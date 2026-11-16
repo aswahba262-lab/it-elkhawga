@@ -15,9 +15,8 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 # Stable admin key kept on disk across restarts.
 $keyFile = Join-Path $dataDir "admin-key.txt"
 if (-not (Test-Path $keyFile)) {
-  $bytes = New-Object byte[] 32
-  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-  (-join ($bytes | ForEach-Object { $_.ToString("x2") })) | Set-Content -LiteralPath $keyFile -Encoding ASCII
+  # Use the baked-in admin key so a fresh relay matches the admin app defaults.
+  "2a0fa2811eb5acdba9847da8ece72ac29e59352a051e093664ba5fd413da2f8e" | Set-Content -LiteralPath $keyFile -Encoding ASCII -NoNewline
 }
 $adminKey = (Get-Content -LiteralPath $keyFile -Raw).Trim()
 
@@ -59,7 +58,7 @@ if ($Public) {
   if ($url) {
     Write-Host ""
     Write-Host "PUBLIC URL : $url" -ForegroundColor Green
-    Write-Host "Put this URL + ADMIN_KEY in the Admin app -> الربط السحابي" -ForegroundColor Green
+    Write-Host "Put this URL + ADMIN_KEY in the Admin app -> Ø§Ù„Ø±Ø¨Ø· Ø§Ù„Ø³Ø­Ø§Ø¨ÙŠ" -ForegroundColor Green
     Write-Host ""
   } else {
     Write-Host "Tunnel started but URL not detected yet. Check $log" -ForegroundColor Yellow
@@ -68,7 +67,7 @@ if ($Public) {
   Write-Host "Press Ctrl+C to stop the relay (tunnel keeps running; close its process if needed)." -ForegroundColor Yellow
 } else {
   Write-Host "Relay PID: $($relay.Id)"
-  Write-Host "Put the LAN URL + ADMIN_KEY in the Admin app -> الربط السحابي" -ForegroundColor Yellow
+  Write-Host "Put the LAN URL + ADMIN_KEY in the Admin app -> Ø§Ù„Ø±Ø¨Ø· Ø§Ù„Ø³Ø­Ø§Ø¨ÙŠ" -ForegroundColor Yellow
   Write-Host "Press Ctrl+C to stop." -ForegroundColor Yellow
 }
 
