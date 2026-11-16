@@ -1,0 +1,26 @@
+# ========================================
+# قائمة المواقع المقفولة (Blacklist)
+# ========================================
+# تستخدم فقط لو mode = blacklist في config.json
+
+# Social Media
+www.facebook.com
+www.instagram.com
+www.twitter.com
+www.x.com
+www.tiktok.com
+www.snapchat.com
+
+# Video Streaming
+www.youtube.com
+www.netflix.com
+www.twitch.tv
+
+# Games
+www.steampowered.com
+www.epicgames.com
+play.google.com
+
+# Other
+www.reddit.com
+www.pinterest.com

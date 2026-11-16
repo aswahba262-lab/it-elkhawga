@@ -1,0 +1,1 @@
+﻿{"bundle":{"resources":{"../buildmode/admin.json":"build-mode.json","../install-agent-task.ps1":"install-agent-task.ps1"},"windows":{"nsis":{"installMode":"perMachine","installerHooks":"nsis-hooks.nsh"}}}}

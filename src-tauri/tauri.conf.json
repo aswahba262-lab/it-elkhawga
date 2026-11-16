@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "IT ELKHAWGA Admin",
+  "version": "1.0.0",
+  "identifier": "com.elkhawga.it.admin",
+  "build": {
+    "frontendDist": "../web"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "IT ELKHAWGA - Admin | Ahmed Wahba",
+        "url": "index.html",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 980,
+        "minHeight": 640,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Ahmed Wahba",
+    "copyright": "Copyright (c) Ahmed Wahba",
+    "category": "Utility",
+    "shortDescription": "IT ELKHAWGA - Company IT control",
+    "longDescription": "IT ELKHAWGA by Ahmed Wahba for managing company devices and internet access.",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "resources": {
+      "../block-internet.ps1": "block-internet.ps1",
+      "../allow-internet.ps1": "allow-internet.ps1",
+      "../enable-autostart.ps1": "enable-autostart.ps1",
+      "../disable-autostart.ps1": "disable-autostart.ps1",
+      "../allowed-sites.txt": "defaults/allowed-sites.txt",
+      "../blocked-sites.txt": "defaults/blocked-sites.txt",
+      "../config.json": "defaults/config.json",
+      "../throttle.ps1": "throttle.ps1"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "languages": ["Arabic", "English"],
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

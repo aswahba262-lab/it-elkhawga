@@ -1,0 +1,20 @@
+﻿# Rust/Tauri build
+src-tauri/target/
+src-tauri/target-*/
+target/
+target-*/
+# Node / build outputs
+node_modules/
+dist/
+# Secrets / runtime data
+relay/data/*.db
+relay/data/*.db-wal
+relay/data/*.db-shm
+# Large binaries
+*.exe
+*.rlib
+*.rmeta
+*.pdb
+# OS
+Thumbs.db
+.DS_Store

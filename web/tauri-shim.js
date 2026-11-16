@@ -1,0 +1,62 @@
+// Maps window.electronAPI (the API the pages were written against) onto Tauri commands.
+(function () {
+  if (window.electronAPI || !window.__TAURI__) return;
+  const invoke = window.__TAURI__.core.invoke;
+  const listen = window.__TAURI__.event.listen;
+
+  window.electronAPI = {
+    getStatus: () => invoke('get_status'),
+    getMode: () => invoke('get_mode'),
+    blockInternet: () => invoke('block_internet'),
+    unblockInternet: (password) => invoke('unblock_internet', { password: password || null }),
+    getAllowedSites: () => invoke('get_allowed_sites'),
+    getBlockedSites: () => invoke('get_blocked_sites'),
+    addSite: (site) => invoke('add_site', { site }),
+    removeSite: (site) => invoke('remove_site', { site }),
+    addBlockedSite: (site) => invoke('add_blocked_site', { site }),
+    removeBlockedSite: (site) => invoke('remove_blocked_site', { site }),
+    getLogs: () => invoke('get_logs'),
+    getConfig: () => invoke('get_config'),
+    setListMode: (mode) => invoke('set_list_mode', { mode }),
+    toggleAutostart: (enable) => invoke('toggle_autostart', { enable }),
+    setPassword: (currentPassword, newPassword) => invoke('set_password', { currentPassword, newPassword }),
+    getServerInfo: () => invoke('get_server_info'),
+    getDevices: () => invoke('get_devices'),
+    sendDeviceCommand: (deviceId, command) => invoke('send_device_command', { deviceId, command }),
+    getRelayConfig: () => invoke('get_relay_config'),
+    setRelayConfig: (relayUrl, adminKey, currentPassword, rustdeskServer, rustdeskKey, rustdeskPassword) =>
+      invoke('set_relay_config', {
+        relayUrl,
+        adminKey: adminKey || null,
+        currentPassword: currentPassword || null,
+        rustdeskServer: rustdeskServer || null,
+        rustdeskKey: rustdeskKey || null,
+        rustdeskPassword: rustdeskPassword || null,
+      }),
+    createPairingToken: (label) => invoke('create_pairing_token', { label: label || null }),
+    getRelayDevices: () => invoke('get_relay_devices'),
+    sendRelayCommand: (deviceId, command) => invoke('send_relay_command', { deviceId, command }),
+    syncPolicy: () => invoke('sync_policy_now'),
+    getRelayGroups: () => invoke('get_relay_groups'),
+    getDashboardStats: () => invoke('get_dashboard_stats'),
+    getRelayAlerts: (type, acked) => invoke('get_relay_alerts', { alertType: type || null, acked: acked || null }),
+    ackAlert: (id) => invoke('ack_alert', { alertId: id }),
+    getAuditLog: () => invoke('get_audit_log'),
+    createRelayGroup: (name, mode) => invoke('create_relay_group', { name, mode }),
+    updateRelayGroup: (groupId, name, mode, allowed, blocked) => invoke('update_relay_group', { groupId, name, mode, allowed, blocked }),
+    deleteRelayGroup: (groupId) => invoke('delete_relay_group', { groupId }),
+    assignDeviceGroup: (deviceId, groupId) => invoke('assign_device_group', { deviceId, groupId: groupId || null }),
+    sendGroupCommand: (groupId, command) => invoke('send_group_command', { groupId, command }),
+    renameRelayDevice: (deviceId, label) => invoke('rename_relay_device', { deviceId, label }),
+    deleteRelayDevice: (deviceId) => invoke('delete_relay_device', { deviceId }),
+    openSupportSession: (rustdeskId) => invoke('open_support_session', { rustdeskId }),
+    setDeviceRustdeskPassword: (deviceId, password) => invoke('set_device_rustdesk_password', { deviceId, password }),
+    requestScreenshot: (deviceId) => invoke('request_screenshot', { deviceId }),
+    getScreenshot: (deviceId) => invoke('get_screenshot', { deviceId }),
+    getClientConfig: () => invoke('get_client_config'),
+    setClientConfig: (serverUrl, token, password) => invoke('set_client_config', { serverUrl, token, password: password || null }),
+    enrollRelay: (relayUrl, pairingToken, password) => invoke('enroll_relay', { relayUrl, pairingToken, password: password || null }),
+    disconnectRelay: (password) => invoke('disconnect_relay', { password: password || null }),
+    onStatusUpdate: (cb) => { listen('status-update', (e) => cb(e.payload)); },
+  };
+})();

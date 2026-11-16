@@ -1,0 +1,7 @@
+{
+  "mode": "whitelist",
+  "password_hash": "",
+  "auto_start": false,
+  "api_token": "",
+  "server_port": 8787
+}

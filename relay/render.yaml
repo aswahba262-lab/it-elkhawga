@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: it-elkhawga-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ADMIN_KEY
+        generateValue: true
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: relay-data
+      mountPath: /var/data
+      sizeGB: 1

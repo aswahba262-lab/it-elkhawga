@@ -1,0 +1,26 @@
+[package]
+name = "it-elkhawga"
+version = "1.0.0"
+description = "IT ELKHAWGA - Company device and internet control"
+authors = ["Ahmed Wahba"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tiny_http = "0.12"
+ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }
+rand = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

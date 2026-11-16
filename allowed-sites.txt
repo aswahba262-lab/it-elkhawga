@@ -1,0 +1,57 @@
+# ========================================
+# قائمة المواقع المسموحة (Whitelist)
+# ========================================
+# كل سطر موقع واحد
+# أي موقع مش هنا هيكون مقفول
+
+# مواقع الشغل
+www.elkhawaga.uk
+
+# WhatsApp Web
+web.whatsapp.com
+www.web.whatsapp.com
+web.whatsapp.net
+whatsapp.com
+www.whatsapp.com
+whatsapp.net
+static.whatsapp.net
+media.whatsapp.net
+cdn.whatsapp.net
+crashlogs.whatsapp.net
+v.whatsapp.net
+g.whatsapp.net
+mmg.whatsapp.net
+mxr.ci.whatsapp.net
+r.whatsapp.net
+srv.whatsapp.net
+scontent.whatsapp.net
+upload.whatsapp.net
+sfo2.whatsapp.net
+sfo3.whatsapp.net
+sfo4.whatsapp.net
+sfo5.whatsapp.net
+sfo6.whatsapp.net
+sfo7.whatsapp.net
+sfo8.whatsapp.net
+sfo9.whatsapp.net
+fra1.whatsapp.net
+fra2.whatsapp.net
+fra3.whatsapp.net
+fra4.whatsapp.net
+fra5.whatsapp.net
+fra6.whatsapp.net
+fra7.whatsapp.net
+fra8.whatsapp.net
+fra9.whatsapp.net
+
+# Discord (للتواصل)
+discord.com
+discordapp.com
+discord.gg
+canary.discord.com
+ptb.discord.com
+
+# AnyDesk (للتحكم عن بعد)
+anydesk.com
+relay.anydesk.com
+server.anydesk.com

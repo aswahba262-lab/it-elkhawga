@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IT ELKHAWGA</title>
+  <link rel="stylesheet" href="styles/theme.css">
+  <style>
+    body { overflow-y: auto; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 26px 22px 40px; }
+    .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
+    .head .brand { padding: 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div class="brand">
+        <div class="brand-logo" style="width:78px;height:62px;border-radius:12px;padding:0">
+          <img src="assets/company-logo-tight.png" alt="IT ELKHAWGA" style="width:100%;height:100%;object-fit:cover;object-position:center" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
+          <svg viewBox="0 0 24 24" style="display:none"><path d="M12 2l8 3v6c0 5-3.5 9.2-8 11-4.5-1.8-8-6-8-11V5l8-3z"/><path d="M9 12l2 2 4-4"/></svg>
+        </div>
+        <div>
+          <div class="brand-name">IT ELKHAWGA</div>
+          <div class="brand-sub">حماية وإدارة الجهاز · Ahmed Wahba</div>
+        </div>
+      </div>
+      <span class="badge gray" id="linkBadge"><span class="dot offline" style="width:7px;height:7px;"></span> غير مربوط</span>
+    </div>
+
+
+    <div class="card hero" id="hero" style="margin-bottom:18px;">
+      <div class="ring"><span id="ringIcon">🌐</span></div>
+      <div class="hero-text">
+        <div class="hero-title ok" id="heroTitle">الإنترنت مفتوح</div>
+        <div class="hero-desc" id="heroDesc">جميع المواقع متاحة</div>
+        <div class="hero-actions">
+          <button class="btn btn-danger" id="blockBtn">قفل الإنترنت</button>
+          <button class="btn btn-success" id="unblockBtn">فتح الإنترنت</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="card-title">المواقع المسموحة</div>
+        <div class="list" id="allowedList" style="margin-top:0;max-height:260px;"></div>
+        <div class="hint">لإضافة مواقع تواصل مع مدير النظام.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">الربط مع المدير</div>
+        <div class="field">
+          <span class="label">عنوان السيرفر</span>
+          <input class="input mono" id="serverUrlInput" placeholder="http://192.168.1.50:8787" style="text-align:left;">
+        </div>
+        <div class="field">
+          <span class="label">مفتاح الربط</span>
+          <input class="input mono" id="tokenInput" placeholder="Token" style="text-align:left;">
+        </div>
+        <div class="field">
+          <span class="label">كلمة السر (مطلوبة لتعديل الربط بعد أول مرة)</span>
+          <input type="password" class="input" id="linkPassInput">
+        </div>
+        <button class="btn btn-primary" id="saveLinkBtn">حفظ والاتصال</button>
+        <div class="hint" id="linkHint">أدخل البيانات التي يعطيها لك المدير من تبويب "الأجهزة".</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">الربط السحابي (Relay)</div>
+        <div class="field">
+          <span class="label">عنوان الـ Relay</span>
+          <input class="input mono" id="relayUrlInput" placeholder="https://relay.example.com" style="text-align:left;">
+        </div>
+        <div class="field">
+          <span class="label">رمز الربط (من المدير)</span>
+          <input class="input mono" id="pairTokenInput" placeholder="pair_..." style="text-align:left;">
+        </div>
+        <div class="field">
+          <span class="label">كلمة السر (مطلوبة لتغيير الربط)</span>
+          <input type="password" class="input" id="relayPassInput">
+        </div>
+        <div class="hero-actions" style="margin-top:0;">
+          <button class="btn btn-primary" id="enrollRelayBtn">ربط الجهاز</button>
+          <button class="btn btn-ghost" id="disconnectRelayBtn">فصل الربط</button>
+        </div>
+        <div class="hint" id="relayHint">يسمح للمدير بالتحكم في الجهاز خارج الشبكة المحلية.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="credits credits-foot" style="max-width:720px;">
+    <div class="credit-row"><span class="credit-label">Developer</span><span class="credit-name">Ahmed Wahba</span></div>
+    <div class="credit-row"><span class="credit-label">Idea by</span><span class="credit-name">Zakee Tahawi</span></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-overlay" id="passModal">
+    <div class="modal">
+      <h3>كلمة السر مطلوبة لفتح الإنترنت</h3>
+      <div class="field"><input type="password" class="input" id="passInput" placeholder="أدخل كلمة السر"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="passCancel">إلغاء</button>
+        <button class="btn btn-success" id="passOk">تأكيد</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="tauri-shim.js"></script>
+  <script>
+    const api = window.electronAPI;
+    const $ = (id) => document.getElementById(id);
+    let isBlocked = false;
+
+    const esc = (s) => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+
+    function toast(msg, type = 'success') {
+      const t = $('toast');
+      t.textContent = msg;
+      t.className = 'toast ' + type + ' show';
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => { t.className = 'toast'; }, 3000);
+    }
+
+    function renderStatus() {
+      $('hero').classList.toggle('blocked', isBlocked);
+      $('ringIcon').textContent = isBlocked ? '🔒' : '🌐';
+      $('heroTitle').textContent = isBlocked ? 'الإنترنت مقفول' : 'الإنترنت مفتوح';
+      $('heroTitle').className = 'hero-title ' + (isBlocked ? 'blocked' : 'ok');
+      $('heroDesc').textContent = isBlocked ? 'المواقع المسموحة فقط متاحة' : 'جميع المواقع متاحة';
+      $('blockBtn').disabled = isBlocked;
+      $('unblockBtn').disabled = !isBlocked;
+    }
+
+    async function loadStatus() {
+      isBlocked = await api.getStatus();
+      renderStatus();
+    }
+    api.onStatusUpdate((s) => { isBlocked = s; renderStatus(); });
+
+    async function loadSites() {
+      const sites = await api.getAllowedSites();
+      $('allowedList').innerHTML = sites.length
+        ? sites.map((s) => '<div class="list-item"><span>' + esc(s) + '</span></div>').join('')
+        : '<div class="empty">لا توجد مواقع مسموحة</div>';
+    }
+
+    async function loadLink(fill) {
+      try {
+        const c = await api.getClientConfig();
+        if (fill) {
+          $('serverUrlInput').value = c.server_url || '';
+          $('tokenInput').value = c.token || '';
+        }
+        renderLink(!!c.connected, c.server_url || c.relay_url, !!c.agent_running);
+      } catch (e) {
+        renderLink(false, $('serverUrlInput').value.trim(), false);
+      loadRelayState();
+      }
+    }
+
+    function renderLink(connected, url, agentRunning) {
+      const badge = $('linkBadge');
+      if (connected) {
+        badge.className = 'badge green';
+        badge.innerHTML = '<span class="dot" style="width:7px;height:7px;"></span> مربوط بالمدير';
+        $('linkHint').textContent = 'الاتصال نشط مع المدير. يتم مزامنة السياسة والأوامر تلقائيًا.';
+      } else if (agentRunning && url) {
+        badge.className = 'badge gold';
+        badge.innerHTML = '<span class="dot" style="width:7px;height:7px;background:#f59e0b"></span> يحاول الاتصال...';
+        $('linkHint').textContent = 'خدمة الحماية تعمل، لكن لا يوجد اتصال بالسيرفر الآن. تأكد من عنوان المدير والمنفذ 8787 والشبكة/Firewall.';
+      } else if (url) {
+        badge.className = 'badge red';
+        badge.innerHTML = '<span class="dot blocked" style="width:7px;height:7px;"></span> الخدمة غير مفعّلة';
+        $('linkHint').textContent = 'تم حفظ بيانات الربط، لكن خدمة الحماية (Agent) غير شغّالة. أعد تثبيت نسخة IT ELKHAWGA Client كمسؤول وتأكد من مهمة InternetBlockerAgent.';
+      } else {
+        badge.className = 'badge gray';
+        badge.innerHTML = '<span class="dot offline" style="width:7px;height:7px;"></span> غير مربوط';
+        $('linkHint').textContent = 'أدخل البيانات التي يعطيها لك المدير من تبويب "الأجهزة".';
+      }
+    }
+
+    async function loadRelayState() {
+      try {
+        const s = await api.getClientConfig();
+        $('relayUrlInput').value = s.relay_url || '';
+        if (s.enrolled) {
+          $('relayHint').textContent = 'الجهاز مربوط بالـ Relay' + (s.device_id ? ' (المعرّف: ' + s.device_id + ')' : '') + '.';
+        } else if (s.relay_url) {
+          $('relayHint').textContent = 'بانتظار إكمال الربط بالـ Relay...';
+        } else {
+          $('relayHint').textContent = 'يسمح للمدير بالتحكم في الجهاز خارج الشبكة المحلية.';
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    $('enrollRelayBtn').addEventListener('click', async () => {
+      const url = $('relayUrlInput').value.trim();
+      const pt = $('pairTokenInput').value.trim();
+      if (!url || !pt) { toast('اكتب عنوان الـ Relay ورمز الربط', 'error'); return; }
+      const r = await api.enrollRelay(url, pt, $('relayPassInput').value);
+      if (r.success) { $('pairTokenInput').value = ''; toast('تم حفظ إعدادات الربط، سيجرى الربط تلقائيًا'); loadRelayState(); }
+      else toast(r.error || 'فشل الربط', 'error');
+    });
+
+    $('disconnectRelayBtn').addEventListener('click', async () => {
+      const r = await api.disconnectRelay($('relayPassInput').value);
+      if (r.success) { toast('تم فصل الربط السحابي'); loadRelayState(); }
+      else toast(r.error || 'فشل الفصل', 'error');
+    });
+
+    $('saveLinkBtn').addEventListener('click', async () => {
+      const btn = $('saveLinkBtn');
+      const url = $('serverUrlInput').value.trim().replace(/\/+$/, '');
+      const token = $('tokenInput').value.trim();
+      if (!url || !token) { toast('أدخل عنوان السيرفر ومفتاح الربط', 'error'); return; }
+      if (!/^https?:\/\//i.test(url)) { toast('العنوان يجب أن يبدأ بـ http:// أو https://', 'error'); return; }
+      btn.disabled = true;
+      const original = btn.innerHTML;
+      btn.innerHTML = '<span class="spinner"></span> جاري الحفظ...';
+      try {
+        const r = await api.setClientConfig(url, token, $('linkPassInput').value);
+        $('linkPassInput').value = '';
+        if (r && r.success) {
+          toast('تم الحفظ والاتصال بالخدمة', 'success');
+        } else {
+          const msg = (r && r.error) || 'تعذر الحفظ';
+          toast(msg, msg.indexOf('تم حفظ بيانات الربط') === 0 ? 'error' : 'error');
+        }
+      } catch (e) {
+        toast('خطأ: ' + (e && e.message ? e.message : e), 'error');
+      }
+      btn.disabled = false;
+      btn.innerHTML = original;
+      await loadLink(false);
+      setTimeout(() => loadLink(false), 12000);
+    });
+
+    async function run(btn, busy, fn, ok, fail) {
+      const original = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> ' + busy;
+      try {
+        const r = await fn();
+        if (r && r.success) toast(ok); else toast((r && r.error) || fail, 'error');
+      } catch (e) { toast('حدث خطأ: ' + e.message, 'error'); }
+      btn.innerHTML = original;
+      await loadStatus();
+    }
+
+    $('blockBtn').addEventListener('click', () => run($('blockBtn'), 'جاري القفل...', () => api.blockInternet(), 'تم قفل الإنترنت', 'فشل القفل'));
+
+    $('unblockBtn').addEventListener('click', () => {
+      $('passInput').value = '';
+      $('passModal').classList.add('show');
+      $('passInput').focus();
+    });
+    $('passCancel').addEventListener('click', () => $('passModal').classList.remove('show'));
+    $('passOk').addEventListener('click', () => {
+      const pw = $('passInput').value;
+      $('passModal').classList.remove('show');
+      run($('unblockBtn'), 'جاري الفتح...', () => api.unblockInternet(pw), 'تم فتح الإنترنت', 'كلمة السر غير صحيحة أو تم الإلغاء');
+    });
+    $('passInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passOk').click(); });
+
+    (async () => {
+      await loadStatus();
+      await loadSites();
+      await loadLink(true);
+      setInterval(() => loadLink(false), 8000);
+    })();
+  </script>
+</body>
+</html>

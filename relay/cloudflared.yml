@@ -1,0 +1,7 @@
+tunnel: 0ffa22eb-8163-4832-9278-b23e377c0cc6
+credentials-file: C:\Users\PC\.cloudflared\0ffa22eb-8163-4832-9278-b23e377c0cc6.json
+
+ingress:
+  - hostname: relay.itkhawaga-2027.com
+    service: http://localhost:8790
+  - service: http_status:404

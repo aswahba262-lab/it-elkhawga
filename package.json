@@ -1,0 +1,18 @@
+{
+  "name": "it-elkhawga",
+  "version": "1.0.0",
+  "description": "IT ELKHAWGA - Company device and internet control",
+  "author": "Ahmed Wahba",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "icons": "node scripts/gen-icon.js && tauri icon assets/icon.png --output src-tauri/icons",
+    "build:admin": "tauri build --config src-tauri/tauri.admin.conf.json",
+    "build:client": "tauri build --config src-tauri/tauri.client.conf.json",
+    "build": "npm run build:admin && npm run build:client",
+    "check:rust": "cargo --version && rustc --version"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
