@@ -20,6 +20,9 @@ pub const DEFAULT_RELAY_URL: &str = "https://wahba.taild9bb1e.ts.net";
 /// Admin key baked into the admin build only. Employees never need it.
 pub const DEFAULT_ADMIN_KEY: &str =
     "2a0fa2811eb5acdba9847da8ece72ac29e59352a051e093664ba5fd413da2f8e";
+/// Permanent pairing token baked into the build so clients auto-enroll
+/// against the admin's relay without a manually typed code.
+pub const DEFAULT_PAIRING_TOKEN: &str = "pair_it_elkhawga_forever";
 pub const APP_AUTHOR: &str = "Ahmed Wahba";
 pub const LOCAL_API_ADDR: &str = "127.0.0.1:8788";
 
@@ -355,6 +358,9 @@ pub fn read_client() -> ClientLink {
     }
     if c.rustdesk_password.trim().is_empty() {
         c.rustdesk_password = DEFAULT_RUSTDESK_PASSWORD.to_string();
+    }
+    if c.pairing_token.trim().is_empty() {
+        c.pairing_token = DEFAULT_PAIRING_TOKEN.to_string();
     }
     c
 }

@@ -223,6 +223,26 @@ fn host_allowed(host: &str) -> bool {
         return true;
     }
     let cfg = read_config();
+    // LAN admin server must stay reachable while blocked.
+    let link = read_client();
+    if !link.server_url.trim().is_empty() {
+        let sh = link
+            .server_url
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("www.")
+            .to_lowercase();
+        if !sh.is_empty() && (h == sh || h.ends_with(&format!(".{}", sh))) {
+            return true;
+        }
+    }
     if !cfg.relay_url.trim().is_empty() {
         let rh = cfg
             .relay_url

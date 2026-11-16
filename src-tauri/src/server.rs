@@ -805,9 +805,13 @@ impl ServerHandle {
             for id in ids {
                 if command.starts_with("throttle:") {
                     let kbps = command.strip_prefix("throttle:").unwrap().parse::<u64>().unwrap_or(0);
-                    reg.pending_throttle.insert(id, kbps);
+                    reg.pending_throttle.insert(id.clone(), kbps);
                 } else {
-                    reg.pending.insert(id, command.to_string());
+                    reg.pending.insert(id.clone(), command.to_string());
+                }
+                if let Some(d) = reg.devices.get_mut(&id) {
+                    if command == "block" { d.blocked = true; }
+                    else if command == "unblock" { d.blocked = false; }
                 }
             }
         } else if reg.devices.contains_key(device_id) {
@@ -816,6 +820,10 @@ impl ServerHandle {
                 reg.pending_throttle.insert(device_id.to_string(), kbps);
             } else {
                 reg.pending.insert(device_id.to_string(), command.to_string());
+            }
+            if let Some(d) = reg.devices.get_mut(device_id) {
+                if command == "block" { d.blocked = true; }
+                else if command == "unblock" { d.blocked = false; }
             }
         } else {
             return Err("الجهاز غير موجود".into());

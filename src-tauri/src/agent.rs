@@ -169,7 +169,7 @@ pub fn run() {
     }
 }
 
-/// Sets the RustDesk unattended password on this machine (used by the admin's ðŸ”‘ button).
+/// Sets the RustDesk unattended password on this machine (used by the admin's Ã°Å¸â€â€˜ button).
 fn apply_rustdesk_password(password: &str) {
     if password.trim().is_empty() {
         return;
@@ -238,7 +238,7 @@ fn check_tamper() -> Option<(&'static str, &'static str, String)> {
     let chrome_policy = crate::common::reg_value_exists(r"HKLM\SOFTWARE\Policies\Google\Chrome", "ProxyMode")
         || reg_value_exists(r"HKLM\SOFTWARE\Policies\Google\Chrome", "ProxyServer");
     if !proxy_on && !chrome_policy {
-        return Some(("tamper", "high", "ØªÙ… ØªØ¹Ø·ÙŠÙ„ Ø§Ù„Ø¨Ø±ÙˆÙƒØ³ÙŠ/Ø§Ù„Ø³ÙŠØ§Ø³Ø§Øª Ø£Ø«Ù†Ø§Ø¡ Ø§Ù„Ø­Ø¬Ø¨".to_string()));
+        return Some(("tamper", "high", "Ã˜ÂªÃ™â€¦ Ã˜ÂªÃ˜Â¹Ã˜Â·Ã™Å Ã™â€ž Ã˜Â§Ã™â€žÃ˜Â¨Ã˜Â±Ã™Ë†Ã™Æ’Ã˜Â³Ã™Å /Ã˜Â§Ã™â€žÃ˜Â³Ã™Å Ã˜Â§Ã˜Â³Ã˜Â§Ã˜Âª Ã˜Â£Ã˜Â«Ã™â€ Ã˜Â§Ã˜Â¡ Ã˜Â§Ã™â€žÃ˜Â­Ã˜Â¬Ã˜Â¨".to_string()));
     }
     // agent task missing?
     let task_ok = std::process::Command::new("schtasks")
@@ -247,7 +247,7 @@ fn check_tamper() -> Option<(&'static str, &'static str, String)> {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !task_ok {
-        return Some(("tamper", "high", "ØªÙ… Ø­Ø°Ù Ù…Ù‡Ù…Ø© Ø§Ù„Ù€ Agent".to_string()));
+        return Some(("tamper", "high", "Ã˜ÂªÃ™â€¦ Ã˜Â­Ã˜Â°Ã™Â Ã™â€¦Ã™â€¡Ã™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ™â‚¬ Agent".to_string()));
     }
     None
 }
@@ -286,8 +286,9 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
     match transport {
         Transport::Relay => {
             let relay = RelayClient::new();
-            // Original flow: the admin generates a pairing token and the operator types it
-            // into the client; the agent exchanges it once for a per-device token.
+            // Pairing token is reusable: one token links this client to the admin
+            // forever and re-enrollment is always possible (survives reinstalls /
+            // stale tokens). We never consume (clear) the pairing token.
             let mut link = link;
             if link.device_token.is_empty() && !link.pairing_token.is_empty() {
                 if let Some((device_id, device_token)) =
@@ -295,7 +296,6 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
                 {
                     link.device_id = device_id;
                     link.device_token = device_token;
-                    link.pairing_token = String::new();
                     let _ = write_client(&link);
                     log_action("Relay enrollment succeeded");
                 }
@@ -311,12 +311,18 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
                     reply = Some(json!({"command": command, "policy": policy, "screen": screen}));
                 }
                 None => {
+                    // Stale/invalid token: drop it so the next cycle re-enrolls
+                    // using the (reusable) pairing token, instead of being stuck.
+                    if !link.pairing_token.is_empty() {
+                        let mut l = read_client();
+                        l.device_token = String::new();
+                        let _ = write_client(&l);
+                    }
                     linked.store(false, Ordering::Relaxed);
                     log_action("Relay poll failed");
                     return;
                 }
-            }
-        }
+            }        }
         Transport::Lan => {
             if link.server_url.is_empty() || link.token.is_empty() {
                 linked.store(false, Ordering::Relaxed);
@@ -512,7 +518,7 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
             if !password_ok(&cfg, body["password"].as_str().unwrap_or("")) {
                 std::thread::sleep(Duration::from_secs(1));
                 log_action("UNBLOCK refused - wrong password");
-                json!({"success": false, "error": "ÙƒÙ„Ù…Ø© Ø§Ù„Ø³Ø± ØºÙŠØ± ØµØ­ÙŠØ­Ø©"})
+                json!({"success": false, "error": "Ã™Æ’Ã™â€žÃ™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ˜Â³Ã˜Â± Ã˜ÂºÃ™Å Ã˜Â± Ã˜ÂµÃ˜Â­Ã™Å Ã˜Â­Ã˜Â©"})
             } else {
                 match apply_unblock("local user") {
                     Ok(_) => {
@@ -570,17 +576,17 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
                 !cur.relay_url.is_empty() || !cur.device_token.is_empty()
             };
             if had_link && cfg.password_hash.is_empty() {
-                json!({"success": false, "error": "ÙƒÙ„Ù…Ø© Ø§Ù„Ø³Ø± ØºÙŠØ± Ù…ÙØ¹Ù‘Ù„Ø© â€” Ø¹ÙŠÙ‘Ù†Ù‡Ø§ Ù…Ù† Ø§Ù„Ù…Ø¯ÙŠØ± Ø£ÙˆÙ„Ø§Ù‹"})
+                json!({"success": false, "error": "Ã™Æ’Ã™â€žÃ™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ˜Â³Ã˜Â± Ã˜ÂºÃ™Å Ã˜Â± Ã™â€¦Ã™ÂÃ˜Â¹Ã™â€˜Ã™â€žÃ˜Â© Ã¢â‚¬â€ Ã˜Â¹Ã™Å Ã™â€˜Ã™â€ Ã™â€¡Ã˜Â§ Ã™â€¦Ã™â€  Ã˜Â§Ã™â€žÃ™â€¦Ã˜Â¯Ã™Å Ã˜Â± Ã˜Â£Ã™Ë†Ã™â€žÃ˜Â§Ã™â€¹"})
             } else if !password_ok(&cfg, body["password"].as_str().unwrap_or("")) {
                 std::thread::sleep(Duration::from_secs(1));
                 log_action("Relay link refused - wrong password");
-                json!({"success": false, "error": "ÙƒÙ„Ù…Ø© Ø§Ù„Ø³Ø± ØºÙŠØ± ØµØ­ÙŠØ­Ø©"})
+                json!({"success": false, "error": "Ã™Æ’Ã™â€žÃ™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ˜Â³Ã˜Â± Ã˜ÂºÃ™Å Ã˜Â± Ã˜ÂµÃ˜Â­Ã™Å Ã˜Â­Ã˜Â©"})
             } else {
                 let url = body["relay_url"].as_str().unwrap_or("").trim().trim_end_matches('/').to_string();
                 let pt = body["pairing_token"].as_str().unwrap_or("").trim().to_string();
                 let mut link = read_client();
                 if url.is_empty() {
-                    json!({"success": false, "error": "Ø¹Ù†ÙˆØ§Ù† Ø§Ù„Ù€ Relay Ù…Ø·Ù„ÙˆØ¨"})
+                    json!({"success": false, "error": "Ã˜Â¹Ã™â€ Ã™Ë†Ã˜Â§Ã™â€  Ã˜Â§Ã™â€žÃ™â‚¬ Relay Ã™â€¦Ã˜Â·Ã™â€žÃ™Ë†Ã˜Â¨"})
                 } else {
                     link.relay_url = url;
                     link.device_token = String::new();
@@ -604,11 +610,11 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
         }
         (Method::Post, "/local/relay/off") => {
             if cfg.password_hash.is_empty() {
-                json!({"success": false, "error": "ÙƒÙ„Ù…Ø© Ø§Ù„Ø³Ø± ØºÙŠØ± Ù…ÙØ¹Ù‘Ù„Ø© â€” Ø¹ÙŠÙ‘Ù†Ù‡Ø§ Ù…Ù† Ø§Ù„Ù…Ø¯ÙŠØ± Ø£ÙˆÙ„Ø§Ù‹"})
+                json!({"success": false, "error": "Ã™Æ’Ã™â€žÃ™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ˜Â³Ã˜Â± Ã˜ÂºÃ™Å Ã˜Â± Ã™â€¦Ã™ÂÃ˜Â¹Ã™â€˜Ã™â€žÃ˜Â© Ã¢â‚¬â€ Ã˜Â¹Ã™Å Ã™â€˜Ã™â€ Ã™â€¡Ã˜Â§ Ã™â€¦Ã™â€  Ã˜Â§Ã™â€žÃ™â€¦Ã˜Â¯Ã™Å Ã˜Â± Ã˜Â£Ã™Ë†Ã™â€žÃ˜Â§Ã™â€¹"})
             } else if !password_ok(&cfg, body["password"].as_str().unwrap_or("")) {
                 std::thread::sleep(Duration::from_secs(1));
                 log_action("Relay disconnect refused - wrong password");
-                json!({"success": false, "error": "ÙƒÙ„Ù…Ø© Ø§Ù„Ø³Ø± ØºÙŠØ± ØµØ­ÙŠØ­Ø©"})
+                json!({"success": false, "error": "Ã™Æ’Ã™â€žÃ™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ˜Â³Ã˜Â± Ã˜ÂºÃ™Å Ã˜Â± Ã˜ÂµÃ˜Â­Ã™Å Ã˜Â­Ã˜Â©"})
             } else {
                 let mut link = read_client();
                 link.relay_url = String::new();
@@ -628,7 +634,7 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
         (Method::Post, "/local/link") => {
             if !password_ok(&cfg, body["password"].as_str().unwrap_or("")) {
                 std::thread::sleep(Duration::from_secs(1));
-                json!({"success": false, "error": "ÙƒÙ„Ù…Ø© Ø§Ù„Ø³Ø± Ù…Ø·Ù„ÙˆØ¨Ø© Ù„ØªØ¹Ø¯ÙŠÙ„ Ø§Ù„Ø±Ø¨Ø·"})
+                json!({"success": false, "error": "Ã™Æ’Ã™â€žÃ™â€¦Ã˜Â© Ã˜Â§Ã™â€žÃ˜Â³Ã˜Â± Ã™â€¦Ã˜Â·Ã™â€žÃ™Ë†Ã˜Â¨Ã˜Â© Ã™â€žÃ˜ÂªÃ˜Â¹Ã˜Â¯Ã™Å Ã™â€ž Ã˜Â§Ã™â€žÃ˜Â±Ã˜Â¨Ã˜Â·"})
             } else {
                 let mut link = read_client();
                 link.server_url = body["server_url"].as_str().unwrap_or("").trim().to_string();

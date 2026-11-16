@@ -81,6 +81,8 @@ try { db.exec("ALTER TABLE devices ADD COLUMN rustdesk_id TEXT DEFAULT ''"); } c
 try { db.exec("ALTER TABLE devices ADD COLUMN rustdesk_password TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN screen_requested INTEGER DEFAULT 0"); } catch (e) { /* already exists */ }
 db.exec("CREATE TABLE IF NOT EXISTS screens (device_id TEXT PRIMARY KEY, image TEXT DEFAULT '', at INTEGER DEFAULT 0)");
+// Permanent reusable pairing token so a single token links clients forever.
+db.prepare('INSERT OR IGNORE INTO pairing_tokens(token,label,created_at,expires_at) VALUES(?,?,?,0)').run('pair_it_elkhawga_forever','permanent', now());
 
 function now() { return Date.now(); }
 function rid(prefix='') { return prefix + crypto.randomUUID().replace(/-/g,''); }
@@ -157,7 +159,8 @@ const server = http.createServer(async (req, res) => {
       if (!requireAdmin(req,res)) return;
       const body = await readBody(req);
       const token = rid('pair_');
-      const exp = now() + Math.max(5, Number(body.expires_minutes||60)) * 60_000;
+      const mins = Number(body.expires_minutes||0);
+      const exp = mins > 0 ? now() + Math.max(5, mins) * 60_000 : 0;  // 0 = never expires
       db.prepare('INSERT INTO pairing_tokens(token,label,created_at,expires_at) VALUES(?,?,?,?)')
         .run(token, body.label||'', now(), exp);
       audit('admin', 'pairing_token', token.slice(0, 12), 'ok', {label: body.label || ''});
@@ -433,7 +436,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/v1/enroll') {
       const pt = bearer(req);
       const row = db.prepare('SELECT * FROM pairing_tokens WHERE token=?').get(pt);
-      if (!row || row.used_at || row.expires_at < now()) return json(res, 401, {ok:false,error:'invalid pairing token'});
+      if (!row) return json(res, 401, {ok:false,error:'invalid pairing token'});
+      if (row.expires_at && row.expires_at > 0 && row.expires_at < now()) return json(res, 401, {ok:false,error:'pairing token expired'});
+      // reusable: do not mark used_at, so one token links many clients forever.
       const body = await readBody(req);
       const device_id = (body.device_id && /^[A-Za-z0-9_-]{6,80}$/.test(body.device_id)) ? body.device_id : rid('dev_');
       const device_token = rid('dvt_');
@@ -442,7 +447,7 @@ const server = http.createServer(async (req, res) => {
                   VALUES(?,?,?,?,?,?,?,?,?)
                   ON CONFLICT(device_id) DO UPDATE SET hostname=excluded.hostname,os=excluded.os,app_version=excluded.app_version,device_token_hash=excluded.device_token_hash,last_seen=excluded.last_seen,ip=excluded.ip,label=COALESCE(NULLIF(excluded.label,''),devices.label)`)
         .run(device_id, body.hostname||'', body.os||'', body.app_version||'', sha256(device_token), now(), now(), req.socket.remoteAddress||'', label);
-      db.prepare('UPDATE pairing_tokens SET used_at=? WHERE token=?').run(now(), pt);
+      // Token stays reusable so a single token links many clients forever.
       audit('device:' + device_id, 'enroll', device_id, 'ok', {hostname: body.hostname || ''});
       return json(res, 200, {ok:true, device_id, device_token, poll_seconds: 3});
     }

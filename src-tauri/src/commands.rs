@@ -419,7 +419,7 @@ pub fn create_pairing_token(label: Option<String>) -> Value {
     match relay_request(
         "/api/v1/admin/pairing-tokens",
         "POST",
-        Some(&json!({ "label": label.unwrap_or_default(), "expires_minutes": 60 })),
+        Some(&json!({ "label": label.unwrap_or_default(), "expires_minutes": 0 })),
     ) {
         Ok(v) => json!({"success": true, "token": v["token"].clone(), "expires_at": v["expires_at"].clone()}),
         Err(e) => fail(e),
@@ -557,12 +557,16 @@ fn relay_delete(path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn assign_device_group(device_id: String, group_id: Option<String>) -> Value {
+pub fn assign_device_group(state: tauri::State<AppState>, device_id: String, group_id: Option<String>) -> Value {
+    let gid = group_id.clone().unwrap_or_default();
+    if is_lan_device(&state, &device_id) {
+        return result(with_server(&state, |s| s.assign_device_group(device_id.clone(), gid.clone())));
+    }
     result(
         relay_request(
             &format!("/api/v1/admin/devices/{}/group", device_id),
             "POST",
-            Some(&json!({ "group_id": group_id.unwrap_or_default() })),
+            Some(&json!({ "group_id": gid })),
         )
         .map(|_| ()),
     )
