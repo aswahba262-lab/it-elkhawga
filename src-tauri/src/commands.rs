@@ -75,15 +75,17 @@ pub fn get_mode() -> String {
 // ---------- Blocking ----------
 
 #[tauri::command]
-pub fn block_internet() -> Value {
-    let r = block_internet_inner();
+pub fn block_internet(actor_username: Option<String>, actor_role: Option<String>) -> Value {
+    let actor = actor_username.unwrap_or_default();
+    let role = actor_role.unwrap_or_default();
+    let r = block_internet_inner(&actor, &role);
     match r {
         Ok(_) => json!({"success": true}),
         Err(e) => json!({"success": false, "error": e}),
     }
 }
 
-fn block_internet_inner() -> Result<(), String> {
+fn block_internet_inner(actor: &str, role: &str) -> Result<(), String> {
     let cfg = read_config();
     // Always try the SYSTEM agent first: it is the only context that can apply the
     // block unattended and it owns the local proxy.
@@ -95,6 +97,7 @@ fn block_internet_inner() -> Result<(), String> {
         Ok(r) => {
             let v: Value = r.into_json().map_err(|e| e.to_string())?;
             if v["success"].as_bool().unwrap_or(false) {
+                log_action(&format!("BLOCK (local) - success by {} ({})", actor.trim(), role.trim()));
                 return Ok(());
             }
             return Err(v["error"].as_str().unwrap_or("فشل الحجب").to_string());
@@ -105,21 +108,23 @@ fn block_internet_inner() -> Result<(), String> {
     if cfg.password_hash.is_empty() {
         run_script_elevated("block-internet.ps1", None)?;
         set_block_state(true);
-        log_action("BLOCK (local) - success");
+        log_action(&format!("BLOCK (local) - success by {} ({})", actor.trim(), role.trim()));
         return Ok(());
     }
     Err("الوكيل غير متاح. تأكد من تثبيت نسخة العميل/الوكيل على الجهاز أو أعد تشغيله".into())
 }
 
 #[tauri::command]
-pub fn unblock_internet(password: Option<String>) -> Value {
-    match unblock_internet_inner(password.unwrap_or_default()) {
+pub fn unblock_internet(password: Option<String>, actor_username: Option<String>, actor_role: Option<String>) -> Value {
+    let actor = actor_username.unwrap_or_default();
+    let role = actor_role.unwrap_or_default();
+    match unblock_internet_inner(password.unwrap_or_default(), &actor, &role) {
         Ok(_) => json!({"success": true}),
         Err(e) => json!({"success": false, "error": e}),
     }
 }
 
-fn unblock_internet_inner(supplied: String) -> Result<(), String> {
+fn unblock_internet_inner(supplied: String, actor: &str, role: &str) -> Result<(), String> {
     let cfg = read_config();
     if !cfg.password_hash.is_empty() && !password_ok(&cfg, &supplied) {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -134,6 +139,7 @@ fn unblock_internet_inner(supplied: String) -> Result<(), String> {
         Ok(r) => {
             let v: Value = r.into_json().map_err(|e| e.to_string())?;
             if v["success"].as_bool().unwrap_or(false) {
+                log_action(&format!("UNBLOCK (local) - success by {} ({})", actor.trim(), role.trim()));
                 return Ok(());
             }
             return Err(v["error"].as_str().unwrap_or("فشل الفتح").to_string());
@@ -143,7 +149,7 @@ fn unblock_internet_inner(supplied: String) -> Result<(), String> {
     if cfg.password_hash.is_empty() {
         run_script_elevated("allow-internet.ps1", None)?;
         set_block_state(false);
-        log_action("UNBLOCK (local) - success");
+        log_action(&format!("UNBLOCK (local) - success by {} ({})", actor.trim(), role.trim()));
         return Ok(());
     }
     Err("الوكيل غير متاح. تأكد من تثبيت نسخة العميل/الوكيل على الجهاز أو أعد تشغيله".into())
@@ -259,6 +265,157 @@ pub fn set_password(current_password: Option<String>, new_password: Option<Strin
     result(write_config(&cfg))
 }
 
+#[tauri::command]
+pub fn get_admin_users() -> Vec<Value> {
+    let cfg = read_config();
+    if !cfg.relay_url.trim().is_empty() && !cfg.admin_key.trim().is_empty() {
+        if let Ok(v) = relay_request("/api/v1/admin/users", "GET", None) {
+            if let Some(users) = v["users"].as_array() {
+                if !users.is_empty() {
+                    return users.clone();
+                }
+            }
+        }
+    }
+    cfg.admins
+        .into_iter()
+        .map(|u| json!({ "username": u.username, "role": normalize_admin_role(&u.role) }))
+        .collect()
+}
+
+#[tauri::command]
+pub fn upsert_admin_user(username: String, password: String, role: Option<String>, actor_username: Option<String>, actor_role: Option<String>) -> Value {
+    let username = username.trim();
+    if username.is_empty() {
+        return fail("اسم المدير مطلوب");
+    }
+
+    let cfg = read_config();
+    let actor = actor_username.unwrap_or_default();
+    let actor_role_name = actor_role.unwrap_or_default();
+    if !cfg.admins.is_empty() && !can_manage_admin_users(&cfg, &actor, &actor_role_name) {
+        return fail("فقط السوبر أدمن يمكنه إدارة حسابات المديرين");
+    }
+
+    let mut cfg = cfg;
+    let mut normalized_role = normalize_admin_role(role.as_deref().unwrap_or("admin"));
+    if normalized_role.is_empty() {
+        normalized_role = "admin".to_string();
+    }
+
+    if !cfg.relay_url.trim().is_empty() && !cfg.admin_key.trim().is_empty() {
+        let relay_result = relay_request(
+            "/api/v1/admin/users",
+            "POST",
+            Some(&json!({
+                "username": username,
+                "password": password,
+                "role": normalized_role,
+                "actor_username": actor,
+                "actor_role": actor_role_name,
+            })),
+        );
+        if relay_result.is_ok() {
+            // Keep the local config in sync for offline access and for the old single-machine flow.
+        } else if !cfg.admins.is_empty() || cfg.password_hash.is_empty() {
+            // Relay sync failure is ignored to keep the local manager path working.
+        }
+    }
+
+    if let Some(existing) = cfg.admins.iter_mut().find(|u| u.username.eq_ignore_ascii_case(username)) {
+        if !password.trim().is_empty() {
+            existing.password_hash = hash_password(password.trim());
+        }
+        existing.role = normalized_role;
+    } else {
+        cfg.admins.push(AdminUser {
+            username: username.to_string(),
+            password_hash: if password.trim().is_empty() { String::new() } else { hash_password(password.trim()) },
+            role: normalized_role,
+        });
+    }
+
+    match write_config(&cfg) {
+        Ok(_) => ok(),
+        Err(e) => fail(e),
+    }
+}
+
+#[tauri::command]
+pub fn remove_admin_user(username: String, actor_username: Option<String>, actor_role: Option<String>) -> Value {
+    let username = username.trim();
+    if username.is_empty() {
+        return fail("اسم المدير مطلوب");
+    }
+
+    let cfg = read_config();
+    let actor = actor_username.unwrap_or_default();
+    let actor_role_name = actor_role.unwrap_or_default();
+    if !cfg.admins.is_empty() && !can_manage_admin_users(&cfg, &actor, &actor_role_name) {
+        return fail("فقط السوبر أدمن يمكنه إدارة حسابات المديرين");
+    }
+
+    if !cfg.relay_url.trim().is_empty() && !cfg.admin_key.trim().is_empty() {
+        let encoded = username.replace(' ', "%20").replace('/', "%2F");
+        let _ = relay_delete(&format!("/api/v1/admin/users/{}", encoded));
+    }
+
+    let mut cfg = cfg;
+    let before = cfg.admins.len();
+    cfg.admins.retain(|u| !u.username.eq_ignore_ascii_case(username));
+
+    if cfg.admins.len() == before {
+        return fail("المستخدم غير موجود");
+    }
+
+    match write_config(&cfg) {
+        Ok(_) => ok(),
+        Err(e) => fail(e),
+    }
+}
+
+#[tauri::command]
+pub fn admin_login(username: String, password: String) -> Value {
+    let username = username.trim();
+    if username.is_empty() {
+        return fail("اسم المستخدم مطلوب");
+    }
+
+    let cfg = read_config();
+    match admin_login_ok(&cfg, username, &password) {
+        Some(role) => json!({
+            "success": true,
+            "username": username,
+            "role": normalize_admin_role(&role),
+            "is_super_admin": normalize_admin_role(&role) == "super",
+        }),
+        None => {
+            let relay_cfg = read_config();
+            if !relay_cfg.relay_url.trim().is_empty() && !relay_cfg.admin_key.trim().is_empty() {
+                match relay_request(
+                    "/api/v1/admin/login",
+                    "POST",
+                    Some(&json!({ "username": username, "password": password })),
+                ) {
+                    Ok(v) => {
+                        if v["success"].as_bool().unwrap_or(false) {
+                            let role = v["role"].as_str().unwrap_or("admin");
+                            return json!({
+                                "success": true,
+                                "username": username,
+                                "role": normalize_admin_role(role),
+                                "is_super_admin": normalize_admin_role(role) == "super",
+                            });
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            fail("اسم المستخدم أو كلمة المرور غير صحيحة")
+        }
+    }
+}
+
 // ---------- Logs ----------
 
 #[tauri::command]
@@ -316,8 +473,16 @@ pub fn get_devices(state: tauri::State<AppState>) -> Vec<Value> {
 }
 
 #[tauri::command]
-pub fn send_device_command(state: tauri::State<AppState>, device_id: String, command: String) -> Value {
-    result(with_server(&state, |s| s.send_command(&device_id, &command)))
+pub fn send_device_command(
+    state: tauri::State<AppState>,
+    device_id: String,
+    command: String,
+    actor_username: Option<String>,
+    actor_role: Option<String>,
+) -> Value {
+    let actor = actor_username.unwrap_or_default();
+    let role = actor_role.unwrap_or_default();
+    result(with_server(&state, |s| s.send_command(&device_id, &command, &actor, &role)))
 }
 
 /// True when the device is currently registered on the local LAN server.
@@ -435,15 +600,15 @@ pub fn get_relay_devices() -> Vec<Value> {
 }
 
 #[tauri::command]
-pub fn send_relay_command(device_id: String, command: String) -> Value {
-    result(
-        relay_request(
-            &format!("/api/v1/admin/devices/{}/command", device_id),
-            "POST",
-            Some(&json!({ "command": command })),
-        )
-        .map(|_| ()),
-    )
+pub fn send_relay_command(device_id: String, command: String, actor_username: Option<String>, actor_role: Option<String>) -> Value {
+    let actor = actor_username.unwrap_or_default();
+    let role = actor_role.unwrap_or_default();
+    let res = relay_request(
+        &format!("/api/v1/admin/devices/{}/command", device_id),
+        "POST",
+        Some(&json!({ "command": command, "actor": actor, "actor_role": role })),
+    );
+    result(res.map(|_| ()))
 }
 
 #[tauri::command]
@@ -573,12 +738,14 @@ pub fn assign_device_group(state: tauri::State<AppState>, device_id: String, gro
 }
 
 #[tauri::command]
-pub fn send_group_command(group_id: String, command: String) -> Value {
+pub fn send_group_command(group_id: String, command: String, actor_username: Option<String>, actor_role: Option<String>) -> Value {
+    let actor = actor_username.unwrap_or_default();
+    let role = actor_role.unwrap_or_default();
     result(
         relay_request(
             &format!("/api/v1/admin/groups/{}/command", group_id),
             "POST",
-            Some(&json!({ "command": command })),
+            Some(&json!({ "command": command, "actor": actor, "actor_role": role })),
         )
         .map(|_| ()),
     )

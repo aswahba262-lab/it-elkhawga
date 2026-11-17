@@ -83,6 +83,20 @@ pub fn is_admin_mode() -> bool {
 
 // ---------- Config ----------
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AdminUser {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password_hash: String,
+    #[serde(default = "default_admin_role")]
+    pub role: String,
+}
+
+fn default_admin_role() -> String {
+    "super".to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_mode")]
@@ -93,6 +107,8 @@ pub struct Config {
     pub auto_start: bool,
     #[serde(default)]
     pub api_token: String,
+    #[serde(default)]
+    pub admins: Vec<AdminUser>,
     #[serde(default = "default_port")]
     pub server_port: u16,
     /// Managed relay URL (https://...) used by the admin to control remote devices.
@@ -138,6 +154,7 @@ impl Default for Config {
             password_hash: String::new(),
             auto_start: false,
             api_token: String::new(),
+            admins: Vec::new(),
             server_port: default_port(),
             relay_url: String::new(),
             admin_key: String::new(),
@@ -248,6 +265,195 @@ pub fn password_ok(cfg: &Config, supplied: &str) -> bool {
     cfg.password_hash.is_empty() || hash_password(supplied) == cfg.password_hash
 }
 
+pub fn admin_password_ok(cfg: &Config, username: &str, supplied: &str) -> bool {
+    if cfg.admins.is_empty() {
+        return password_ok(cfg, supplied);
+    }
+    cfg.admins
+        .iter()
+        .find(|u| u.username.eq_ignore_ascii_case(username))
+        .map(|u| u.password_hash.is_empty() || hash_password(supplied) == u.password_hash)
+        .unwrap_or(false)
+}
+
+pub fn normalize_admin_role(role: &str) -> String {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "super" => "super".to_string(),
+        "admin" => "admin".to_string(),
+        "support" => "support".to_string(),
+        "viewer" => "viewer".to_string(),
+        _ => "admin".to_string(),
+    }
+}
+
+pub fn admin_login_ok(cfg: &Config, username: &str, supplied: &str) -> Option<String> {
+    let username = username.trim();
+    if username.is_empty() {
+        return None;
+    }
+
+    if cfg.admins.is_empty() {
+        if cfg.password_hash.is_empty() || hash_password(supplied) == cfg.password_hash {
+            return Some("super".to_string());
+        }
+        return None;
+    }
+
+    cfg.admins
+        .iter()
+        .find(|u| u.username.eq_ignore_ascii_case(username))
+        .and_then(|u| {
+            if u.password_hash.is_empty() || hash_password(supplied) == u.password_hash {
+                Some(normalize_admin_role(&u.role))
+            } else {
+                None
+            }
+        })
+}
+
+pub fn admin_has_role(cfg: &Config, username: &str, required_role: &str) -> bool {
+    if cfg.admins.is_empty() {
+        return true;
+    }
+    let required = required_role.trim().to_ascii_lowercase();
+    cfg.admins
+        .iter()
+        .find(|u| u.username.eq_ignore_ascii_case(username))
+        .map(|u| {
+            let role = u.role.trim().to_ascii_lowercase();
+            role == "super" || role == required || (required == "super" && role == "super")
+        })
+        .unwrap_or(false)
+}
+
+pub fn can_manage_admin_users(cfg: &Config, actor_username: &str, actor_role: &str) -> bool {
+    let actor = actor_username.trim();
+    if actor.is_empty() {
+        return false;
+    }
+    if cfg.admins.is_empty() {
+        return true;
+    }
+    let role = normalize_admin_role(actor_role);
+    if role == "super" {
+        return cfg.admins.iter().any(|u| u.username.eq_ignore_ascii_case(actor) && normalize_admin_role(&u.role) == "super");
+    }
+    cfg.admins
+        .iter()
+        .find(|u| u.username.eq_ignore_ascii_case(actor))
+        .map(|u| normalize_admin_role(&u.role) == "super")
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_password_still_works() {
+        let cfg = Config {
+            password_hash: hash_password("secret"),
+            ..Default::default()
+        };
+        assert!(password_ok(&cfg, "secret"));
+        assert!(!password_ok(&cfg, "wrong"));
+    }
+
+    #[test]
+    fn multi_admin_roles_are_checked() {
+        let cfg = Config {
+            admins: vec![
+                AdminUser {
+                    username: "superadmin".to_string(),
+                    password_hash: hash_password("super-pass"),
+                    role: "super".to_string(),
+                },
+                AdminUser {
+                    username: "support".to_string(),
+                    password_hash: hash_password("support-pass"),
+                    role: "support".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(admin_password_ok(&cfg, "superadmin", "super-pass"));
+        assert!(admin_password_ok(&cfg, "support", "support-pass"));
+        assert!(!admin_password_ok(&cfg, "support", "wrong"));
+        assert!(admin_has_role(&cfg, "superadmin", "support"));
+        assert!(admin_has_role(&cfg, "support", "support"));
+        assert!(!admin_has_role(&cfg, "support", "super"));
+    }
+
+    #[test]
+    fn admin_login_helper_accepts_legacy_and_multi_admin_credentials() {
+        let legacy_cfg = Config {
+            password_hash: hash_password("legacy-secret"),
+            ..Default::default()
+        };
+        let multi_cfg = Config {
+            admins: vec![
+                AdminUser {
+                    username: "manager".to_string(),
+                    password_hash: hash_password("manager-pass"),
+                    role: "admin".to_string(),
+                },
+                AdminUser {
+                    username: "ops".to_string(),
+                    password_hash: hash_password("ops-pass"),
+                    role: "support".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(admin_login_ok(&legacy_cfg, "admin", "legacy-secret"), Some("super".to_string()));
+        assert_eq!(admin_login_ok(&multi_cfg, "manager", "manager-pass"), Some("admin".to_string()));
+        assert_eq!(admin_login_ok(&multi_cfg, "ops", "ops-pass"), Some("support".to_string()));
+        assert_eq!(admin_login_ok(&multi_cfg, "manager", "wrong"), None);
+    }
+
+    #[test]
+    fn only_super_admin_can_manage_other_admins() {
+        let cfg = Config {
+            admins: vec![
+                AdminUser {
+                    username: "superadmin".to_string(),
+                    password_hash: hash_password("super-pass"),
+                    role: "super".to_string(),
+                },
+                AdminUser {
+                    username: "manager".to_string(),
+                    password_hash: hash_password("manager-pass"),
+                    role: "admin".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(can_manage_admin_users(&cfg, "superadmin", "super"));
+        assert!(!can_manage_admin_users(&cfg, "manager", "admin"));
+        assert!(!can_manage_admin_users(&cfg, "manager", "super"));
+        assert!(!can_manage_admin_users(&cfg, "unknown", "admin"));
+    }
+
+    #[test]
+    fn client_defaults_to_fixed_relay_and_rustdesk_password() {
+        let mut c = ClientLink::default();
+        c.device_id.clear();
+        c.relay_url.clear();
+        c.rustdesk_password.clear();
+        c.pairing_token.clear();
+        c.transport.clear();
+
+        let fixed = read_client();
+        assert_eq!(fixed.relay_url, DEFAULT_RELAY_URL);
+        assert_eq!(fixed.rustdesk_password, DEFAULT_RUSTDESK_PASSWORD);
+        assert_eq!(fixed.pairing_token, DEFAULT_PAIRING_TOKEN);
+        assert_eq!(fixed.transport, "relay");
+    }
+}
+
 // ---------- Site lists ----------
 
 pub fn allowed_path() -> PathBuf {
@@ -356,11 +562,17 @@ pub fn read_client() -> ClientLink {
         c.device_id = random_hex(12);
         let _ = write_client(&c);
     }
+    if c.relay_url.trim().is_empty() {
+        c.relay_url = DEFAULT_RELAY_URL.to_string();
+    }
     if c.rustdesk_password.trim().is_empty() {
         c.rustdesk_password = DEFAULT_RUSTDESK_PASSWORD.to_string();
     }
     if c.pairing_token.trim().is_empty() {
         c.pairing_token = DEFAULT_PAIRING_TOKEN.to_string();
+    }
+    if c.transport.trim().is_empty() {
+        c.transport = if c.relay_url.trim().starts_with("http") { "relay".to_string() } else { "lan".to_string() };
     }
     c
 }

@@ -4,7 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IT ELKHAWGA - Admin</title>
-  <link rel="stylesheet" href="styles/theme.css">
+  <script>
+    const appCssVersion = Date.now();
+    const cssLink = document.createElement('link');
+    cssLink.rel = 'stylesheet';
+    cssLink.href = 'styles/theme.css?v=' + appCssVersion;
+    document.head.appendChild(cssLink);
+  </script>
 </head>
 <body>
   <div class="app">
@@ -37,6 +43,10 @@
         <button class="nav-item" data-view="settings" data-title="الإعدادات" data-sub="وضع الحجب وكلمة السر والتشغيل التلقائي">
           <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
           الإعدادات
+        </button>
+        <button class="nav-item" data-view="admins" data-title="المديرين" data-sub="إدارة حسابات المديرين والأدوار">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H7a4 4 0 00-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+          المديرين
         </button>
         <button class="nav-item" data-view="relay" data-title="الربط السحابي" data-sub="ربط الأجهزة خارج الشبكة المحلية عبر Relay">
           <svg class="icon" viewBox="0 0 24 24"><path d="M12 3v6M12 15v6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M3 12h6M15 12h6M5.6 18.4l4.2-4.2M14.2 9.8l4.2-4.2"/></svg>
@@ -77,20 +87,37 @@
 
       <!-- Dashboard -->
       <section class="view active" id="view-dashboard">
-        <div class="card hero" id="hero" style="margin-bottom:18px;">
-          <div class="ring" id="ring"><span id="ringIcon">🌐</span></div>
-          <div class="hero-text">
-            <div class="hero-title ok" id="heroTitle">الإنترنت مفتوح</div>
-            <div class="hero-desc" id="heroDesc">جميع المواقع متاحة على هذا الجهاز</div>
-            <div class="hero-actions">
-              <button class="btn btn-danger" id="blockBtn">
-                <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>
-                قفل الإنترنت
-              </button>
-              <button class="btn btn-success" id="unblockBtn">
-                <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg>
-                فتح الإنترنت
-              </button>
+        <div class="dashboard-shell">
+          <div class="card hero" id="hero" style="margin-bottom:18px;">
+            <div class="ring" id="ring"><span id="ringIcon">🌐</span></div>
+            <div class="hero-text">
+              <div class="hero-title ok" id="heroTitle">الإنترنت مفتوح</div>
+              <div class="hero-desc" id="heroDesc">جميع المواقع متاحة على هذا الجهاز</div>
+              <div class="hero-actions">
+                <button class="btn btn-danger" id="blockBtn">
+                  <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>
+                  قفل الإنترنت
+                </button>
+                <button class="btn btn-success" id="unblockBtn">
+                  <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg>
+                  فتح الإنترنت
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="dashboard-summary">
+            <div class="summary-tile">
+              <span class="summary-label">حالة الجهاز</span>
+              <strong id="summaryStatus">آمن</strong>
+            </div>
+            <div class="summary-tile">
+              <span class="summary-label">المراقبة</span>
+              <strong>نشطة</strong>
+            </div>
+            <div class="summary-tile">
+              <span class="summary-label">وضع الحجب</span>
+              <strong id="dashMode">-</strong>
             </div>
           </div>
         </div>
@@ -268,6 +295,100 @@
               <div class="field"><span class="label">تأكيد الجديدة</span><input type="password" class="input" id="confPass"></div>
             </div>
             <button class="btn btn-primary" id="savePassBtn">حفظ كلمة السر</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Admins -->
+      <section class="view" id="view-admins">
+        <div class="admin-shell">
+          <div class="admin-hero">
+            <div class="admin-hero-content">
+              <span class="pill">Security Center</span>
+              <h3>إدارة المديرين والأدوار</h3>
+              <p>راقب صلاحيات الوصول، وأضف مديرين جدد، واحتفظ بسيطرة آمنة على النظام.</p>
+            </div>
+            <div class="admin-mini-stats">
+              <div class="mini-stat">
+                <span>إجمالي المديرين</span>
+                <strong id="adminTotalStat">0</strong>
+              </div>
+              <div class="mini-stat">
+                <span>Super</span>
+                <strong id="adminSuperStat">0</strong>
+              </div>
+              <div class="mini-stat">
+                <span>Admin</span>
+                <strong id="adminNormalStat">0</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid cols-2 admin-panel-grid">
+            <div class="card admin-card admin-card-primary">
+              <div class="card-title">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M7 7a5 5 0 1110 0v1a5 5 0 01-10 0V7zM5 17a7 7 0 0114 0v1H5v-1z"/></svg>
+                تسجيل دخول مدير
+              </div>
+              <div class="field">
+                <span class="label">اسم المستخدم</span>
+                <input class="input" id="adminLoginName" placeholder="مثال: superadmin">
+              </div>
+              <div class="field">
+                <span class="label">كلمة المرور</span>
+                <input class="input" id="adminLoginPass" type="password" placeholder="أدخل كلمة المرور">
+              </div>
+              <button class="btn btn-primary" id="adminLoginBtn">اختبار الدخول</button>
+              <div id="adminLoginResult" class="hint admin-result" style="margin-top:12px;">‏</div>
+            </div>
+
+            <div class="card admin-card">
+              <div class="card-title">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+                إضافة أو تعديل مدير
+              </div>
+              <div class="field">
+                <span class="label">اسم المستخدم</span>
+                <input class="input" id="adminUserName" placeholder="مثال: ahmed">
+              </div>
+              <div class="field">
+                <span class="label">كلمة المرور</span>
+                <input class="input" id="adminUserPass" type="password" placeholder="اتركها فارغة إذا لم ترد تغييرها">
+              </div>
+              <div class="field">
+                <span class="label">الدور</span>
+                <select class="input" id="adminUserRole">
+                  <option value="super">Super</option>
+                  <option value="admin" selected>Admin</option>
+                  <option value="support">Support</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+              </div>
+              <div class="hero-actions">
+                <button class="btn btn-primary" id="saveAdminBtn">حفظ</button>
+                <button class="btn btn-ghost" id="clearAdminFormBtn">مسح</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card admin-table-card" style="margin-top:18px;">
+            <div class="card-title" style="justify-content:space-between;">
+              <span>قائمة المديرين</span>
+              <button class="btn btn-ghost btn-sm" id="refreshAdminsBtn">تحديث</button>
+            </div>
+            <div class="table-wrap">
+              <table class="table" style="min-width: 760px;">
+                <thead>
+                  <tr>
+                    <th>اسم المستخدم</th>
+                    <th>الدور</th>
+                    <th>الحالة</th>
+                    <th>إجراءات</th>
+                  </tr>
+                </thead>
+                <tbody id="adminsTableBody"></tbody>
+              </table>
+            </div>
           </div>
         </div>
       </section>
@@ -549,10 +670,10 @@
       await loadStatus();
     }
 
-    $('blockBtn').addEventListener('click', () => runAction($('blockBtn'), 'جاري القفل...', () => api.blockInternet(), 'تم قفل الإنترنت', 'فشل القفل'));
+    $('blockBtn').addEventListener('click', () => runAction($('blockBtn'), 'جاري القفل...', () => api.blockInternet(currentAdminUser, currentAdminRole), 'تم قفل الإنترنت', 'فشل القفل'));
 
     function doUnblock(pw) {
-      runAction($('unblockBtn'), 'جاري الفتح...', () => api.unblockInternet(pw), 'تم فتح الإنترنت', 'فشل الفتح');
+      runAction($('unblockBtn'), 'جاري الفتح...', () => api.unblockInternet(pw, currentAdminUser, currentAdminRole), 'تم فتح الإنترنت', 'فشل الفتح');
     }
 
     $('unblockBtn').addEventListener('click', async () => {
@@ -602,6 +723,33 @@
       if (cp) {
         navigator.clipboard.writeText($(cp.dataset.copy).textContent);
         toast('تم النسخ');
+      }
+
+      const adminEdit = e.target.closest('[data-admin-edit]');
+      if (adminEdit) {
+        const user = adminEdit.dataset.adminEdit;
+        $('adminUserName').value = user;
+        $('adminUserPass').value = '';
+        $('adminUserPass').placeholder = 'اتركها فارغة إذا لم ترد تغييرها';
+        $('adminUserRole').value = adminEdit.dataset.adminRole || 'admin';
+        $('adminUserName').focus();
+        toast('تم تحميل بيانات المدير');
+        return;
+      }
+
+      const adminDel = e.target.closest('[data-admin-remove]');
+      if (adminDel) {
+        const username = adminDel.dataset.adminRemove;
+        if (!confirm('حذف المدير "' + username + '"؟')) return;
+        try {
+          const r = await api.removeAdminUser(username);
+          if (r.success) {
+            toast('تم حذف المدير');
+            await loadAdminUsers();
+          } else {
+            toast(r.error || 'فشل الحذف', 'error');
+          }
+        } catch (err) { toast('حدث خطأ: ' + err.message, 'error'); }
       }
     });
 
@@ -661,6 +809,83 @@
       const r = await api.setPassword(cur, nw);
       if (r.success) { $('curPass').value = $('newPass').value = $('confPass').value = ''; toast('تم حفظ كلمة السر'); }
       else toast(r.error || 'فشل الحفظ', 'error');
+    });
+
+    /* ---------- Admin users ---------- */
+    async function loadAdminUsers() {
+      if (!api.getAdminUsers) return;
+      const users = await api.getAdminUsers();
+      const tbody = $('adminsTableBody');
+      const total = users.length || 0;
+      const superCount = users.filter(u => String(u.role || 'admin') === 'super').length;
+      const adminCount = users.filter(u => String(u.role || 'admin') === 'admin').length;
+      $('adminTotalStat').textContent = total;
+      $('adminSuperStat').textContent = superCount;
+      $('adminNormalStat').textContent = adminCount;
+      if (!total) {
+        tbody.innerHTML = '<tr><td colspan="4"><div class="empty">لا يوجد مديرين مسجلين بعد.</div></td></tr>';
+        return;
+      }
+      tbody.innerHTML = users.map((u) => {
+        const role = String(u.role || 'admin');
+        const state = role === 'super' ? '<span class="badge violet">Super</span>' : role === 'support' ? '<span class="badge gold">Support</span>' : role === 'viewer' ? '<span class="badge gray">Viewer</span>' : '<span class="badge green">Admin</span>';
+        return '<tr>' +
+          '<td><b>' + esc(u.username || '') + '</b></td>' +
+          '<td>' + esc(role) + '</td>' +
+          '<td>' + state + '</td>' +
+          '<td>' +
+            '<button class="btn btn-ghost btn-sm" data-admin-edit="' + esc(u.username || '') + '" data-admin-role="' + esc(role) + '">تعديل</button> ' +
+            '<button class="btn btn-danger btn-sm" data-admin-remove="' + esc(u.username || '') + '">حذف</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function clearAdminForm() {
+      $('adminUserName').value = '';
+      $('adminUserPass').value = '';
+      $('adminUserRole').value = 'admin';
+      $('adminUserPass').placeholder = 'اتركها فارغة إذا لم ترد تغييرها';
+      $('adminUserName').focus();
+    }
+
+    $('saveAdminBtn').addEventListener('click', async () => {
+      const username = $('adminUserName').value.trim();
+      const password = $('adminUserPass').value.trim();
+      const role = $('adminUserRole').value;
+      if (!username) { toast('اكتب اسم المستخدم أولاً', 'error'); return; }
+      try {
+        const r = await api.upsertAdminUser(username, password, role);
+        if (r.success) {
+          toast('تم حفظ بيانات المدير');
+          clearAdminForm();
+          await loadAdminUsers();
+        } else {
+          toast(r.error || 'فشل حفظ المدير', 'error');
+        }
+      } catch (err) { toast('حدث خطأ: ' + err.message, 'error'); }
+    });
+
+    $('clearAdminFormBtn').addEventListener('click', clearAdminForm);
+    $('refreshAdminsBtn').addEventListener('click', loadAdminUsers);
+
+    $('adminLoginBtn').addEventListener('click', async () => {
+      const username = $('adminLoginName').value.trim();
+      const password = $('adminLoginPass').value;
+      if (!username) { toast('اكتب اسم المستخدم', 'error'); return; }
+      try {
+        const r = await api.adminLogin(username, password);
+        if (r.success) {
+          $('adminLoginResult').innerHTML = '<span class="badge green">تم الدخول</span> المستخدم: <b>' + esc(username) + '</b> · الدور: <b>' + esc(r.role || 'admin') + '</b>';
+          toast('تم تسجيل الدخول بنجاح');
+        } else {
+          $('adminLoginResult').innerHTML = '<span class="badge red">فشل</span> ' + esc(r.error || 'اسم المستخدم أو كلمة المرور غير صحيحة');
+          toast(r.error || 'فشل الدخول', 'error');
+        }
+      } catch (err) {
+        $('adminLoginResult').textContent = 'حدث خطأ في تسجيل الدخول';
+        toast('حدث خطأ: ' + err.message, 'error');
+      }
     });
 
     /* ---------- Logs ---------- */
@@ -757,8 +982,8 @@
       try {
         const isRelay = b.dataset.transport === 'relay';
         const r = isRelay
-          ? await api.sendRelayCommand(b.dataset.id, b.dataset.devCmd)
-          : await api.sendDeviceCommand(b.dataset.id, b.dataset.devCmd);
+          ? await api.sendRelayCommand(b.dataset.id, b.dataset.devCmd, currentAdminUser, currentAdminRole)
+          : await api.sendDeviceCommand(b.dataset.id, b.dataset.devCmd, currentAdminUser, currentAdminRole);
         if (r && r.success === false) { toast(r.error || 'فشل إرسال الأمر', 'error'); return; }
         toast('تم إرسال الأمر' + (isRelay ? ' للـ Relay' : '، يصل خلال ثوانٍ'));
       } catch (err) { toast(err.message || 'فشل إرسال الأمر', 'error'); }
@@ -774,8 +999,8 @@
       if (e.target.closest && e.target.closest('#view-devices .table-wrap')) lanTableHover = false;
     });
 
-    $('blockAllBtn').addEventListener('click', async () => { await api.sendDeviceCommand('*', 'block'); toast('تم إرسال أمر القفل لكل الأجهزة'); });
-    $('unblockAllBtn').addEventListener('click', async () => { await api.sendDeviceCommand('*', 'unblock'); toast('تم إرسال أمر الفتح لكل الأجهزة'); });
+    $('blockAllBtn').addEventListener('click', async () => { await api.sendDeviceCommand('*', 'block', currentAdminUser, currentAdminRole); toast('تم إرسال أمر القفل لكل الأجهزة'); });
+    $('unblockAllBtn').addEventListener('click', async () => { await api.sendDeviceCommand('*', 'unblock', currentAdminUser, currentAdminRole); toast('تم إرسال أمر الفتح لكل الأجهزة'); });
 
     /* ---------- Relay ---------- */
     async function loadRelayConfig() {
@@ -868,7 +1093,7 @@
     document.addEventListener('click', async (e) => {
       const b = e.target.closest('[data-relay-cmd]');
       if (!b) return;
-      const r = await api.sendRelayCommand(b.dataset.id, b.dataset.relayCmd);
+      const r = await api.sendRelayCommand(b.dataset.id, b.dataset.relayCmd, currentAdminUser, currentAdminRole);
       if (r && r.success) toast('تم إرسال الأمر للـ Relay');
       else toast((r && r.error) || 'فشل إرسال الأمر', 'error');
     });
@@ -1224,8 +1449,8 @@
         if (isNaN(kbps) || kbps < 0) { toast('قيمة غير صالحة', 'error'); return; }
         try {
           const r = isLan
-            ? await api.sendDeviceCommand(id, 'throttle:' + kbps)
-            : await api.sendRelayCommand(id, 'throttle:' + kbps);
+            ? await api.sendDeviceCommand(id, 'throttle:' + kbps, currentAdminUser, currentAdminRole)
+            : await api.sendRelayCommand(id, 'throttle:' + kbps, currentAdminUser, currentAdminRole);
           if (r && r.success !== false) {
             toast(kbps > 0 ? ('تم إرسال حد ' + kbps + 'Kbps') : 'تم إلغاء الحد');
             if (thr.blur) thr.blur();
@@ -1287,7 +1512,7 @@
       const gc = e.target.closest('[data-grp-cmd]');
       if (gc) {
         try {
-          const r = await api.sendGroupCommand(gc.dataset.id, gc.dataset.grpCmd);
+          const r = await api.sendGroupCommand(gc.dataset.id, gc.dataset.grpCmd, currentAdminUser, currentAdminRole);
           if (r && r.success) toast('تم إرسال أمر المجموعة'); else toast((r && r.error) || 'فشل', 'error');
         } catch (err) { toast(err.message || 'فشل', 'error'); }
         return;
@@ -1314,6 +1539,7 @@
       loadRelayDevices();
       loadAlerts();
       loadKpis();
+      loadAdminUsers();
     })();
   </script>
 </body>

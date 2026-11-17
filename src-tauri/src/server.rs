@@ -143,6 +143,23 @@ fn rid(prefix: &str) -> String {
     format!("{}{}", prefix, uuid::Uuid::new_v4().to_string().replace('-', ""))
 }
 
+fn record_audit(reg: &mut Registry, actor: &str, action: &str, target: Option<&str>, result: &str, meta: &str) {
+    let actor_name = actor.trim();
+    let entry = AuditEntry {
+        id: rid("act_"),
+        actor: if actor_name.is_empty() { "admin".to_string() } else { actor_name.to_string() },
+        action: action.to_string(),
+        target: target.map(str::to_string),
+        result: result.to_string(),
+        meta: meta.to_string(),
+        created_at: now(),
+    };
+    reg.audit_log.push(entry);
+    if reg.audit_log.len() > 500 {
+        reg.audit_log.drain(..reg.audit_log.len().saturating_sub(500));
+    }
+}
+
 /// Binds the first free port starting at `preferred` and serves clients on a background thread.
 pub fn start(token: String, preferred: u16) -> Result<ServerHandle, String> {
     let mut last_err = String::new();
@@ -270,6 +287,21 @@ fn handle_poll(mut req: Request, registry: &Arc<Mutex<Registry>>) {
         } else {
             poll.denied.clone()
         };
+        if !poll.denied.is_empty() {
+            for host in &poll.denied {
+                if !host.trim().is_empty() {
+                    reg.audit_log.push(AuditEntry {
+                        id: rid("denied_"),
+                        actor: format!("device:{}", poll.device_id),
+                        action: "site_denied".to_string(),
+                        target: Some(host.clone()),
+                        result: "denied".to_string(),
+                        meta: poll.hostname.clone(),
+                        created_at: now(),
+                    });
+                }
+            }
+        }
         let rustdesk_id = if poll.rustdesk_id.is_empty() {
             old.as_ref().map(|d| d.rustdesk_id.clone()).unwrap_or_default()
         } else {
@@ -543,15 +575,17 @@ fn handle_admin(mut req: Request, registry: &Arc<Mutex<Registry>>, url: &str, me
             let _ = req.respond(json_response(json!({"ok": false, "error": "no device"}), 404));
             return;
         };
+        let actor = body_val["actor"].as_str().unwrap_or("admin");
         let mut count = 0;
         for id in targets {
             if command_type.starts_with("throttle:") {
                 let kbps = command_type.strip_prefix("throttle:").unwrap().parse::<u64>().unwrap_or(0);
-                reg.pending_throttle.insert(id, kbps);
+                reg.pending_throttle.insert(id.clone(), kbps);
             } else {
-                reg.pending.insert(id, command_type.to_string());
+                reg.pending.insert(id.clone(), command_type.to_string());
             }
             count += 1;
+            record_audit(&mut reg, actor, if command_type == "block" { "device_block" } else { "device_unblock" }, Some(&id), "ok", raw);
         }
         let _ = req.respond(json_response(json!({"ok": true, "queued": count}), 200));
         return;
@@ -788,7 +822,7 @@ impl ServerHandle {
 
     /// Queues a one-shot command for a device, or for every online device when `device_id` is "*".
     /// Supports: "block", "unblock", "throttle:<kbps>"
-    pub fn send_command(&self, device_id: &str, command: &str) -> Result<(), String> {
+    pub fn send_command(&self, device_id: &str, command: &str, actor: &str, actor_role: &str) -> Result<(), String> {
         let valid = command == "block" || command == "unblock" || command.starts_with("throttle:");
         if !valid {
             return Err("أمر غير معروف".into());
@@ -813,6 +847,7 @@ impl ServerHandle {
                     if command == "block" { d.blocked = true; }
                     else if command == "unblock" { d.blocked = false; }
                 }
+                record_audit(&mut reg, actor, if command == "block" { "device_block" } else { "device_unblock" }, Some(&id), "queued", actor_role);
             }
         } else if reg.devices.contains_key(device_id) {
             if command.starts_with("throttle:") {
@@ -825,6 +860,7 @@ impl ServerHandle {
                 if command == "block" { d.blocked = true; }
                 else if command == "unblock" { d.blocked = false; }
             }
+            record_audit(&mut reg, actor, if command == "block" { "device_block" } else { "device_unblock" }, Some(device_id), "queued", actor_role);
         } else {
             return Err("الجهاز غير موجود".into());
         }
@@ -1010,7 +1046,7 @@ impl ServerHandle {
         }
     }
 
-    pub fn send_group_command(&self, group_id: String, command: String) -> Result<u64, String> {
+    pub fn send_group_command(&self, group_id: String, command: String, actor: &str, actor_role: &str) -> Result<u64, String> {
         let mut reg = self.registry.lock().unwrap();
         if !reg.groups.contains_key(&group_id) {
             return Err("no group".into());
@@ -1023,8 +1059,9 @@ impl ServerHandle {
         let targets: Vec<_> = reg.devices.values().filter(|d| d.group_id == group_id).map(|d| d.device_id.clone()).collect();
         let mut count = 0;
         for id in targets {
-            reg.pending.insert(id, cmd_type.to_string());
+            reg.pending.insert(id.clone(), cmd_type.to_string());
             count += 1;
+            record_audit(&mut reg, actor, if cmd_type == "block" { "group_block" } else { "group_unblock" }, Some(&id), "queued", actor_role);
         }
         Ok(count)
     }

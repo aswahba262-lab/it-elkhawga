@@ -4,7 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IT ELKHAWGA</title>
-  <link rel="stylesheet" href="styles/theme.css">
+  <script>
+    const appCssVersion = Date.now();
+    const cssLink = document.createElement('link');
+    cssLink.rel = 'stylesheet';
+    cssLink.href = 'styles/theme.css?v=' + appCssVersion;
+    document.head.appendChild(cssLink);
+  </script>
   <style>
     body { overflow-y: auto; }
     .wrap { max-width: 720px; margin: 0 auto; padding: 26px 22px 40px; }
@@ -249,7 +255,7 @@
       await loadStatus();
     }
 
-    $('blockBtn').addEventListener('click', () => run($('blockBtn'), 'جاري القفل...', () => api.blockInternet(), 'تم قفل الإنترنت', 'فشل القفل'));
+    $('blockBtn').addEventListener('click', () => run($('blockBtn'), 'جاري القفل...', () => api.blockInternet('', ''), 'تم قفل الإنترنت', 'فشل القفل'));
 
     $('unblockBtn').addEventListener('click', () => {
       $('passInput').value = '';
@@ -260,7 +266,7 @@
     $('passOk').addEventListener('click', () => {
       const pw = $('passInput').value;
       $('passModal').classList.remove('show');
-      run($('unblockBtn'), 'جاري الفتح...', () => api.unblockInternet(pw), 'تم فتح الإنترنت', 'كلمة السر غير صحيحة أو تم الإلغاء');
+      run($('unblockBtn'), 'جاري الفتح...', () => api.unblockInternet(pw, '', ''), 'تم فتح الإنترنت', 'كلمة السر غير صحيحة أو تم الإلغاء');
     });
     $('passInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passOk').click(); });
 

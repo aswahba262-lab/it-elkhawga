@@ -7,8 +7,15 @@
   window.electronAPI = {
     getStatus: () => invoke('get_status'),
     getMode: () => invoke('get_mode'),
-    blockInternet: () => invoke('block_internet'),
-    unblockInternet: (password) => invoke('unblock_internet', { password: password || null }),
+    blockInternet: (actorUsername, actorRole) => invoke('block_internet', {
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
+    unblockInternet: (password, actorUsername, actorRole) => invoke('unblock_internet', {
+      password: password || null,
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
     getAllowedSites: () => invoke('get_allowed_sites'),
     getBlockedSites: () => invoke('get_blocked_sites'),
     addSite: (site) => invoke('add_site', { site }),
@@ -20,9 +27,28 @@
     setListMode: (mode) => invoke('set_list_mode', { mode }),
     toggleAutostart: (enable) => invoke('toggle_autostart', { enable }),
     setPassword: (currentPassword, newPassword) => invoke('set_password', { currentPassword, newPassword }),
+    getAdminUsers: () => invoke('get_admin_users'),
+    upsertAdminUser: (username, password, role, actorUsername, actorRole) => invoke('upsert_admin_user', {
+      username,
+      password,
+      role: role || null,
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
+    removeAdminUser: (username, actorUsername, actorRole) => invoke('remove_admin_user', {
+      username,
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
+    adminLogin: (username, password) => invoke('admin_login', { username, password }),
     getServerInfo: () => invoke('get_server_info'),
     getDevices: () => invoke('get_devices'),
-    sendDeviceCommand: (deviceId, command) => invoke('send_device_command', { deviceId, command }),
+    sendDeviceCommand: (deviceId, command, actorUsername, actorRole) => invoke('send_device_command', {
+      deviceId,
+      command,
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
     getRelayConfig: () => invoke('get_relay_config'),
     setRelayConfig: (relayUrl, adminKey, currentPassword, rustdeskServer, rustdeskKey, rustdeskPassword) =>
       invoke('set_relay_config', {
@@ -35,7 +61,12 @@
       }),
     createPairingToken: (label) => invoke('create_pairing_token', { label: label || null }),
     getRelayDevices: () => invoke('get_relay_devices'),
-    sendRelayCommand: (deviceId, command) => invoke('send_relay_command', { deviceId, command }),
+    sendRelayCommand: (deviceId, command, actorUsername, actorRole) => invoke('send_relay_command', {
+      deviceId,
+      command,
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
     syncPolicy: () => invoke('sync_policy_now'),
     getRelayGroups: () => invoke('get_relay_groups'),
     getDashboardStats: () => invoke('get_dashboard_stats'),
@@ -46,7 +77,12 @@
     updateRelayGroup: (groupId, name, mode, allowed, blocked) => invoke('update_relay_group', { groupId, name, mode, allowed, blocked }),
     deleteRelayGroup: (groupId) => invoke('delete_relay_group', { groupId }),
     assignDeviceGroup: (deviceId, groupId) => invoke('assign_device_group', { deviceId, groupId: groupId || null }),
-    sendGroupCommand: (groupId, command) => invoke('send_group_command', { groupId, command }),
+    sendGroupCommand: (groupId, command, actorUsername, actorRole) => invoke('send_group_command', {
+      groupId,
+      command,
+      actor_username: actorUsername || '',
+      actor_role: actorRole || ''
+    }),
     renameRelayDevice: (deviceId, label) => invoke('rename_relay_device', { deviceId, label }),
     deleteRelayDevice: (deviceId) => invoke('delete_relay_device', { deviceId }),
     openSupportSession: (rustdeskId) => invoke('open_support_session', { rustdeskId }),

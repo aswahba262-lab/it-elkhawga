@@ -77,6 +77,7 @@ try { db.exec("ALTER TABLE devices ADD COLUMN sites TEXT DEFAULT '[]'"); } catch
 try { db.exec("ALTER TABLE devices ADD COLUMN denied TEXT DEFAULT '[]'"); } catch (e) { /* already exists */ }
 try { db.exec("CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, device_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL, meta TEXT DEFAULT '{}', created_at INTEGER NOT NULL, acked_at INTEGER, acked_by TEXT)"); } catch (e) {}
 try { db.exec("CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, result TEXT, meta TEXT DEFAULT '{}', created_at INTEGER NOT NULL)"); } catch (e) {}
+try { db.exec("CREATE TABLE IF NOT EXISTS admin_users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'admin', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"); } catch (e) {}
 try { db.exec("ALTER TABLE devices ADD COLUMN rustdesk_id TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN rustdesk_password TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN screen_requested INTEGER DEFAULT 0"); } catch (e) { /* already exists */ }
@@ -93,7 +94,7 @@ function json(res, status, body) {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': CORS_ORIGIN,
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
   });
   res.end(raw);
 }
@@ -166,6 +167,49 @@ const server = http.createServer(async (req, res) => {
       audit('admin', 'pairing_token', token.slice(0, 12), 'ok', {label: body.label || ''});
       return json(res, 200, {ok:true, token, expires_at: exp});
     }
+    // Shared admin accounts across all admin installs.
+    if (req.method === 'GET' && url.pathname === '/api/v1/admin/users') {
+      if (!requireAdmin(req,res)) return;
+      const rows = db.prepare('SELECT username, role FROM admin_users ORDER BY username ASC').all();
+      return json(res, 200, { ok: true, users: rows.map(r => ({ username: r.username, role: r.role })) });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/users') {
+      if (!requireAdmin(req,res)) return;
+      const body = await readBody(req);
+      const username = String(body.username || '').trim();
+      const password = String(body.password || '');
+      const role = String(body.role || 'admin').trim() || 'admin';
+      if (!username) return json(res, 400, { ok: false, error: 'username required' });
+      const key = sha256(password);
+      const nowTs = now();
+      db.prepare(`INSERT INTO admin_users(username,password_hash,role,created_at,updated_at)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash, role=excluded.role, updated_at=excluded.updated_at`)
+        .run(username, key, role, nowTs, nowTs);
+      audit(String(body.actor_username || 'admin'), 'admin_user_upsert', username, 'ok', { role });
+      return json(res, 200, { ok: true });
+    }
+    const adminUserMatch = url.pathname.match(/^\/api\/v1\/admin\/users\/([^/]+)$/);
+    if (adminUserMatch && req.method === 'DELETE') {
+      if (!requireAdmin(req,res)) return;
+      const username = decodeURIComponent(adminUserMatch[1]).replace(/%20/g, ' ');
+      const removed = db.prepare('DELETE FROM admin_users WHERE username=?').run(username).changes;
+      audit('admin', 'admin_user_delete', username, removed ? 'ok' : 'not_found', {});
+      return json(res, 200, { ok: true, deleted: !!removed });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/login') {
+      if (!requireAdmin(req,res)) return;
+      const body = await readBody(req);
+      const username = String(body.username || '').trim();
+      const password = String(body.password || '');
+      if (!username) return json(res, 401, { ok: false, error: 'missing username' });
+      const row = db.prepare('SELECT username, role, password_hash FROM admin_users WHERE lower(username)=lower(?)').get(username);
+      if (!row) return json(res, 401, { ok: false, error: 'invalid credentials' });
+      const ok = row.password_hash === sha256(password);
+      if (!ok) return json(res, 401, { ok: false, error: 'invalid credentials' });
+      return json(res, 200, { ok: true, success: true, username: row.username, role: row.role, is_super_admin: row.role === 'super' });
+    }
+
     // ----- Dashboard KPIs -----
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/stats') {
       if (!requireAdmin(req,res)) return;
