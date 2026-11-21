@@ -40,113 +40,70 @@ $inetKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings"
 $inetPolicyKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
 $overrideList = ""
 
-# 1. Windows proxy (machine-wide)
-if ($mode -eq "whitelist") {
-    $allowedSites = Read-List $allowedSitesFile
-
-    $overrideList = ($allowedSites | ForEach-Object {
-        $domain = $_ -replace "^https?://", "" -replace "^www\.", ""
-        "*.$domain;www.$domain;$domain"
-    }) -join ";"
-    $overrideList = "<local>;$overrideList"
-
-    if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
-    try { Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord } catch { }
-
-    try { Set-ItemProperty -Path $inetKey -Name "ProxyEnable" -Value 1 -Type DWord } catch { }
-    try { Set-ItemProperty -Path $inetKey -Name "ProxyServer" -Value "127.0.0.1:8080" -Type String } catch { }
-    try { Set-ItemProperty -Path $inetKey -Name "ProxyOverride" -Value $overrideList -Type String } catch { }
-    Write-Host "OK: proxy set" -ForegroundColor Green
-} else {
-    if (Test-Path $inetKey) {
-        try { Set-ItemProperty -Path $inetKey -Name "ProxyEnable" -Value 0 -Type DWord } catch { }
-        Remove-ItemProperty -Path $inetKey -Name "ProxyServer" -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path $inetKey -Name "ProxyOverride" -ErrorAction SilentlyContinue
+# 1. Windows proxy (machine-wide + all loaded user hives so SYSTEM agent updates active sessions immediately)
+$userInetKeys = @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+try {
+    Get-ChildItem "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | Where-Object {
+        $_.PSChildName -match "^S-1-5-21-\d+-\d+-\d+-\d+$"
+    } | ForEach-Object {
+        $uk = "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (Test-Path $uk) { $userInetKeys += $uk }
     }
-    Remove-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -ErrorAction SilentlyContinue
-    Write-Host "OK: blacklist mode, proxy left off" -ForegroundColor Green
+} catch { }
+$userInetKeys = $userInetKeys | Select-Object -Unique
+
+# Always route traffic through our local proxy on 127.0.0.1:8080 when blocking is active
+# (in both whitelist and blacklist modes) so blocked sites are enforced, logged, and trigger notifications.
+$overrideList = "<local>;localhost;127.0.0.1"
+
+if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
+try { Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord } catch { }
+
+foreach ($k in (@($inetKey) + $userInetKeys)) {
+    if (Test-Path $k) {
+        try { Set-ItemProperty -Path $k -Name "ProxyEnable" -Value 1 -Type DWord } catch { }
+        try { Set-ItemProperty -Path $k -Name "ProxyServer" -Value "127.0.0.1:8080" -Type String } catch { }
+        try { Set-ItemProperty -Path $k -Name "ProxyOverride" -Value $overrideList -Type String } catch { }
+    }
 }
+Write-Host "OK: proxy set (mode: $mode)" -ForegroundColor Green
 
 # 2. Chrome / Edge policies.
-# Chrome/Edge upgrade to DNS-over-HTTPS by themselves, which skips the hosts file
-# entirely. Turning DoH off makes the hosts block effective. In whitelist mode the
-# proxy is also pinned by policy; a browser proxy policy ignores the Windows bypass
-# list, so the allowed sites are repeated as ProxyBypassList.
+# Disable DNS-over-HTTPS and QUIC/UDP bypass while blocked and pin local proxy.
 foreach ($key in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\Policies\Microsoft\Edge")) {
     try {
         if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
         Set-ItemProperty -Path $key -Name "DnsOverHttpsMode" -Value "off" -Type String
+        Set-ItemProperty -Path $key -Name "QuicAllowed" -Value 0 -Type DWord
 
-        if ($mode -eq "whitelist") {
-            $bypass = (($overrideList -split ";") | Where-Object { $_ }) -join ","
-            Set-ItemProperty -Path $key -Name "ProxyMode" -Value "fixed_servers" -Type String
-            Set-ItemProperty -Path $key -Name "ProxyServer" -Value "127.0.0.1:8080" -Type String
-            Set-ItemProperty -Path $key -Name "ProxyBypassList" -Value $bypass -Type String
-        } else {
-            foreach ($n in @("ProxyMode", "ProxyServer", "ProxyBypassList")) {
-                Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue
-            }
-        }
+        $bypass = (($overrideList -split ";") | Where-Object { $_ }) -join ","
+        Set-ItemProperty -Path $key -Name "ProxyMode" -Value "fixed_servers" -Type String
+        Set-ItemProperty -Path $key -Name "ProxyServer" -Value "127.0.0.1:8080" -Type String
+        Set-ItemProperty -Path $key -Name "ProxyBypassList" -Value $bypass -Type String
     } catch { }
 }
 Write-Host "OK: browser policies applied" -ForegroundColor Green
 
-# 3. hosts file
+# 3. Clean any legacy hosts block markers so blocked domains go through 127.0.0.1:8080
+# and can display/trigger the "blocked by IT ELKHAWGA" alert instead of silent 127.0.0.1 failure.
 $hostsFile = "$env:SystemRoot\System32\drivers\etc\hosts"
 $startMarker = "# === BLOCKED SITES START ==="
 $endMarker = "# === BLOCKED SITES END ==="
 
 $newHosts = @()
 $inBlock = $false
-foreach ($line in (Get-Content $hostsFile)) {
-    if ($line -eq $startMarker) { $inBlock = $true; continue }
+$hadBlock = $false
+foreach ($line in (Get-Content $hostsFile -ErrorAction SilentlyContinue)) {
+    if ($line -eq $startMarker) { $inBlock = $true; $hadBlock = $true; continue }
     if ($line -eq $endMarker) { $inBlock = $false; continue }
     if (-not $inBlock) { $newHosts += $line }
 }
-
-$blockList = @()
-# The built-in "distraction" list is only meaningful in blacklist mode. In whitelist
-# mode the proxy already denies everything except the allowed list, so hardcoding
-# these domains in hosts would also block sites the admin explicitly allowed.
-if ($mode -eq "blacklist") {
-    $blockList += @("youtube.com", "facebook.com", "m.facebook.com", "twitter.com", "x.com",
-        "instagram.com", "tiktok.com", "reddit.com", "netflix.com", "twitch.tv",
-        "snapchat.com", "pinterest.com", "linkedin.com")
+if ($hadBlock) {
+    try {
+        $newHosts | Out-File $hostsFile -Encoding ASCII -Force
+        Write-Host "OK: legacy hosts block cleaned" -ForegroundColor Green
+    } catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
 }
-$blockList += Read-List $blockedSitesFile
-
-# In whitelist mode an allowed site must never end up in the hosts block, otherwise
-# the 127.0.0.1 entry overrides the proxy bypass and the site cannot open.
-$allowedNorm = @()
-if ($mode -eq "whitelist") {
-    $allowedNorm = (Read-List $allowedSitesFile | ForEach-Object {
-        ($_ -replace "^https?://", "" -replace "^www.", "" -replace "/.*$", "").ToLower()
-    })
-}
-
-# Names are validated by the app; keep only plain hostname characters here too.
-$names = @()
-foreach ($site in ($blockList | Select-Object -Unique)) {
-    $d = ($site -replace "^https?://", "" -replace "/.*$", "").ToLower()
-    $d = $d -replace "^www.", ""
-    if ($d -notmatch "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$") { continue }
-    if ($mode -eq "whitelist" -and ($allowedNorm -contains $d)) { continue }
-    $names += $d
-    if (-not $d.StartsWith("www.")) { $names += "www.$d" }
-}
-$names = $names | Select-Object -Unique
-
-if ($names.Count -gt 0) {
-    $newHosts += ""
-    $newHosts += $startMarker
-    $newHosts += "# Blocked on: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    foreach ($n in $names) { $newHosts += "127.0.0.1    $n" }
-    $newHosts += $endMarker
-}
-try {
-    $newHosts | Out-File $hostsFile -Encoding ASCII -Force
-    Write-Host "OK: hosts updated" -ForegroundColor Green
-} catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
 
 # 4. Flush DNS and tell WinINET to reload
 ipconfig /flushdns | Out-Null

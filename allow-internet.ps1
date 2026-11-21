@@ -69,18 +69,28 @@ foreach ($n in @("ProxySettingsPerUser", "ProxyServer", "ProxyOverride", "AutoCo
     Remove-ItemProperty -Path $inetPolicyKey -Name $n -ErrorAction SilentlyContinue
 }
 
-$userKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-if (Test-Path $userKey) {
-    Set-ItemProperty -Path $userKey -Name "ProxyEnable" -Value 0 -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $userKey -Name "ProxyServer" -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $userKey -Name "ProxyOverride" -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $userKey -Name "AutoConfigURL" -ErrorAction SilentlyContinue
+$userInetKeys = @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+try {
+    Get-ChildItem "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | Where-Object {
+        $_.PSChildName -match "^S-1-5-21-\d+-\d+-\d+-\d+$"
+    } | ForEach-Object {
+        $uk = "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (Test-Path $uk) { $userInetKeys += $uk }
+    }
+} catch { }
+foreach ($uk in ($userInetKeys | Select-Object -Unique)) {
+    if (Test-Path $uk) {
+        Set-ItemProperty -Path $uk -Name "ProxyEnable" -Value 0 -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $uk -Name "ProxyServer" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $uk -Name "ProxyOverride" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $uk -Name "AutoConfigURL" -ErrorAction SilentlyContinue
+    }
 }
 Write-Host "OK: proxy disabled" -ForegroundColor Green
 
 # 2. Chrome / Edge policies set by block-internet.ps1
 foreach ($key in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\Policies\Microsoft\Edge")) {
-    foreach ($n in @("DnsOverHttpsMode", "ProxyMode", "ProxyServer", "ProxyBypassList")) {
+    foreach ($n in @("DnsOverHttpsMode", "QuicAllowed", "ProxyMode", "ProxyServer", "ProxyBypassList")) {
         Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue
     }
 }

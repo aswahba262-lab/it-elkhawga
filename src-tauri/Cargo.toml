@@ -17,6 +17,12 @@ tiny_http = "0.12"
 ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }
 rand = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
+jsonwebtoken = "9"
+chrono = "0.4"
+png = "0.18"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = "z"

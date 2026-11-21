@@ -18,10 +18,12 @@ impl Transport {
             "relay" => Transport::Relay,
             "lan" => Transport::Lan,
             _ => {
-                if link.relay_url.starts_with("https://") || link.relay_url.starts_with("http://") {
-                    Transport::Relay
-                } else if link.server_url.starts_with("http://") {
+                // Prefer the local admin server whenever it is explicitly configured.
+                // Relay is only used when the device is intentionally linked to one.
+                if !link.server_url.trim().is_empty() {
                     Transport::Lan
+                } else if !link.relay_url.trim().is_empty() {
+                    Transport::Relay
                 } else {
                     Transport::Lan
                 }
@@ -30,6 +32,12 @@ impl Transport {
     }
 
 
+}
+
+pub enum RelayPollOutcome {
+    Ok(Option<Value>, Option<Value>, bool, String),
+    Unauthorized,
+    NetworkError,
 }
 
 pub struct RelayClient {
@@ -71,30 +79,91 @@ impl RelayClient {
     }
 
     /// Outbound poll: sends state, ACKs any previous command, receives pending command + policy.
-    /// Uploads a base64 screenshot captured in the user session.
-    pub fn upload_screen(&self, relay_url: &str, device_token: &str, image: &str) -> Option<Value> {
-        self.post(relay_url, "/api/v1/device/screen", device_token, json!({"image": image}))
+    /// Uploads a base64 frame or stream status (`screen` or `camera`) captured in the user session.
+    pub fn upload_screen_frame(
+        &self,
+        relay_url: &str,
+        device_token: &str,
+        image: &str,
+        kind: &str,
+        error: &str,
+    ) -> Option<Value> {
+        self.post(
+            relay_url,
+            "/api/v1/device/screen",
+            device_token,
+            json!({"image": image, "kind": kind, "error": error}),
+        )
     }
 
-    pub fn poll(
+    pub fn upload_screen(&self, relay_url: &str, device_token: &str, image: &str) -> Option<Value> {
+        self.upload_screen_frame(relay_url, device_token, image, "screen", "")
+    }
+
+    /// Uploads an exact archived copy of a user-uploaded file (up to 64 MB raw) to the relay.
+    pub fn upload_file(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
+        let url = format!("{}/api/v1/device/file", relay_url.trim_end_matches('/'));
+        let resp = tls_agent(180)
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(payload.clone());
+        resp.ok().and_then(|r| r.into_json().ok())
+    }
+
+    /// Reports a security alert (usb, tamper, exfil) to the relay.
+    pub fn report_alert(&self, relay_url: &str, device_token: &str, alert: &Value) -> Option<Value> {
+        if alert.is_null() {
+            return None;
+        }
+        let url = format!("{}/api/v1/device/alert", relay_url.trim_end_matches('/'));
+        let resp = tls_agent(60)
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(alert.clone());
+        resp.ok().and_then(|r| r.into_json().ok())
+    }
+
+    pub fn poll_status(
         &self,
         relay_url: &str,
         device_token: &str,
         state: &Value,
         ack_command_id: Option<&str>,
-    ) -> Option<(Option<Value>, Option<Value>, bool)> {
+    ) -> RelayPollOutcome {
         let mut body = state.clone();
         if let Some(id) = ack_command_id {
             body["ack_command_id"] = json!(id);
         }
-        let v = self.post(relay_url, "/api/v1/device/poll", device_token, body)?;
-        if !v["ok"].as_bool().unwrap_or(false) {
-            return None;
+        let url = format!("{}/api/v1/device/poll", relay_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(body);
+        match resp {
+            Ok(r) => match r.into_json::<Value>() {
+                Ok(v) => {
+                    if !v["ok"].as_bool().unwrap_or(false) {
+                        return RelayPollOutcome::Unauthorized;
+                    }
+                    let command = v.get("command").and_then(|c| if c.is_null() { None } else { Some(c.clone()) });
+                    let policy = v.get("policy").and_then(|p| if p.is_null() { None } else { Some(p.clone()) });
+                    let screen = v.get("screen").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let stream_mode = v
+                        .get("stream_mode")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or(if screen { "once" } else { "" })
+                        .to_string();
+                    RelayPollOutcome::Ok(command, policy, screen, stream_mode)
+                }
+                Err(_) => RelayPollOutcome::NetworkError,
+            },
+            Err(ureq::Error::Status(401 | 403, _)) => RelayPollOutcome::Unauthorized,
+            Err(_) => RelayPollOutcome::NetworkError,
         }
-        let command = v.get("command").and_then(|c| if c.is_null() { None } else { Some(c.clone()) });
-        let policy = v.get("policy").and_then(|p| if p.is_null() { None } else { Some(p.clone()) });
-        let screen = v.get("screen").and_then(|s| s.as_bool()).unwrap_or(false);
-        Some((command, policy, screen))
     }
 }
 
@@ -123,13 +192,38 @@ pub fn lan_poll(http: &ureq::Agent, link: &ClientLink, ack_command_id: Option<&s
     resp.ok().and_then(|r| r.into_json().ok())
 }
 
-/// Upload a screenshot to the LAN admin server.
-pub fn lan_upload_screen(http: &ureq::Agent, link: &ClientLink, image: &str) -> Option<Value> {
-    let body = json!({ "image": image, "device_id": link.device_id });
+/// Upload a screenshot or camera stream frame to the LAN admin server.
+pub fn lan_upload_screen_frame(
+    http: &ureq::Agent,
+    link: &ClientLink,
+    image: &str,
+    kind: &str,
+    error: &str,
+) -> Option<Value> {
+    let body = json!({
+        "image": image,
+        "kind": kind,
+        "error": error,
+        "device_id": link.device_id
+    });
     let resp = http
         .post(&format!("{}/api/v1/device/screen", link.server_url.trim_end_matches('/')))
         .set("Authorization", &format!("Bearer {}", link.token))
         .set("Content-Type", "application/json")
         .send_json(body);
+    resp.ok().and_then(|r| r.into_json().ok())
+}
+
+pub fn lan_upload_screen(http: &ureq::Agent, link: &ClientLink, image: &str) -> Option<Value> {
+    lan_upload_screen_frame(http, link, image, "screen", "")
+}
+
+/// Upload an archived copy of a user-uploaded file to the LAN admin server.
+pub fn lan_upload_file(http: &ureq::Agent, link: &ClientLink, payload: &Value) -> Option<Value> {
+    let resp = http
+        .post(&format!("{}/api/v1/device/file", link.server_url.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", link.token))
+        .set("Content-Type", "application/json")
+        .send_json(payload.clone());
     resp.ok().and_then(|r| r.into_json().ok())
 }

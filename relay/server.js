@@ -78,12 +78,112 @@ try { db.exec("ALTER TABLE devices ADD COLUMN denied TEXT DEFAULT '[]'"); } catc
 try { db.exec("CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, device_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL, meta TEXT DEFAULT '{}', created_at INTEGER NOT NULL, acked_at INTEGER, acked_by TEXT)"); } catch (e) {}
 try { db.exec("CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, result TEXT, meta TEXT DEFAULT '{}', created_at INTEGER NOT NULL)"); } catch (e) {}
 try { db.exec("CREATE TABLE IF NOT EXISTS admin_users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'admin', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"); } catch (e) {}
+try { db.exec("CREATE TABLE IF NOT EXISTS uploaded_files (file_id TEXT PRIMARY KEY, device_id TEXT, file_name TEXT, file_size INTEGER DEFAULT 0, stored_path TEXT, created_at INTEGER NOT NULL)"); } catch (e) {}
+for (const colSql of [
+  "ALTER TABLE uploaded_files ADD COLUMN device_name TEXT DEFAULT ''",
+  "ALTER TABLE uploaded_files ADD COLUMN windows_user TEXT DEFAULT ''",
+  "ALTER TABLE uploaded_files ADD COLUMN channel TEXT DEFAULT 'whatsapp_web'",
+  "ALTER TABLE uploaded_files ADD COLUMN recipient_name TEXT DEFAULT ''",
+  "ALTER TABLE uploaded_files ADD COLUMN recipient_phone TEXT DEFAULT ''",
+  "ALTER TABLE uploaded_files ADD COLUMN page_url TEXT DEFAULT ''",
+  "ALTER TABLE uploaded_files ADD COLUMN sha256 TEXT DEFAULT ''",
+]) {
+  try { db.exec(colSql); } catch (e) { /* already exists */ }
+}
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
+const ARCHIVE_ROOT = path.resolve(process.env.ARCHIVE_DIR || 'C:/IT-ELKHAWGA-Archive');
+for (const sub of ['WhatsApp', 'Web-Uploads']) {
+  try { fs.mkdirSync(path.join(ARCHIVE_ROOT, sub), { recursive: true }); } catch (e) {}
+}
+
+function sanitizeWinSegment(raw, fallback, maxLen = 70) {
+  let s = String(raw || '').trim()
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/g, '');
+  if (!s) s = fallback;
+  if (/^(con|prn|aux|nul|com\d|lpt\d)$/i.test(s)) s = '_' + s;
+  return s.slice(0, maxLen) || fallback;
+}
+
+function buildArchiveFilePath({ channel, deviceName, recipientName, recipientPhone, origName, tsMs }) {
+  const d = new Date(tsMs || Date.now());
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const dayStr = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const timeStr = `${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`;
+  const chanDir = String(channel || '').includes('whatsapp') ? 'WhatsApp' : 'Web-Uploads';
+  const devDir = sanitizeWinSegment(deviceName, 'Unknown-Device', 60);
+  const dir = path.join(ARCHIVE_ROOT, chanDir, dayStr, devDir);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const recipRaw = recipientPhone || recipientName || '';
+  const recipTag = recipRaw ? sanitizeWinSegment(recipRaw, '', 40) + '__' : '';
+  const cleanOrig = sanitizeWinSegment(origName, 'file.bin', 130);
+  const dotIdx = cleanOrig.lastIndexOf('.');
+  const stem = dotIdx > 0 ? cleanOrig.slice(0, dotIdx) : cleanOrig;
+  const ext = dotIdx > 0 ? cleanOrig.slice(dotIdx) : '';
+
+  let candidate = path.join(dir, `${timeStr}__${recipTag}${stem}${ext}`);
+  if (fs.existsSync(candidate)) {
+    const uniq = crypto.randomBytes(2).toString('hex');
+    candidate = path.join(dir, `${timeStr}__${recipTag}${stem}__${uniq}${ext}`);
+  }
+  return candidate;
+}
+
+function appendArchiveLog(entry) {
+  try {
+    fs.mkdirSync(ARCHIVE_ROOT, { recursive: true });
+    fs.appendFileSync(path.join(ARCHIVE_ROOT, 'archive-log.jsonl'), JSON.stringify(entry) + '\n', 'utf8');
+  } catch (e) {}
+}
+
+function readArchiveLogEntries() {
+  const out = [];
+  try {
+    const p = path.join(ARCHIVE_ROOT, 'archive-log.jsonl');
+    if (!fs.existsSync(p)) return out;
+    const raw = fs.readFileSync(p, 'utf8');
+    for (const line of raw.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      try { out.push(JSON.parse(t)); } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
+
+function stripAlertMedia(rawMeta) {
+  if (!rawMeta) return '{}';
+  let obj = null;
+  if (typeof rawMeta === 'object') {
+    obj = { ...rawMeta };
+  } else if (typeof rawMeta === 'string' && rawMeta.trim().startsWith('{')) {
+    try { obj = JSON.parse(rawMeta); } catch (_) { return rawMeta; }
+  }
+  if (!obj || typeof obj !== 'object') return typeof rawMeta === 'string' ? rawMeta : '{}';
+  if (obj.screenshot && String(obj.screenshot).length > 0) {
+    obj.has_screenshot = true;
+    delete obj.screenshot;
+  }
+  if (obj.camera_photo && String(obj.camera_photo).length > 0) {
+    obj.has_camera_photo = true;
+    delete obj.camera_photo;
+  }
+  return JSON.stringify(obj);
+}
 try { db.exec("ALTER TABLE devices ADD COLUMN rustdesk_id TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN rustdesk_password TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN screen_requested INTEGER DEFAULT 0"); } catch (e) { /* already exists */ }
+try { db.exec("ALTER TABLE devices ADD COLUMN stream_mode TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
+try { db.exec("ALTER TABLE devices ADD COLUMN stream_until INTEGER DEFAULT 0"); } catch (e) { /* already exists */ }
 db.exec("CREATE TABLE IF NOT EXISTS screens (device_id TEXT PRIMARY KEY, image TEXT DEFAULT '', at INTEGER DEFAULT 0)");
-// Permanent reusable pairing token so a single token links clients forever.
-db.prepare('INSERT OR IGNORE INTO pairing_tokens(token,label,created_at,expires_at) VALUES(?,?,?,0)').run('pair_it_elkhawga_forever','permanent', now());
+try { db.exec("ALTER TABLE screens ADD COLUMN kind TEXT DEFAULT 'screen'"); } catch (e) { /* already exists */ }
+try { db.exec("ALTER TABLE screens ADD COLUMN error TEXT DEFAULT ''"); } catch (e) { /* already exists */ }
+// Remove legacy auto-enroll token so LAN devices never secretly self-enroll without an admin token.
+db.prepare("DELETE FROM pairing_tokens WHERE token='pair_it_elkhawga_forever'").run();
+db.prepare("UPDATE devices SET label='' WHERE label='permanent'").run();
 
 function now() { return Date.now(); }
 function rid(prefix='') { return prefix + crypto.randomUUID().replace(/-/g,''); }
@@ -143,7 +243,8 @@ function groupList() {
     const pol = getGroupPolicy(g.id) || { version: '', mode: 'whitelist', allowed: [], blocked: [] };
     const count = db.prepare('SELECT COUNT(*) AS n FROM devices WHERE group_id=?').get(g.id).n;
     return { id: g.id, name: g.name, created_at: g.created_at, devices: count,
-      version: pol.version, mode: pol.mode, allowed: pol.allowed || [], blocked: pol.blocked || [] };
+      version: pol.version, mode: pol.mode, allowed: pol.allowed || [], blocked: pol.blocked || [],
+      ephemeral_browser: !!pol.ephemeral_browser };
   });
 }
 
@@ -154,6 +255,79 @@ const server = http.createServer(async (req, res) => {
     // Health
     if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, {ok:true, version: RELAY_VERSION, ts: now()});
     if (req.method === 'GET' && url.pathname === '/api/v1/version') return json(res, 200, {ok:true, version: RELAY_VERSION});
+    if (req.method === 'GET' && (url.pathname === '/api/v1/client-setup.exe' || url.pathname === '/api/client-setup.exe')) {
+      const candidates = [
+        path.join(process.cwd(), '..', 'final-release', 'IT ELKHAWGA Client_1.0.0_x64-setup.exe'),
+        path.join(process.cwd(), 'final-release', 'IT ELKHAWGA Client_1.0.0_x64-setup.exe'),
+        'C:/Users/IT APP/Desktop/blockwebsite/final-release/IT ELKHAWGA Client_1.0.0_x64-setup.exe',
+        'C:/Users/IT APP/Desktop/tools/IT ELKHAWGA Client_1.0.0_x64-setup.exe',
+      ];
+      const found = candidates.find((p) => {
+        try { return fs.existsSync(p) && fs.statSync(p).size > 500000; } catch (_) { return false; }
+      });
+      if (!found) return json(res, 404, { error: 'client installer not found on relay' });
+      const stat = fs.statSync(found);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': stat.size,
+        'Content-Disposition': 'attachment; filename="it-elkhawga-client-setup.exe"',
+        'Access-Control-Allow-Origin': CORS_ORIGIN,
+      });
+      fs.createReadStream(found).pipe(res);
+      return;
+    }
+
+    // Download archived uploaded file copy (DLP evidence)
+    const uploadDlMatch = url.pathname.match(/^\/api(?:\/v1)?\/uploads\/([^/]+)$/);
+    if (req.method === 'GET' && uploadDlMatch) {
+      const fid = decodeURIComponent(uploadDlMatch[1]).replace(/[^A-Za-z0-9_-]/g, '');
+      if (!fid) return json(res, 400, { ok: false, error: 'invalid file_id' });
+      const row = db.prepare('SELECT file_name, stored_path FROM uploaded_files WHERE file_id=?').get(fid);
+      let filePath = row && row.stored_path && fs.existsSync(row.stored_path) ? row.stored_path : '';
+      let fileName = (row && row.file_name) || '';
+      if (!filePath) {
+        for (const entry of readArchiveLogEntries().reverse()) {
+          if (entry && entry.file_id === fid && entry.stored_path && fs.existsSync(entry.stored_path)) {
+            filePath = entry.stored_path;
+            if (!fileName) fileName = entry.file_name || '';
+            break;
+          }
+        }
+      }
+      if (!filePath) {
+        for (const dir of [UPLOADS_DIR, 'C:/ProgramData/InternetBlocker/uploaded-files']) {
+          try {
+            if (!fs.existsSync(dir)) continue;
+            const hit = fs.readdirSync(dir).find((f) => f.startsWith(fid + '__'));
+            if (hit) {
+              filePath = path.join(dir, hit);
+              if (!fileName) fileName = hit.slice(fid.length + 2);
+              break;
+            }
+          } catch (_) {}
+        }
+      }
+      if (!filePath || !fs.existsSync(filePath)) return json(res, 404, { ok: false, error: 'file not found' });
+      const stat = fs.statSync(filePath);
+      const asciiName = (fileName || 'file.bin').replace(/["\r\n\\/]/g, '_').replace(/[^\x20-\x7E]/g, '_') || 'file.bin';
+      const utf8Name = encodeURIComponent(fileName || 'file.bin');
+      const lowerExt = asciiName.toLowerCase();
+      const mime = (lowerExt.endsWith('.jpg') || lowerExt.endsWith('.jpeg')) ? 'image/jpeg'
+        : lowerExt.endsWith('.png') ? 'image/png'
+        : lowerExt.endsWith('.webp') ? 'image/webp'
+        : lowerExt.endsWith('.gif') ? 'image/gif'
+        : lowerExt.endsWith('.pdf') ? 'application/pdf'
+        : 'application/octet-stream';
+      res.writeHead(200, {
+        'Content-Type': mime,
+        'Content-Length': stat.size,
+        'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+        'Access-Control-Allow-Origin': CORS_ORIGIN,
+        'Access-Control-Expose-Headers': 'Content-Disposition, Content-Length',
+      });
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    }
 
     // Admin: create pairing token
     if (req.method === 'POST' && url.pathname === '/api/v1/admin/pairing-tokens') {
@@ -170,21 +344,32 @@ const server = http.createServer(async (req, res) => {
     // Shared admin accounts across all admin installs.
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/users') {
       if (!requireAdmin(req,res)) return;
-      const rows = db.prepare('SELECT username, role FROM admin_users ORDER BY username ASC').all();
-      return json(res, 200, { ok: true, users: rows.map(r => ({ username: r.username, role: r.role })) });
+      const rows = db.prepare('SELECT username, role, password_hash FROM admin_users ORDER BY username ASC').all();
+      return json(res, 200, {
+        ok: true,
+        users: rows.map(r => ({
+          username: r.username,
+          role: r.role,
+          password_hash: r.password_hash || '',
+        })),
+      });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/admin/users') {
       if (!requireAdmin(req,res)) return;
       const body = await readBody(req);
       const username = String(body.username || '').trim();
-      const password = String(body.password || '');
+      const password = String(body.password || '').trim();
+      const rawHash = String(body.password_hash || '').trim();
       const role = String(body.role || 'admin').trim() || 'admin';
       if (!username) return json(res, 400, { ok: false, error: 'username required' });
-      const key = sha256(password);
+      const key = rawHash || (password ? sha256(password) : '');
       const nowTs = now();
       db.prepare(`INSERT INTO admin_users(username,password_hash,role,created_at,updated_at)
         VALUES(?,?,?,?,?)
-        ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash, role=excluded.role, updated_at=excluded.updated_at`)
+        ON CONFLICT(username) DO UPDATE SET
+          password_hash=CASE WHEN excluded.password_hash!='' THEN excluded.password_hash ELSE admin_users.password_hash END,
+          role=excluded.role,
+          updated_at=excluded.updated_at`)
         .run(username, key, role, nowTs, nowTs);
       audit(String(body.actor_username || 'admin'), 'admin_user_upsert', username, 'ok', { role });
       return json(res, 200, { ok: true });
@@ -193,7 +378,7 @@ const server = http.createServer(async (req, res) => {
     if (adminUserMatch && req.method === 'DELETE') {
       if (!requireAdmin(req,res)) return;
       const username = decodeURIComponent(adminUserMatch[1]).replace(/%20/g, ' ');
-      const removed = db.prepare('DELETE FROM admin_users WHERE username=?').run(username).changes;
+      const removed = db.prepare('DELETE FROM admin_users WHERE lower(username)=lower(?)').run(username).changes;
       audit('admin', 'admin_user_delete', username, removed ? 'ok' : 'not_found', {});
       return json(res, 200, { ok: true, deleted: !!removed });
     }
@@ -236,6 +421,7 @@ const server = http.createServer(async (req, res) => {
       const type = url.searchParams.get('type') || '';
       const severity = url.searchParams.get('severity') || '';
       const acked = url.searchParams.get('acked') || '';
+      const includeFullMedia = url.searchParams.get('full') === '1';
       let sql = 'SELECT id,device_id,type,severity,message,meta,created_at,acked_at,acked_by FROM alerts WHERE 1=1';
       const params = [];
       if (type) { sql += ' AND type=?'; params.push(type); }
@@ -246,8 +432,61 @@ const server = http.createServer(async (req, res) => {
       const rows = db.prepare(sql).all(...params);
       const devices = db.prepare('SELECT device_id,label,hostname FROM devices').all();
       const byId = Object.fromEntries(devices.map(d => [d.device_id, d.label || d.hostname || d.device_id]));
-      const out = rows.map(r => ({...r, device_name: byId[r.device_id] || r.device_id, acked: !!r.acked_at}));
+      const out = rows.map(r => {
+        const cleanMeta = includeFullMedia ? r.meta : stripAlertMedia(r.meta);
+        let metaDevName = '';
+        if (typeof cleanMeta === 'string' && cleanMeta.startsWith('{')) {
+          try { metaDevName = JSON.parse(cleanMeta).device_name || ''; } catch (_) {}
+        }
+        return {
+          ...r,
+          meta: cleanMeta,
+          device_name: byId[r.device_id] || metaDevName || r.device_id,
+          acked: !!r.acked_at,
+        };
+      });
       return json(res, 200, {ok:true, alerts: out, unacked: db.prepare('SELECT COUNT(*) AS n FROM alerts WHERE acked_at IS NULL').get().n});
+    }
+    const alertDetailMatch = url.pathname.match(/^\/api\/v1\/admin\/alerts\/([^/]+)$/);
+    if (req.method === 'GET' && alertDetailMatch) {
+      if (!requireAdmin(req, res)) return;
+      const id = decodeURIComponent(alertDetailMatch[1]);
+      const row = db.prepare('SELECT id, meta FROM alerts WHERE id=?').get(id);
+      if (!row) return json(res, 404, { ok: false, error: 'alert not found' });
+      let metaObj = {};
+      if (typeof row.meta === 'string' && row.meta.trim().startsWith('{')) {
+        try { metaObj = JSON.parse(row.meta); } catch (_) {}
+      }
+      return json(res, 200, {
+        ok: true,
+        id: row.id,
+        screenshot: String(metaObj.screenshot || ''),
+        camera_photo: String(metaObj.camera_photo || ''),
+      });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/alerts') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req, 25 * 1024 * 1024);
+      const id = String(body.id || rid('alt_')).slice(0, 80);
+      const deviceId = String(body.device_id || 'lan_device').slice(0, 80);
+      const deviceName = String(body.device_name || '').slice(0, 120);
+      const type = String(body.type || 'tamper').slice(0, 40);
+      const severity = ['low', 'medium', 'high', 'critical'].includes(body.severity) ? body.severity : 'medium';
+      const message = String(body.message || '').slice(0, 600);
+      if (!message) return json(res, 400, { ok: false, error: 'message required' });
+      let metaObj = {};
+      if (body.meta && typeof body.meta === 'object') {
+        metaObj = { ...body.meta };
+      } else if (typeof body.meta === 'string' && body.meta.trim().startsWith('{')) {
+        try { metaObj = JSON.parse(body.meta); } catch (_) { metaObj = {}; }
+      }
+      if (deviceName && !metaObj.device_name) {
+        metaObj.device_name = deviceName;
+      }
+      const createdAt = Number(body.created_at) > 0 ? Number(body.created_at) : now();
+      db.prepare('INSERT OR IGNORE INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)')
+        .run(id, deviceId, type, severity, message, JSON.stringify(metaObj), createdAt);
+      return json(res, 200, { ok: true, id });
     }
     const ackMatch = url.pathname.match(/^\/api\/v1\/admin\/alerts\/([^/]+)\/ack$/);
     if (req.method === 'POST' && ackMatch) {
@@ -275,7 +514,13 @@ const server = http.createServer(async (req, res) => {
         if (!name) return json(res, 400, {ok:false,error:'name required'});
         const gid = rid('grp_');
         db.prepare('INSERT INTO groups(id,name,created_at) VALUES(?,?,?)').run(gid, name, now());
-        const data = { mode: body.mode||'whitelist', allowed: body.allowed||[], blocked: body.blocked||[], rules: [] };
+        const data = {
+          mode: body.mode||'whitelist',
+          allowed: body.allowed||[],
+          blocked: body.blocked||[],
+          ephemeral_browser: !!body.ephemeral_browser,
+          rules: [],
+        };
         db.prepare('INSERT INTO group_policy(group_id,version,data,updated_at) VALUES(?,?,?,?)')
           .run(gid, rid('gv_'), JSON.stringify(data), now());
         audit('admin', 'group_create', gid, 'ok', {name: body.name});
@@ -293,12 +538,13 @@ const server = http.createServer(async (req, res) => {
         if (typeof body.name === 'string' && body.name.trim()) {
           db.prepare('UPDATE groups SET name=? WHERE id=?').run(body.name.trim(), gid);
         }
-        if (body.mode !== undefined || body.allowed !== undefined || body.blocked !== undefined) {
-          const cur = getGroupPolicy(gid) || { mode:'whitelist', allowed:[], blocked:[] };
+        if (body.mode !== undefined || body.allowed !== undefined || body.blocked !== undefined || body.ephemeral_browser !== undefined) {
+          const cur = getGroupPolicy(gid) || { mode:'whitelist', allowed:[], blocked:[], ephemeral_browser: false };
           const data = {
             mode: body.mode === undefined ? cur.mode : (body.mode === 'blacklist' ? 'blacklist' : 'whitelist'),
             allowed: body.allowed === undefined ? (cur.allowed||[]) : body.allowed,
             blocked: body.blocked === undefined ? (cur.blocked||[]) : body.blocked,
+            ephemeral_browser: body.ephemeral_browser === undefined ? !!cur.ephemeral_browser : !!body.ephemeral_browser,
             rules: [],
           };
           const ver = rid('gv_');
@@ -320,7 +566,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && grpCmd) {
       if (!requireAdmin(req,res)) return;
       const body = await readBody(req);
-      const type = body.command === 'unblock' ? 'unblock' : body.command === 'block' ? 'block' : null;
+      const type = body.command === 'unblock' ? 'unblock'
+        : body.command === 'block' ? 'block'
+        : body.command === 'update_client' ? 'update_client'
+        : null;
       if (!type) return json(res, 400, {ok:false,error:'invalid command'});
       const gid = decodeURIComponent(grpCmd[1]);
       const targets = db.prepare('SELECT device_id FROM devices WHERE group_id=?').all(gid);
@@ -330,29 +579,46 @@ const server = http.createServer(async (req, res) => {
       audit('admin', 'group_' + type, gid, 'ok', {queued: targets.length});
       return json(res, 200, {ok:true, queued: targets.length});
     }
-    // Ask a device for a fresh screenshot.
+    // Ask a device for a fresh screenshot or start/renew/stop a live screen/camera stream lease.
     const scrReq = url.pathname.match(/^\/api\/v1\/admin\/devices\/([^/]+)\/screen\/request$/);
     if (req.method === 'POST' && scrReq) {
       if (!requireAdmin(req,res)) return;
       const did = decodeURIComponent(scrReq[1]);
-      if (!db.prepare('SELECT 1 FROM devices WHERE device_id=?').get(did)) return json(res, 404, {ok:false,error:'no device'});
-      db.prepare('UPDATE devices SET screen_requested=1 WHERE device_id=?').run(did);
-      db.prepare("INSERT INTO screens(device_id,image,at) VALUES(?, '', 0) ON CONFLICT(device_id) DO UPDATE SET image='', at=0").run(did);
-      return json(res, 200, {ok:true});
+      const dev = db.prepare('SELECT stream_mode FROM devices WHERE device_id=?').get(did);
+      if (!dev) return json(res, 404, {ok:false,error:'no device'});
+      const body = await readBody(req).catch(() => ({}));
+      const mode = String((body && body.mode) || 'once').trim().toLowerCase();
+      if (mode === 'stop') {
+        db.prepare("UPDATE devices SET screen_requested=0, stream_mode='', stream_until=0 WHERE device_id=?").run(did);
+      } else if (mode === 'screen' || mode === 'camera') {
+        const until = now() + 12000;
+        if ((dev.stream_mode || '') !== mode) {
+          db.prepare("INSERT INTO screens(device_id,image,at,kind,error) VALUES(?, '', 0, ?, '') ON CONFLICT(device_id) DO UPDATE SET image='', at=0, kind=excluded.kind, error=''").run(did, mode);
+        }
+        db.prepare('UPDATE devices SET screen_requested=1, stream_mode=?, stream_until=? WHERE device_id=?').run(mode, until, did);
+      } else {
+        db.prepare("UPDATE devices SET screen_requested=1, stream_mode='', stream_until=0 WHERE device_id=?").run(did);
+        db.prepare("INSERT INTO screens(device_id,image,at,kind,error) VALUES(?, '', 0, 'screen', '') ON CONFLICT(device_id) DO UPDATE SET image='', at=0, kind='screen', error=''").run(did);
+      }
+      return json(res, 200, {ok:true, mode});
     }
 
-    // Admin: fetch the latest screenshot.
+    // Admin: fetch the latest screenshot or live stream frame.
     const scrGet = url.pathname.match(/^\/api\/v1\/admin\/devices\/([^/]+)\/screen$/);
     if (req.method === 'GET' && scrGet) {
       if (!requireAdmin(req,res)) return;
       const did = decodeURIComponent(scrGet[1]);
-      const row = db.prepare('SELECT image,at FROM screens WHERE device_id=?').get(did);
-      const dev = db.prepare('SELECT screen_requested FROM devices WHERE device_id=?').get(did);
+      const row = db.prepare('SELECT image,at,kind,error FROM screens WHERE device_id=?').get(did);
+      const dev = db.prepare('SELECT screen_requested,stream_mode,stream_until FROM devices WHERE device_id=?').get(did);
+      const activeLease = !!(dev && dev.stream_until && dev.stream_until > now());
       return json(res, 200, {
         ok: true,
-        requested: !!(dev && dev.screen_requested),
+        requested: !!(dev && (dev.screen_requested || activeLease)),
+        stream_mode: activeLease ? (dev.stream_mode || 'screen') : '',
         image: row ? row.image : '',
         at: row ? row.at : 0,
+        kind: (row && row.kind) || 'screen',
+        error: (row && row.error) || '',
       });
     }
 
@@ -425,9 +691,14 @@ const server = http.createServer(async (req, res) => {
       const type = raw === 'unblock' ? 'unblock'
         : raw === 'block' ? 'block'
         : /^throttle:\d{1,7}$/.test(raw) ? raw
+        : (raw === 'restart' || raw === 'shutdown' || raw === 'cancel_power' || raw === 'update_client') ? raw
         : null;
       if (!type) return json(res, 400, {ok:false,error:'invalid command'});
       const did = decodeURIComponent(cmdMatch[1]);
+      // Power commands target one device only, never "*".
+      if (did === '*' && (type === 'restart' || type === 'shutdown')) {
+        return json(res, 400, {ok:false,error:'power commands require a single device'});
+      }
       const targets = did === '*' ? db.prepare('SELECT device_id FROM devices').all().map(r=>r.device_id) : [did];
       let count = 0;
       const ins = db.prepare('INSERT INTO commands(id,device_id,type,created_at) VALUES(?,?,?,?)');
@@ -486,7 +757,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const device_id = (body.device_id && /^[A-Za-z0-9_-]{6,80}$/.test(body.device_id)) ? body.device_id : rid('dev_');
       const device_token = rid('dvt_');
-      const label = (row.label || '').trim();
+      const rawLabel = (row.label || '').trim();
+      const label = rawLabel === 'permanent' ? '' : rawLabel;
       db.prepare(`INSERT INTO devices(device_id,hostname,os,app_version,device_token_hash,enrolled_at,last_seen,ip,label)
                   VALUES(?,?,?,?,?,?,?,?,?)
                   ON CONFLICT(device_id) DO UPDATE SET hostname=excluded.hostname,os=excluded.os,app_version=excluded.app_version,device_token_hash=excluded.device_token_hash,last_seen=excluded.last_seen,ip=excluded.ip,label=COALESCE(NULLIF(excluded.label,''),devices.label)`)
@@ -495,31 +767,215 @@ const server = http.createServer(async (req, res) => {
       audit('device:' + device_id, 'enroll', device_id, 'ok', {hostname: body.hostname || ''});
       return json(res, 200, {ok:true, device_id, device_token, poll_seconds: 3});
     }
-    // Device: upload a screenshot captured in the user session.
+    // Device: upload a screenshot or camera stream frame captured in the user session.
     if (req.method === 'POST' && url.pathname === '/api/v1/device/screen') {
       const dev = getDeviceByToken(bearer(req));
       if (!dev) return json(res, 401, {ok:false,error:'unauthorized'});
       const body = await readBody(req);
       const img = typeof body.image === 'string' ? body.image : '';
-      if (!img) return json(res, 400, {ok:false,error:'missing image'});
+      const kind = String(body.kind || 'screen').slice(0, 20);
+      const errStr = String(body.error || '').slice(0, 120);
+      if (!img && !errStr) return json(res, 400, {ok:false,error:'missing image'});
       if (img.length > 5 * 1024 * 1024) return json(res, 413, {ok:false,error:'image too large'});
-      db.prepare("INSERT INTO screens(device_id,image,at) VALUES(?,?,?) ON CONFLICT(device_id) DO UPDATE SET image=excluded.image, at=excluded.at")
-        .run(dev.device_id, img, now());
-      db.prepare('UPDATE devices SET screen_requested=0 WHERE device_id=?').run(dev.device_id);
+      db.prepare("INSERT INTO screens(device_id,image,at,kind,error) VALUES(?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET image=excluded.image, at=excluded.at, kind=excluded.kind, error=excluded.error")
+        .run(dev.device_id, img, now(), kind, errStr);
+      if (!dev.stream_until || dev.stream_until <= now()) {
+        db.prepare('UPDATE devices SET screen_requested=0 WHERE device_id=?').run(dev.device_id);
+      }
       return json(res, 200, {ok:true});
+    }
+
+    // Admin: list archived exact-copy uploaded files
+    if (req.method === 'GET' && url.pathname === '/api/v1/admin/uploads') {
+      if (!requireAdmin(req, res)) return;
+      const ch = String(url.searchParams.get('channel') || '').trim().toLowerCase();
+      let sql = `SELECT u.file_id,u.device_id,u.file_name,u.file_size,u.stored_path,u.created_at,
+        u.device_name,u.windows_user,u.channel,u.recipient_name,u.recipient_phone,u.page_url,u.sha256,
+        COALESCE(NULLIF(u.device_name,''), COALESCE(NULLIF(d.label,''), d.hostname, u.device_id)) AS resolved_device_name
+        FROM uploaded_files u
+        LEFT JOIN devices d ON d.device_id = u.device_id
+        WHERE 1=1`;
+      const params = [];
+      if (ch === 'whatsapp_web') {
+        sql += " AND lower(COALESCE(NULLIF(u.channel,''),'whatsapp_web')) LIKE '%whatsapp%'";
+      } else if (ch) {
+        sql += " AND lower(COALESCE(u.channel,'')) = ?";
+        params.push(ch);
+      }
+      sql += ' ORDER BY u.created_at DESC LIMIT 400';
+      const rows = db.prepare(sql).all(...params);
+      const byId = new Map();
+      for (const r of rows) {
+        byId.set(r.file_id, {
+          file_id: r.file_id,
+          device_id: r.device_id || '',
+          device_name: r.resolved_device_name || r.device_name || r.device_id || '',
+          windows_user: r.windows_user || '',
+          channel: r.channel || 'whatsapp_web',
+          file_name: r.file_name || 'file.bin',
+          file_size: Number(r.file_size || 0),
+          stored_path: r.stored_path || '',
+          exists_on_disk: Boolean(r.stored_path && fs.existsSync(r.stored_path)),
+          recipient_name: r.recipient_name || '',
+          recipient_phone: r.recipient_phone || '',
+          page_url: r.page_url || '',
+          sha256: r.sha256 || '',
+          created_at: Number(r.created_at || 0),
+        });
+      }
+      for (const entry of readArchiveLogEntries()) {
+        const fid = String((entry && entry.file_id) || '').trim();
+        if (!fid || byId.has(fid)) continue;
+        const entryChan = String(entry.channel || 'whatsapp_web').toLowerCase();
+        if (ch === 'whatsapp_web' && !entryChan.includes('whatsapp')) continue;
+        if (ch && ch !== 'whatsapp_web' && entryChan !== ch) continue;
+        byId.set(fid, {
+          file_id: fid,
+          device_id: entry.device_id || '',
+          device_name: entry.device_name || entry.device_id || '',
+          windows_user: entry.windows_user || '',
+          channel: entry.channel || 'whatsapp_web',
+          file_name: entry.file_name || 'file.bin',
+          file_size: Number(entry.file_size || 0),
+          stored_path: entry.stored_path || '',
+          exists_on_disk: Boolean(entry.stored_path && fs.existsSync(entry.stored_path)),
+          recipient_name: entry.recipient_name || '',
+          recipient_phone: entry.recipient_phone || '',
+          page_url: entry.page_url || '',
+          sha256: entry.sha256 || '',
+          created_at: Number(entry.created_at || 0),
+        });
+      }
+      const files = Array.from(byId.values())
+        .sort((a, b) => b.created_at - a.created_at)
+        .slice(0, 400);
+      return json(res, 200, { ok: true, archive_root: ARCHIVE_ROOT, files });
+    }
+
+    // ----- Device: upload archived exact copy -----
+    // Device: upload an exact archived copy of an employee-uploaded file (DLP evidence).
+    if (req.method === 'POST' && url.pathname === '/api/v1/device/file') {
+      const dev = getDeviceByToken(bearer(req));
+      if (!dev) return json(res, 401, {ok:false,error:'unauthorized'});
+      const body = await readBody(req, 95 * 1024 * 1024);
+      const rawFid = String(body.file_id || '').replace(/[^A-Za-z0-9_-]/g, '');
+      const fid = rawFid || rid('upl_');
+      const origName = String(body.file_name || 'file.bin').trim() || 'file.bin';
+      let b64 = typeof body.file_base64 === 'string' ? body.file_base64.trim() : '';
+      const comma = b64.indexOf(';base64,');
+      if (comma !== -1) b64 = b64.slice(comma + 8);
+      if (!b64) return json(res, 400, {ok:false,error:'missing file_base64'});
+      const buf = Buffer.from(b64, 'base64');
+      if (buf.length > 66 * 1024 * 1024) return json(res, 413, {ok:false,error:'file too large'});
+
+      const sha256Hash = crypto.createHash('sha256').update(buf).digest('hex');
+      const deviceName = String(dev.label || dev.hostname || body.hostname || dev.device_id || 'Unknown-Device').trim();
+      const winUser = String(body.windows_user || '').trim();
+      const channel = String(body.channel || 'whatsapp_web').trim() || 'whatsapp_web';
+      const recipientName = String(body.recipient_name || '').trim();
+      const recipientPhone = String(body.recipient_phone || '').trim();
+      const pageUrl = String(body.page_url || '').trim();
+      const createdTs = now();
+
+      const existingRow = db.prepare('SELECT stored_path FROM uploaded_files WHERE file_id=?').get(fid);
+      let storedPath = existingRow && existingRow.stored_path && fs.existsSync(existingRow.stored_path)
+        ? existingRow.stored_path
+        : '';
+      if (!storedPath) {
+        try {
+          storedPath = buildArchiveFilePath({
+            channel,
+            deviceName,
+            recipientName,
+            recipientPhone,
+            origName,
+            tsMs: createdTs,
+          });
+          fs.writeFileSync(storedPath, buf);
+        } catch (err) {
+          const fallbackName = sanitizeWinSegment(origName, 'file.bin', 120);
+          storedPath = path.join(UPLOADS_DIR, `${fid}__${fallbackName}`);
+          fs.writeFileSync(storedPath, buf);
+        }
+        appendArchiveLog({
+          file_id: fid,
+          device_id: dev.device_id,
+          device_name: deviceName,
+          windows_user: winUser,
+          channel,
+          file_name: origName,
+          file_size: buf.length,
+          sha256: sha256Hash,
+          recipient_name: recipientName,
+          recipient_phone: recipientPhone,
+          page_url: pageUrl,
+          stored_path: storedPath,
+          created_at: createdTs,
+        });
+      }
+
+      db.prepare(`INSERT OR REPLACE INTO uploaded_files
+        (file_id,device_id,file_name,file_size,stored_path,created_at,device_name,windows_user,channel,recipient_name,recipient_phone,page_url,sha256)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(
+          fid,
+          dev.device_id,
+          origName,
+          buf.length,
+          storedPath,
+          createdTs,
+          deviceName,
+          winUser,
+          channel,
+          recipientName,
+          recipientPhone,
+          pageUrl,
+          sha256Hash
+        );
+      return json(res, 200, {ok:true, file_id: fid, size: buf.length, sha256: sha256Hash, stored_path: storedPath});
     }
 
     // Device: report an alert (tamper, exfil, usb, auth_fail, bypass).
     if (req.method === 'POST' && url.pathname === '/api/v1/device/alert') {
       const dev = getDeviceByToken(bearer(req));
       if (!dev) return json(res, 401, {ok:false,error:'unauthorized'});
-      const body = await readBody(req);
+      const body = await readBody(req, 25 * 1024 * 1024);
       const type = String(body.type || 'tamper').slice(0, 40);
       const severity = ['low','medium','high','critical'].includes(body.severity) ? body.severity : 'medium';
-      const message = String(body.message || '').slice(0, 300);
-      const meta = body.meta && typeof body.meta === 'object' ? JSON.stringify(body.meta) : '{}';
+      const message = String(body.message || '').slice(0, 600);
+      const metaObj = (body.meta && typeof body.meta === 'object') ? body.meta : null;
+      const meta = typeof body.meta === 'string'
+        ? body.meta
+        : (metaObj ? JSON.stringify(metaObj) : '{}');
       db.prepare('INSERT INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)')
         .run(rid('alt_'), dev.device_id, type, severity, message, meta, now());
+
+      let parsedMeta = metaObj;
+      if (!parsedMeta && typeof meta === 'string' && meta.startsWith('{')) {
+        try { parsedMeta = JSON.parse(meta); } catch (_) {}
+      }
+      if (parsedMeta && parsedMeta.uploaded_file_id) {
+        const devName = String(dev.label || dev.hostname || dev.device_id || '');
+        db.prepare(`UPDATE uploaded_files SET
+          device_name=COALESCE(NULLIF(device_name,''),?),
+          windows_user=COALESCE(NULLIF(windows_user,''),?),
+          channel=COALESCE(NULLIF(channel,''),?),
+          recipient_name=COALESCE(NULLIF(recipient_name,''),?),
+          recipient_phone=COALESCE(NULLIF(recipient_phone,''),?),
+          page_url=COALESCE(NULLIF(page_url,''),?),
+          sha256=COALESCE(NULLIF(sha256,''),?)
+          WHERE file_id=?`)
+          .run(
+            devName,
+            String(parsedMeta.windows_user || ''),
+            String(parsedMeta.channel || 'whatsapp_web'),
+            String(parsedMeta.recipient_name || ''),
+            String(parsedMeta.recipient_phone || ''),
+            String(parsedMeta.page_url || ''),
+            String(parsedMeta.sha256 || ''),
+            String(parsedMeta.uploaded_file_id)
+          );
+      }
       return json(res, 200, {ok:true});
     }
 
@@ -559,14 +1015,21 @@ const server = http.createServer(async (req, res) => {
       const pol = (dev.group_id && getGroupPolicy(dev.group_id)) || getPolicy();
       const sendPolicy = pol && body.policy_version !== pol.version ? pol : null;
 
+      const activeMode = (d) => (d && d.stream_until && d.stream_until > now())
+        ? (d.stream_mode || 'screen')
+        : ((d && d.screen_requested) ? 'once' : '');
       let command = pendingCommand(dev.device_id);
-      // Long-poll: keep the request open briefly so a command issued right now is
-      // delivered within a few hundred ms instead of waiting for the next cycle.
-      if (!command && !sendPolicy) {
+      let fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password FROM devices WHERE device_id=?').get(dev.device_id) || dev;
+      let streamMode = activeMode(fresh);
+      // Long-poll: keep the request open briefly so a command or screenshot/stream request issued
+      // right now is delivered within ~300 ms instead of waiting for the next cycle.
+      if (!command && !sendPolicy && !streamMode) {
         const started = Date.now();
-        while (!command && (Date.now() - started) < LONG_POLL_MS) {
+        while (!command && !streamMode && (Date.now() - started) < LONG_POLL_MS) {
           await new Promise(function (r) { setTimeout(r, 300); });
           command = pendingCommand(dev.device_id);
+          fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password FROM devices WHERE device_id=?').get(dev.device_id) || fresh;
+          streamMode = activeMode(fresh);
         }
       }
       return json(res, 200, {
@@ -574,8 +1037,9 @@ const server = http.createServer(async (req, res) => {
         command: command || null,
         policy: sendPolicy,
         poll_seconds: 3,
-        screen: !!dev.screen_requested,
-        rustdesk_password: dev.rustdesk_password || '',
+        screen: !!streamMode,
+        stream_mode: streamMode,
+        rustdesk_password: fresh.rustdesk_password || '',
       });
     }
 

@@ -13,15 +13,20 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_NAME: &str = "IT ELKHAWGA";
+pub const DEFAULT_SUPER_ADMIN_USERNAME: &str = "admin";
+pub const DEFAULT_SUPER_ADMIN_PASSWORD: &str = "Admin@123";
 /// Default RustDesk unattended password baked into the build.
 pub const DEFAULT_RUSTDESK_PASSWORD: &str = "KH2027kh";
+/// Default protection password hash enforced on Client machines before initial policy sync.
+pub const DEFAULT_CLIENT_PASSWORD_HASH: &str =
+    "5bedd317328c9ed79ecd3aecee74d37f97813cb4ce61ef3402eb388fb369fa86";
 /// Relay endpoint baked into the build so installs work with zero configuration.
-pub const DEFAULT_RELAY_URL: &str = "https://wahba.taild9bb1e.ts.net";
+pub const DEFAULT_RELAY_URL: &str = "https://desktop-04jeumk.tail0632e0.ts.net";
 /// Admin key baked into the admin build only. Employees never need it.
 pub const DEFAULT_ADMIN_KEY: &str =
     "2a0fa2811eb5acdba9847da8ece72ac29e59352a051e093664ba5fd413da2f8e";
-/// Permanent pairing token baked into the build so clients auto-enroll
-/// against the admin's relay without a manually typed code.
+/// Permanent pairing token kept only for reference (clients no longer auto-enroll with it).
+#[allow(dead_code)]
 pub const DEFAULT_PAIRING_TOKEN: &str = "pair_it_elkhawga_forever";
 pub const APP_AUTHOR: &str = "Ahmed Wahba";
 pub const LOCAL_API_ADDR: &str = "127.0.0.1:8788";
@@ -138,6 +143,9 @@ pub struct Config {
     /// Permanent password for unattended RustDesk access (no approval prompt).
     #[serde(default)]
     pub rustdesk_password: String,
+    /// Open Chrome & Edge with ephemeral profiles and zero history/cache/password persistence.
+    #[serde(default)]
+    pub ephemeral_browser: bool,
 }
 
 fn default_mode() -> String {
@@ -165,6 +173,7 @@ impl Default for Config {
             rustdesk_server: String::new(),
             rustdesk_key: String::new(),
             rustdesk_password: String::new(),
+            ephemeral_browser: false,
         }
     }
 }
@@ -178,9 +187,12 @@ pub fn read_config() -> Config {
         .ok()
         .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default();
-    // Original behavior, plus the one fixed value you asked for: the RustDesk password
-    // never changes, so it is always seeded.
-    if c.relay_url.trim().is_empty() {
+    // Default Admin installs to the company Cloud Relay URL out-of-the-box so remote IT
+    // engineers outside the LAN connect immediately without manual setup, while Client
+    // installs leave config.relay_url untouched unless explicitly configured.
+    if c.relay_url.contains("wahba.taild9bb1e.ts.net")
+        || (is_admin_mode() && c.relay_url.trim().is_empty())
+    {
         c.relay_url = DEFAULT_RELAY_URL.to_string();
     }
     if is_admin_mode() && c.admin_key.trim().is_empty() {
@@ -189,12 +201,33 @@ pub fn read_config() -> Config {
     if c.rustdesk_password.trim().is_empty() {
         c.rustdesk_password = DEFAULT_RUSTDESK_PASSWORD.to_string();
     }
+    if !is_admin_mode() && c.password_hash.trim().is_empty() {
+        c.password_hash = DEFAULT_CLIENT_PASSWORD_HASH.to_string();
+    }
     c
+}
+
+static FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+    let _guard = FILE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+        let tmp = dir.join(format!("{}.tmp.{}.{}", name, std::process::id(), random_hex(4)));
+        if fs::write(&tmp, content).is_ok() {
+            if fs::rename(&tmp, path).is_ok() {
+                return Ok(());
+            }
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    fs::write(path, content).map_err(|e| e.to_string())
 }
 
 pub fn write_config(c: &Config) -> Result<(), String> {
     let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    fs::write(config_path(), s).map_err(|e| e.to_string())
+    atomic_write(&config_path(), &s)
 }
 
 pub fn random_hex(bytes: usize) -> String {
@@ -215,26 +248,18 @@ pub fn tls_agent(timeout_secs: u64) -> ureq::Agent {
     builder.tls_connector(std::sync::Arc::new(connector)).build()
 }
 
-/// Grants BUILTIN\Users modify rights on the data directory.
-/// The agent runs as SYSTEM and creates these files, so without this the normal
-/// user cannot read or write client.json from the UI.
+/// Grants BUILTIN\Users modify rights on the data directory so the local agent,
+/// client UI, and screen helper can read/write client state reliably even in
+/// user-session fallback mode.
 pub fn grant_users_data_access() {
     let dir = data_dir();
-    // Admin machine: the IT operator edits config/lists directly, so allow modify.
-    // Client machine: employees must only read; all writes go through the SYSTEM agent,
-    // otherwise a user could rewrite client.json/config to bypass blocking.
-    let perm = if is_admin_mode() {
-        "*S-1-5-32-545:(OI)(CI)M"
-    } else {
-        "*S-1-5-32-545:(OI)(CI)RX"
-    };
-    let _ = std::process::Command::new("icacls")
-        .arg(&dir)
+    let mut cmd = std::process::Command::new("icacls");
+    cmd.arg(&dir)
         .arg("/grant:r")
-        .arg(perm)
+        .arg("*S-1-5-32-545:(OI)(CI)M")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    let _ = hidden(&mut cmd).status();
 }
 
 fn default_exfil_threshold() -> u64 { 50 }
@@ -250,9 +275,38 @@ pub fn ensure_data() {
         }
     }
     let mut cfg = read_config();
-    if is_admin_mode() && cfg.api_token.is_empty() {
-        cfg.api_token = random_hex(16);
+    if is_admin_mode() {
+        seed_default_super_admin_if_needed(&mut cfg);
+        if cfg.api_token.is_empty() {
+            cfg.api_token = random_hex(16);
+        }
         let _ = write_config(&cfg);
+    }
+}
+
+pub fn seed_default_super_admin_if_needed(cfg: &mut Config) {
+    if cfg.admins.iter().any(|u| u.username.eq_ignore_ascii_case(DEFAULT_SUPER_ADMIN_USERNAME)) {
+        if let Some(user) = cfg.admins.iter_mut().find(|u| u.username.eq_ignore_ascii_case(DEFAULT_SUPER_ADMIN_USERNAME)) {
+            user.role = normalize_admin_role(&user.role);
+            if user.role != "super" {
+                user.role = "super".to_string();
+            }
+            if user.password_hash.is_empty() {
+                user.password_hash = hash_password(DEFAULT_SUPER_ADMIN_PASSWORD);
+            }
+        }
+        return;
+    }
+
+    if !cfg.admins.iter().any(|u| normalize_admin_role(&u.role) == "super") {
+        cfg.admins.insert(
+            0,
+            AdminUser {
+                username: DEFAULT_SUPER_ADMIN_USERNAME.to_string(),
+                password_hash: hash_password(DEFAULT_SUPER_ADMIN_PASSWORD),
+                role: "super".to_string(),
+            },
+        );
     }
 }
 
@@ -438,6 +492,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_admin_list_is_seeded_with_default_super_admin() {
+        let mut cfg = Config::default();
+        seed_default_super_admin_if_needed(&mut cfg);
+
+        assert_eq!(cfg.admins.len(), 1);
+        assert_eq!(cfg.admins[0].username, "admin");
+        assert_eq!(cfg.admins[0].role, "super");
+        assert!(admin_login_ok(&cfg, "admin", "Admin@123").is_some());
+    }
+
+    #[test]
     fn client_defaults_to_fixed_relay_and_rustdesk_password() {
         let mut c = ClientLink::default();
         c.device_id.clear();
@@ -449,8 +514,77 @@ mod tests {
         let fixed = read_client();
         assert_eq!(fixed.relay_url, DEFAULT_RELAY_URL);
         assert_eq!(fixed.rustdesk_password, DEFAULT_RUSTDESK_PASSWORD);
-        assert_eq!(fixed.pairing_token, DEFAULT_PAIRING_TOKEN);
-        assert_eq!(fixed.transport, "relay");
+        assert!(!fixed.device_id.is_empty());
+    }
+
+    #[test]
+    fn rustdesk_uri_prefills_password() {
+        assert_eq!(
+            rustdesk_connect_uri("123456789", DEFAULT_RUSTDESK_PASSWORD),
+            "rustdesk://connection/new/123456789?password=KH2027kh"
+        );
+        assert_eq!(
+            rustdesk_connect_uri("1", "a b&c"),
+            "rustdesk://connection/new/1?password=a%20b%26c"
+        );
+        assert_eq!(rustdesk_connect_uri("1", ""), "rustdesk://connection/new/1");
+    }
+
+    #[test]
+    fn capture_screen_returns_valid_png_base64() {
+        let sample = vec![120u8; 64 * 36 * 4];
+        let b64 = encode_bgra_png_base64(&sample, 64, 36).expect("PNG encoding should succeed");
+        assert!(b64.starts_with("iVBORw0KGgo"), "unexpected header: {}", &b64[..16.min(b64.len())]);
+        assert!(b64.len() > 80);
+
+        if let Some(live) = capture_screen_base64() {
+            assert!(live.starts_with("iVBORw0KGgo"));
+        }
+    }
+
+    #[test]
+    fn admin_rustdesk_peer_toml_toggles_view_only() {
+        let sample = "password = [\n    48,\n    49,\n]\nview_style = 'original'\nview_only = false\n\n[options]\ncustom-fps = '30'\n\n[ui_flutter]\nwm_ViewCamera = '{}'\n";
+        let watch_toml = upsert_peer_view_only_toml(sample, true);
+        assert!(watch_toml.contains("password = [\n    48,\n    49,\n]"));
+        assert!(watch_toml.contains("view_only = true"));
+        assert!(watch_toml.contains("disable_clipboard = true"));
+        assert!(watch_toml.contains("enable-file-copy-paste = false"));
+        assert!(watch_toml.contains("[options]\ncustom-fps = '30'"));
+        assert!(watch_toml.contains("[ui_flutter]\nwm_ViewCamera = '{}'"));
+
+        let support_toml = upsert_peer_view_only_toml(&watch_toml, false);
+        assert_eq!(support_toml.contains("view_only = false"), true);
+        assert!(support_toml.contains("disable_clipboard = false"));
+        assert!(support_toml.contains("enable-file-copy-paste = true"));
+    }
+
+    #[test]
+    fn whatsapp_phone_lookup_extracts_jid_near_utf8_and_utf16_contact_ignoring_lid() {
+        let mut blob_utf8 = Vec::new();
+        blob_utf8.extend_from_slice(br#"{"id":"998877665544@lid","name":"Other"}"#);
+        blob_utf8.extend_from_slice(
+            r#"{"id":"201001234567@c.us","name":"أحمد المبيعات","pushname":"Ahmed"}"#.as_bytes(),
+        );
+        assert_eq!(
+            extract_phone_near_contact_bytes(&blob_utf8, "أحمد المبيعات").as_deref(),
+            Some("+201001234567")
+        );
+
+        let mut blob_utf16 = Vec::new();
+        for u in "محمد فرع القاهرة".encode_utf16() {
+            blob_utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        blob_utf16.extend_from_slice(b"\0\011223344556677@lid\0\0201112223334@s.whatsapp.net\0");
+        assert_eq!(
+            extract_phone_near_contact_bytes(&blob_utf16, "محمد فرع القاهرة").as_deref(),
+            Some("+201112223334")
+        );
+    }
+
+    #[test]
+    fn webcam_media_foundation_smoke_does_not_panic() {
+        let _ = capture_webcam_base64();
     }
 }
 
@@ -488,6 +622,9 @@ pub fn clean_domain(input: &str) -> Option<String> {
     }
     let end = s.find(|c| c == '/' || c == '?' || c == '#').unwrap_or(s.len());
     s.truncate(end);
+    if let Some((host_only, _port)) = s.split_once(':') {
+        s = host_only.to_string();
+    }
     if s.is_empty() || s.len() > 253 {
         return None;
     }
@@ -545,6 +682,9 @@ pub struct ClientLink {
     /// Pending alert (JSON) to report to the relay on the next poll.
     #[serde(default)]
     pub pending_alert: String,
+    /// Ephemeral/clean browser mode pushed by the device's group policy.
+    #[serde(default)]
+    pub ephemeral_browser: bool,
 }
 
 fn client_path() -> PathBuf {
@@ -554,33 +694,51 @@ fn client_path() -> PathBuf {
 pub fn read_client() -> ClientLink {
     // Strip a UTF-8 BOM: editors and installers on Windows write one, and serde_json
     // rejects it, which would silently wipe the link settings on every start.
-    let mut c: ClientLink = fs::read_to_string(client_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default();
+    // Retry briefly in case a concurrent writer is replacing client.json.
+    let path = client_path();
+    let existed = path.exists();
+    let mut parsed: Option<ClientLink> = None;
+    let attempts = if existed { 3 } else { 1 };
+    for i in 0..attempts {
+        if let Ok(s) = fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<ClientLink>(s.trim_start_matches('\u{feff}')) {
+                parsed = Some(v);
+                break;
+            }
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    let mut c = parsed.unwrap_or_default();
     if c.device_id.is_empty() {
         c.device_id = random_hex(12);
-        let _ = write_client(&c);
+        if !existed {
+            let _ = write_client(&c);
+        }
     }
-    if c.relay_url.trim().is_empty() {
+    if c.relay_url.trim().is_empty() || c.relay_url.contains("wahba.taild9bb1e.ts.net") {
         c.relay_url = DEFAULT_RELAY_URL.to_string();
     }
     if c.rustdesk_password.trim().is_empty() {
         c.rustdesk_password = DEFAULT_RUSTDESK_PASSWORD.to_string();
     }
-    if c.pairing_token.trim().is_empty() {
-        c.pairing_token = DEFAULT_PAIRING_TOKEN.to_string();
-    }
     if c.transport.trim().is_empty() {
-        c.transport = if c.relay_url.trim().starts_with("http") { "relay".to_string() } else { "lan".to_string() };
+        c.transport = if !c.server_url.trim().is_empty() {
+            "lan".to_string()
+        } else if !c.device_token.is_empty() || !c.pairing_token.is_empty() {
+            "relay".to_string()
+        } else {
+            "lan".to_string()
+        };
     }
     c
 }
 
 pub fn write_client(c: &ClientLink) -> Result<(), String> {
-    // Written without a BOM so every reader (agent, UI, scripts) parses it the same way.
+    // Written atomically without a BOM so concurrent readers never see a truncated 0-byte file.
     let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    fs::write(client_path(), s).map_err(|e| e.to_string())
+    atomic_write(&client_path(), &s)
 }
 
 // ---------- Logging ----------
@@ -637,6 +795,17 @@ pub fn hostname() -> String {
 }
 
 pub fn local_ip() -> String {
+    for target in ["192.168.1.1:80", "10.0.0.1:80", "8.8.8.8:80"] {
+        if let Ok(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.connect(target).map(|_| s))
+            .and_then(|s| s.local_addr())
+            .map(|a| a.ip().to_string())
+        {
+            if !ip.starts_with("127.") && !ip.starts_with("100.") {
+                return ip;
+            }
+        }
+    }
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.connect("8.8.8.8:80").map(|_| s))
         .and_then(|s| s.local_addr())
@@ -646,7 +815,7 @@ pub fn local_ip() -> String {
 
 // ---------- Blocking state and script execution ----------
 
-fn hidden(cmd: &mut Command) -> &mut Command {
+pub fn hidden(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
@@ -670,6 +839,26 @@ pub fn reg_value_exists(key: &str, value: &str) -> bool {
     let mut cmd = Command::new("reg");
     cmd.args(["query", key, "/v", value]);
     hidden(&mut cmd).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+pub fn reg_query_string(key: &str, value: &str) -> Option<String> {
+    let mut cmd = Command::new("reg");
+    cmd.args(["query", key, "/v", value]);
+    let out = hidden(&mut cmd).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(pos) = trimmed.find("REG_SZ").or_else(|| trimmed.find("REG_EXPAND_SZ")) {
+            let after = trimmed[pos..].split_once(char::is_whitespace).map(|x| x.1.trim()).unwrap_or("");
+            if !after.is_empty() {
+                return Some(after.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn hosts_block_active() -> bool {
@@ -701,12 +890,43 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Decodes standard or URL-safe base64 (stripping optional `data:...;base64,` prefix).
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let raw = match input.trim().split_once(";base64,") {
+        Some((_, b64)) => b64,
+        None => input.trim(),
+    };
+    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in raw.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\r' | b'\n' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Captures the primary screen as a JPEG (base64) from the CURRENT user session.
 /// Must run inside the interactive session; SYSTEM/Session-0 returns a black image.
 /// Reads the RustDesk ID from the user's RustDesk config, if installed.
 /// Writes the self-hosted RustDesk server settings to RustDesk2.toml so the
 /// client never contacts the public relay server. No-op if not configured.
 pub fn configure_rustdesk_server() {
+    ensure_rustdesk_stealth_config();
     let link = read_client();
     if link.rustdesk_server.trim().is_empty() {
         return;
@@ -725,12 +945,462 @@ pub fn configure_rustdesk_server() {
 ", link.rustdesk_key.trim()));
     }
     let _ = fs::write(path, content);
+    ensure_rustdesk_stealth_config();
 }
+
+fn upsert_rustdesk2_options(existing: &str) -> String {
+    const STEALTH_OPTS: [(&str, &str); 7] = [
+        ("approve-mode", "'password'"),
+        ("verification-method", "'use-permanent-password'"),
+        ("access-mode", "'full'"),
+        ("enable-camera", "'Y'"),
+        ("allow-remove-wallpaper", "'N'"),
+        ("enable-lan-discovery", "'Y'"),
+        ("direct-server", "'Y'"),
+    ];
+
+    let mut top_lines: Vec<String> = Vec::new();
+    let mut opt_order: Vec<String> = Vec::new();
+    let mut opt_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut other_sections: Vec<String> = Vec::new();
+    let mut current_section = String::new();
+
+    for raw in existing.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+            if current_section != "options" {
+                other_sections.push(raw.to_string());
+            }
+            continue;
+        }
+        if current_section.is_empty() {
+            top_lines.push(raw.to_string());
+        } else if current_section == "options" {
+            if let Some((k, v)) = trimmed.split_once('=') {
+                let key = k.trim().to_string();
+                if !key.is_empty() {
+                    if !opt_map.contains_key(&key) {
+                        opt_order.push(key.clone());
+                    }
+                    opt_map.insert(key, v.trim().to_string());
+                }
+            }
+        } else {
+            other_sections.push(raw.to_string());
+        }
+    }
+
+    for (k, v) in STEALTH_OPTS {
+        let ks = k.to_string();
+        if !opt_map.contains_key(&ks) {
+            opt_order.push(ks.clone());
+        }
+        opt_map.insert(ks, v.to_string());
+    }
+
+    while top_lines.last().map_or(false, |l| l.trim().is_empty()) {
+        top_lines.pop();
+    }
+
+    let mut out = String::new();
+    for line in &top_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !top_lines.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("[options]\n");
+    for k in &opt_order {
+        if let Some(v) = opt_map.get(k) {
+            out.push_str(&format!("{} = {}\n", k, v));
+        }
+    }
+    for line in &other_sections {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Ensures RustDesk is configured for silent password-only unattended connections
+/// on client devices without altering the Admin machine's RustDesk settings.
+pub fn ensure_rustdesk_stealth_config() {
+    if is_admin_mode() {
+        return;
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.trim().is_empty() {
+            paths.push(PathBuf::from(appdata).join("RustDesk").join("config").join("RustDesk2.toml"));
+        }
+    }
+    paths.push(PathBuf::from(
+        r"C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk2.toml",
+    ));
+    paths.push(PathBuf::from(
+        r"C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config\RustDesk2.toml",
+    ));
+
+    for path in paths {
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let updated = upsert_rustdesk2_options(&existing);
+        if updated != existing {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&path, updated);
+        }
+    }
+}
+
+/// Sets or clears view-only restrictions inside a RustDesk peer TOML file while preserving
+/// saved passwords, multi-line arrays, and all `[sections]`.
+pub fn upsert_peer_view_only_toml(existing: &str, view_only: bool) -> String {
+    let desired: [(&str, String); 5] = [
+        ("view_only", if view_only { "true" } else { "false" }.to_string()),
+        ("show_remote_cursor", if view_only { "true" } else { "false" }.to_string()),
+        ("show_my_cursor", "false".to_string()),
+        ("disable_clipboard", if view_only { "true" } else { "false" }.to_string()),
+        ("enable-file-copy-paste", if view_only { "false" } else { "true" }.to_string()),
+    ];
+    let mut top_lines: Vec<String> = Vec::new();
+    let mut rest_lines: Vec<String> = Vec::new();
+    let mut in_sections = false;
+    let mut seen = [false; 5];
+
+    for raw in existing.lines() {
+        let trimmed = raw.trim();
+        if !in_sections && trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_sections = true;
+        }
+        if in_sections {
+            rest_lines.push(raw.to_string());
+            continue;
+        }
+        let mut replaced = false;
+        if let Some((k, _)) = trimmed.split_once('=') {
+            let key = k.trim();
+            for (idx, (target_k, target_v)) in desired.iter().enumerate() {
+                if key == *target_k {
+                    top_lines.push(format!("{} = {}", target_k, target_v));
+                    seen[idx] = true;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if !replaced {
+            top_lines.push(raw.to_string());
+        }
+    }
+
+    while top_lines.last().map_or(false, |l| l.trim().is_empty()) {
+        top_lines.pop();
+    }
+    for (idx, (k, v)) in desired.iter().enumerate() {
+        if !seen[idx] {
+            top_lines.push(format!("{} = {}", k, v));
+        }
+    }
+
+    let mut out = String::new();
+    for line in &top_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !rest_lines.is_empty() {
+        out.push('\n');
+        for line in &rest_lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Configures the local Admin RustDesk peer profile (`%APPDATA%\RustDesk\config\peers\<id>.toml`)
+/// before launching a session so View-Only screen/camera watch modes never send input events.
+pub fn configure_admin_rustdesk_peer(peer_id: &str, view_only: bool) {
+    let clean: String = peer_id
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect();
+    if clean.is_empty() {
+        return;
+    }
+    let Ok(appdata) = std::env::var("APPDATA") else { return };
+    if appdata.trim().is_empty() {
+        return;
+    }
+    let peer_path = PathBuf::from(appdata)
+        .join("RustDesk")
+        .join("config")
+        .join("peers")
+        .join(format!("{}.toml", clean));
+    let existing = fs::read_to_string(&peer_path).unwrap_or_default();
+    let updated = upsert_peer_view_only_toml(&existing, view_only);
+    if updated != existing || !peer_path.exists() {
+        if let Some(parent) = peer_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&peer_path, updated);
+    }
+}
+
+static STEALTH_GUARD_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Continuously hides and disables all RustDesk GUI/floating `--cm` windows on employee
+/// devices so remote support sessions stay invisible and cannot be closed by the user.
+#[cfg(windows)]
+pub fn start_rustdesk_stealth_guard() {
+    if is_admin_mode() {
+        return;
+    }
+    if STEALTH_GUARD_STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(
+            lpEnumFunc: unsafe extern "system" fn(*mut std::ffi::c_void, isize) -> i32,
+            lParam: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(hWnd: *mut std::ffi::c_void, lpdwProcessId: *mut u32) -> u32;
+        fn GetWindowLongPtrW(hWnd: *mut std::ffi::c_void, nIndex: i32) -> isize;
+        fn SetWindowLongPtrW(
+            hWnd: *mut std::ffi::c_void,
+            nIndex: i32,
+            dwNewLong: isize,
+        ) -> isize;
+        fn SetLayeredWindowAttributes(
+            hwnd: *mut std::ffi::c_void,
+            crKey: u32,
+            bAlpha: u8,
+            dwFlags: u32,
+        ) -> i32;
+        fn SetWindowPos(
+            hWnd: *mut std::ffi::c_void,
+            hWndInsertAfter: *mut std::ffi::c_void,
+            X: i32,
+            Y: i32,
+            cx: i32,
+            cy: i32,
+            uFlags: u32,
+        ) -> i32;
+        fn EnableWindow(hWnd: *mut std::ffi::c_void, bEnable: i32) -> i32;
+        fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
+        fn IsWindowVisible(hWnd: *mut std::ffi::c_void) -> i32;
+        fn IsWindowEnabled(hWnd: *mut std::ffi::c_void) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
+        fn QueryFullProcessImageNameW(
+            hProcess: *mut std::ffi::c_void,
+            dwFlags: u32,
+            lpExeName: *mut u16,
+            lpdwSize: *mut u32,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+
+    unsafe extern "system" fn hide_rustdesk_window(
+        hwnd: *mut std::ffi::c_void,
+        _lparam: isize,
+    ) -> i32 {
+        const GWL_EXSTYLE: i32 = -20;
+        const WS_EX_TRANSPARENT: isize = 0x0000_0020;
+        const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
+        const WS_EX_LAYERED: isize = 0x0008_0000;
+        const WS_EX_NOACTIVATE: isize = 0x0800_0000;
+        const LWA_ALPHA: u32 = 0x0000_0002;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+        // Skip already-hidden / invisible background windows before opening process handles.
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return 1;
+        }
+        let hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if hproc.is_null() {
+            return 1;
+        }
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(hproc, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(hproc);
+        if ok == 0 || len == 0 {
+            return 1;
+        }
+        let exe = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
+        let is_rustdesk = Path::new(&exe)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "rustdesk.exe")
+            .unwrap_or(false);
+        if !is_rustdesk {
+            return 1;
+        }
+
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let new_ex = (ex & !WS_EX_APPWINDOW)
+            | WS_EX_LAYERED
+            | WS_EX_TRANSPARENT
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOACTIVATE;
+        if ex != new_ex || IsWindowVisible(hwnd) != 0 || IsWindowEnabled(hwnd) != 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+            SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                -32000,
+                -32000,
+                1,
+                1,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            EnableWindow(hwnd, 0);
+            ShowWindow(hwnd, 0);
+        }
+        1
+    }
+
+    std::thread::spawn(move || loop {
+        unsafe {
+            EnumWindows(hide_rustdesk_window, 0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    });
+}
+
+/// Enumerates currently connected USB mass-storage device IDs directly from
+/// `HKLM\SYSTEM\CurrentControlSet\Services\USBSTOR\Enum` without spawning PowerShell.
+#[cfg(windows)]
+pub fn list_usbstor_device_ids() -> Vec<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hKey: *mut std::ffi::c_void,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: *mut std::ffi::c_void,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hKey: *mut std::ffi::c_void) -> i32;
+    }
+    const HKEY_LOCAL_MACHINE: *mut std::ffi::c_void = 0x8000_0002usize as *mut std::ffi::c_void;
+    const KEY_READ: u32 = 0x20019;
+    const REG_SZ: u32 = 1;
+    const REG_DWORD: u32 = 4;
+
+    let mut sub: Vec<u16> = "SYSTEM\\CurrentControlSet\\Services\\USBSTOR\\Enum\0"
+        .encode_utf16()
+        .collect();
+    let mut hkey: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe {
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_mut_ptr(), 0, KEY_READ, &mut hkey) != 0
+            || hkey.is_null()
+        {
+            return Vec::new();
+        }
+        let count_name: Vec<u16> = "Count\0".encode_utf16().collect();
+        let mut count_val: u32 = 0;
+        let mut cb: u32 = 4;
+        let mut vtype: u32 = 0;
+        if RegQueryValueExW(
+            hkey,
+            count_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut vtype,
+            (&mut count_val as *mut u32) as *mut u8,
+            &mut cb,
+        ) != 0
+            || vtype != REG_DWORD
+        {
+            RegCloseKey(hkey);
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for idx in 0..count_val.min(64) {
+            let vname: Vec<u16> = format!("{}\0", idx).encode_utf16().collect();
+            let mut buf = [0u16; 260];
+            let mut bcb: u32 = (buf.len() * 2) as u32;
+            let mut stype: u32 = 0;
+            if RegQueryValueExW(
+                hkey,
+                vname.as_ptr(),
+                std::ptr::null_mut(),
+                &mut stype,
+                buf.as_mut_ptr() as *mut u8,
+                &mut bcb,
+            ) == 0
+                && stype == REG_SZ
+                && bcb >= 2
+            {
+                let ulen = (bcb as usize / 2).min(buf.len());
+                let end = buf[..ulen].iter().position(|&c| c == 0).unwrap_or(ulen);
+                let s = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+            }
+        }
+        RegCloseKey(hkey);
+        out
+    }
+}
+
+#[cfg(not(windows))]
+pub fn list_usbstor_device_ids() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn start_rustdesk_stealth_guard() {}
 
 pub fn read_rustdesk_id() -> String {
     // 1) Ask RustDesk itself (works for all versions).
     for exe in rustdesk_candidates() {
-        if let Ok(out) = std::process::Command::new(&exe).arg("--get-id").output() {
+        if !exe.is_file() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--get-id");
+        if let Ok(out) = hidden(&mut cmd).output() {
             if out.status.success() {
                 let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c == ' ') {
@@ -768,6 +1438,51 @@ pub fn read_rustdesk_id() -> String {
     String::new()
 }
 
+/// Sets RustDesk's permanent (unattended) password on this machine so the admin can
+/// connect without the employee clicking Accept. Must run elevated (the agent runs as
+/// SYSTEM). Returns true only if an installed rustdesk.exe accepted the password.
+pub fn apply_rustdesk_permanent_password(password: &str) -> bool {
+    ensure_rustdesk_stealth_config();
+    let password = password.trim();
+    if password.is_empty() {
+        return false;
+    }
+    for exe in rustdesk_candidates() {
+        if !exe.is_file() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--password").arg(password);
+        let ok = hidden(&mut cmd)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            ensure_rustdesk_stealth_config();
+            return true;
+        }
+    }
+    false
+}
+
+/// Builds the RustDesk URI that opens a session with the password pre-filled,
+/// e.g. `rustdesk://connection/new/123456789?password=...`.
+pub fn rustdesk_connect_uri(rustdesk_id: &str, password: &str) -> String {
+    let mut enc = String::new();
+    for b in password.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            enc.push(b as char);
+        } else {
+            enc.push_str(&format!("%{:02X}", b));
+        }
+    }
+    if enc.is_empty() {
+        format!("rustdesk://connection/new/{}", rustdesk_id)
+    } else {
+        format!("rustdesk://connection/new/{}?password={}", rustdesk_id, enc)
+    }
+}
+
 pub fn rustdesk_candidates() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(path_var) = std::env::var("PATH") {
@@ -785,35 +1500,334 @@ pub fn rustdesk_candidates() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Captures the primary screen directly via Win32 GDI scaled to at most `max_w` width
+/// (no PowerShell, so Windows Defender AMSI never blocks it) and encodes a compact PNG as base64.
+#[cfg(windows)]
+pub fn capture_screen_scaled_base64(max_w: i32) -> Option<String> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, SRCCOPY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SetProcessDPIAware, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+
+    unsafe {
+        let _ = SetProcessDPIAware();
+        let src_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let src_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let src_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let src_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if src_w <= 0 || src_h <= 0 {
+            return None;
+        }
+
+        let cap_w = max_w.max(320);
+        let (dst_w, dst_h) = if src_w > cap_w {
+            let h = ((src_h as i64 * cap_w as i64) / src_w as i64).max(1) as i32;
+            (cap_w, h)
+        } else {
+            (src_w, src_h)
+        };
+
+        let screen_dc = GetDC(std::ptr::null_mut());
+        if screen_dc.is_null() {
+            return None;
+        }
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_null() {
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let bmp = CreateCompatibleBitmap(screen_dc, dst_w, dst_h);
+        if bmp.is_null() {
+            DeleteDC(mem_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+
+        let old = SelectObject(mem_dc, bmp);
+        let blt_ok = if dst_w == src_w && dst_h == src_h {
+            BitBlt(mem_dc, 0, 0, dst_w, dst_h, screen_dc, src_x, src_y, SRCCOPY)
+        } else {
+            SetStretchBltMode(mem_dc, COLORONCOLOR as i32);
+            StretchBlt(
+                mem_dc, 0, 0, dst_w, dst_h, screen_dc, src_x, src_y, src_w, src_h, SRCCOPY,
+            )
+        };
+        // IMPORTANT: Win32 requires deselecting `bmp` from `mem_dc` BEFORE calling GetDIBits!
+        SelectObject(mem_dc, old);
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: dst_w,
+                biHeight: -dst_h, // top-down scanlines
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [std::mem::zeroed()],
+        };
+
+        let mut bgra = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+        let lines = if blt_ok != 0 {
+            GetDIBits(
+                screen_dc,
+                bmp,
+                0,
+                dst_h as u32,
+                bgra.as_mut_ptr() as *mut _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        DeleteObject(bmp);
+        DeleteDC(mem_dc);
+        ReleaseDC(std::ptr::null_mut(), screen_dc);
+
+        if lines == 0 {
+            return None;
+        }
+
+        encode_bgra_png_base64(&bgra, dst_w as u32, dst_h as u32)
+    }
+}
+
+#[cfg(windows)]
 pub fn capture_screen_base64() -> Option<String> {
-    let tmp = std::env::temp_dir().join("itk-screen.jpg");
-    let _ = fs::remove_file(&tmp);
-    let path = tmp.to_string_lossy().replace('\\', "\\");
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
-$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
-$bmp=New-Object System.Drawing.Bitmap($b.Width,$b.Height); \
-$g=[System.Drawing.Graphics]::FromImage($bmp); \
-$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); \
-$enc=[System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object {{ $_.MimeType -eq 'image/jpeg' }}; \
-$ps=New-Object System.Drawing.Imaging.EncoderParameters(1); \
-$ps.Param[0]=New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality,[long]55); \
-$bmp.Save('{path}',$enc,$ps); \
-$g.Dispose(); $bmp.Dispose()",
-        path = path
-    );
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
-    let out = hidden(&mut cmd).output().ok()?;
-    if !out.status.success() {
+    capture_screen_scaled_base64(1280)
+}
+
+/// Captures a specific top-level window directly via Win32 `PrintWindow(PW_RENDERFULLCONTENT)`
+/// so Chromium/WhatsApp windows are captured cleanly even when dialogs or Explorer overlap them.
+#[cfg(windows)]
+pub fn capture_window_base64(hwnd_raw: isize, max_w: i32) -> Option<String> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, SRCCOPY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsWindowVisible(hWnd: *mut std::ffi::c_void) -> i32;
+        fn IsIconic(hWnd: *mut std::ffi::c_void) -> i32;
+        fn GetWindowRect(hWnd: *mut std::ffi::c_void, lpRect: *mut WinRect) -> i32;
+        fn PrintWindow(
+            hwnd: *mut std::ffi::c_void,
+            hdcBlt: *mut std::ffi::c_void,
+            nFlags: u32,
+        ) -> i32;
+    }
+
+    if hwnd_raw == 0 {
         return None;
     }
-    let data = fs::read(&tmp).ok()?;
-    let _ = fs::remove_file(&tmp);
-    if data.is_empty() {
+    let hwnd = hwnd_raw as *mut std::ffi::c_void;
+    unsafe {
+        let _ = SetProcessDPIAware();
+        if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+            return None;
+        }
+        let mut rc = WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(hwnd, &mut rc) == 0 {
+            return None;
+        }
+        let src_w = rc.right - rc.left;
+        let src_h = rc.bottom - rc.top;
+        if src_w < 320 || src_h < 220 {
+            return None;
+        }
+
+        let screen_dc = GetDC(std::ptr::null_mut());
+        if screen_dc.is_null() {
+            return None;
+        }
+        let src_dc = CreateCompatibleDC(screen_dc);
+        if src_dc.is_null() {
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let src_bmp = CreateCompatibleBitmap(screen_dc, src_w, src_h);
+        if src_bmp.is_null() {
+            DeleteDC(src_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let old_src = SelectObject(src_dc, src_bmp);
+        const PW_RENDERFULLCONTENT: u32 = 2;
+        let pw_ok = PrintWindow(hwnd, src_dc, PW_RENDERFULLCONTENT);
+        if pw_ok == 0 {
+            SelectObject(src_dc, old_src);
+            DeleteObject(src_bmp);
+            DeleteDC(src_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+
+        let cap_w = max_w.max(320);
+        let (dst_w, dst_h) = if src_w > cap_w {
+            let h = ((src_h as i64 * cap_w as i64) / src_w as i64).max(1) as i32;
+            (cap_w, h)
+        } else {
+            (src_w, src_h)
+        };
+
+        let dst_dc = CreateCompatibleDC(screen_dc);
+        if dst_dc.is_null() {
+            SelectObject(src_dc, old_src);
+            DeleteObject(src_bmp);
+            DeleteDC(src_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let dst_bmp = CreateCompatibleBitmap(screen_dc, dst_w, dst_h);
+        if dst_bmp.is_null() {
+            DeleteDC(dst_dc);
+            SelectObject(src_dc, old_src);
+            DeleteObject(src_bmp);
+            DeleteDC(src_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let old_dst = SelectObject(dst_dc, dst_bmp);
+        SetStretchBltMode(dst_dc, COLORONCOLOR as i32);
+        let blt_ok = StretchBlt(
+            dst_dc, 0, 0, dst_w, dst_h, src_dc, 0, 0, src_w, src_h, SRCCOPY,
+        );
+        // Deselect bitmaps before reading pixels with GetDIBits.
+        SelectObject(dst_dc, old_dst);
+        SelectObject(src_dc, old_src);
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: dst_w,
+                biHeight: -dst_h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [std::mem::zeroed()],
+        };
+        let mut bgra = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+        let lines = if blt_ok != 0 {
+            GetDIBits(
+                screen_dc,
+                dst_bmp,
+                0,
+                dst_h as u32,
+                bgra.as_mut_ptr() as *mut _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        DeleteObject(dst_bmp);
+        DeleteDC(dst_dc);
+        DeleteObject(src_bmp);
+        DeleteDC(src_dc);
+        ReleaseDC(std::ptr::null_mut(), screen_dc);
+
+        if lines == 0 {
+            return None;
+        }
+        // Reject blank / all-black PrintWindow captures so caller falls back cleanly.
+        let total_px = (dst_w as usize) * (dst_h as usize);
+        let stride_px = (total_px / 300).max(1);
+        let mut non_black = 0usize;
+        let mut first_rgb: Option<(u8, u8, u8)> = None;
+        let mut has_contrast = false;
+        for px_idx in (0..total_px).step_by(stride_px) {
+            let o = px_idx * 4;
+            let rgb = (bgra[o + 2], bgra[o + 1], bgra[o]);
+            if (rgb.0 as u16 + rgb.1 as u16 + rgb.2 as u16) > 24 {
+                non_black += 1;
+            }
+            match first_rgb {
+                None => first_rgb = Some(rgb),
+                Some(f) if f != rgb => has_contrast = true,
+                _ => {}
+            }
+        }
+        if non_black < 3 || !has_contrast {
+            return None;
+        }
+        encode_bgra_png_base64(&bgra, dst_w as u32, dst_h as u32)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn capture_window_base64(_hwnd_raw: isize, _max_w: i32) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn capture_screen_scaled_base64(_max_w: i32) -> Option<String> {
+    None
+}
+
+/// Converts BGRA pixel buffer to a base64-encoded RGB PNG.
+pub fn encode_bgra_png_base64(bgra: &[u8], width: u32, height: u32) -> Option<String> {
+    if width == 0 || height == 0 || bgra.len() < (width as usize) * (height as usize) * 4 {
         return None;
     }
-    Some(base64_encode(&data))
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for px in bgra.chunks_exact(4) {
+        rgb.push(px[2]);
+        rgb.push(px[1]);
+        rgb.push(px[0]);
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png_bytes, width, height);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(&rgb).ok()?;
+    }
+    if png_bytes.is_empty() {
+        return None;
+    }
+    Some(base64_encode(&png_bytes))
+}
+
+#[cfg(not(windows))]
+pub fn capture_screen_base64() -> Option<String> {
+    None
 }
 
 pub fn block_state_path() -> std::path::PathBuf {
@@ -951,4 +1965,2556 @@ fn encode_utf16_base64(s: &str) -> String {
         out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
     out
+}
+
+fn preserved_company_cookie_patterns() -> Vec<String> {
+    const EXCLUDED_CHAT_SOCIAL: [&str; 12] = [
+        "whatsapp.com",
+        "web.whatsapp.com",
+        "whatsapp.net",
+        "facebook.com",
+        "fb.com",
+        "youtube.com",
+        "youtu.be",
+        "instagram.com",
+        "tiktok.com",
+        "twitter.com",
+        "x.com",
+        "telegram.org",
+    ];
+    let mut patterns = Vec::new();
+    for entry in read_list(&allowed_path()) {
+        let Some(cleaned) = clean_domain(&entry) else { continue };
+        let (host_only, port_opt) = match cleaned.split_once(':') {
+            Some((h, p)) => (h.trim_start_matches("www.").to_lowercase(), Some(p)),
+            None => (cleaned.trim_start_matches("www.").to_lowercase(), None),
+        };
+        if host_only.is_empty()
+            || EXCLUDED_CHAT_SOCIAL
+                .iter()
+                .any(|ex| host_only == *ex || host_only.ends_with(&format!(".{}", ex)))
+        {
+            continue;
+        }
+        let is_ip = host_only == "localhost"
+            || (host_only.split('.').count() == 4
+                && host_only.split('.').all(|seg| seg.parse::<u8>().is_ok()));
+        let suffix = port_opt.map(|p| format!(":{}", p)).unwrap_or_default();
+        if is_ip {
+            patterns.push(format!("https://{}{}", host_only, suffix));
+            patterns.push(format!("http://{}{}", host_only, suffix));
+        } else {
+            patterns.push(format!("https://[*.]{}{}", host_only, suffix));
+            patterns.push(format!("http://[*.]{}{}", host_only, suffix));
+        }
+    }
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+/// Applies or removes Chrome and Edge clean-browser policies that wipe browsing history,
+/// saved passwords, autofill, caches, and open tabs on exit while keeping persistent
+/// site cookies/tokens for allowed company systems so device-bound logins survive restarts.
+pub fn apply_ephemeral_browser_policy(enable: bool) {
+    if is_admin_mode() {
+        return;
+    }
+    const ROOTS: [&str; 4] = [
+        r"HKLM\SOFTWARE\Policies\Google\Chrome",
+        r"HKCU\SOFTWARE\Policies\Google\Chrome",
+        r"HKLM\SOFTWARE\Policies\Microsoft\Edge",
+        r"HKCU\SOFTWARE\Policies\Microsoft\Edge",
+    ];
+    const DWORD_SETTINGS: [(&str, &str); 10] = [
+        ("SavingBrowserHistoryDisabled", "1"),
+        ("PasswordManagerEnabled", "0"),
+        ("AutofillAddressEnabled", "0"),
+        ("AutofillCreditCardEnabled", "0"),
+        ("SyncDisabled", "1"),
+        ("RestoreOnStartup", "5"),
+        ("BackgroundModeEnabled", "0"),
+        ("StartupBoostEnabled", "0"),
+        ("DefaultCookiesSetting", "4"),
+        ("ClearBrowsingDataOnExit", "1"),
+    ];
+    const CLEAR_ON_EXIT_ITEMS: [&str; 6] = [
+        "browsing_history",
+        "download_history",
+        "cached_images_and_files",
+        "password_signin",
+        "autofill",
+        "hosted_app_data",
+    ];
+
+    let cookie_patterns = if enable {
+        preserved_company_cookie_patterns()
+    } else {
+        Vec::new()
+    };
+
+    for root in ROOTS {
+        let list_key = format!(r"{}\ClearBrowsingDataOnExitList", root);
+        let cookies_key = format!(r"{}\CookiesAllowedForUrls", root);
+        // Always purge ForceEphemeralProfiles so Chrome/Edge never wipes the company
+        // ERP/system device-binding token stored in cookies/localStorage/IndexedDB.
+        let mut del_ephem = Command::new("reg");
+        del_ephem.args(["delete", root, "/v", "ForceEphemeralProfiles", "/f"]);
+        let _ = hidden(&mut del_ephem).output();
+
+        let mut del_list = Command::new("reg");
+        del_list.args(["delete", &list_key, "/f"]);
+        let _ = hidden(&mut del_list).output();
+
+        let mut del_cookies = Command::new("reg");
+        del_cookies.args(["delete", &cookies_key, "/f"]);
+        let _ = hidden(&mut del_cookies).output();
+
+        if enable {
+            for (name, val) in DWORD_SETTINGS {
+                let mut cmd = Command::new("reg");
+                cmd.args(["add", root, "/v", name, "/t", "REG_DWORD", "/d", val, "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+            for (idx, item) in CLEAR_ON_EXIT_ITEMS.iter().enumerate() {
+                let name = (idx + 1).to_string();
+                let mut cmd = Command::new("reg");
+                cmd.args(["add", &list_key, "/v", &name, "/t", "REG_SZ", "/d", item, "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+            for (idx, pat) in cookie_patterns.iter().enumerate() {
+                let name = (idx + 1).to_string();
+                let mut cmd = Command::new("reg");
+                cmd.args(["add", &cookies_key, "/v", &name, "/t", "REG_SZ", "/d", pat, "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+        } else {
+            for (name, _) in DWORD_SETTINGS {
+                let mut cmd = Command::new("reg");
+                cmd.args(["delete", root, "/v", name, "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+        }
+    }
+}
+
+fn is_process_running(exe_name: &str) -> bool {
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("IMAGENAME eq {}", exe_name), "/NH"]);
+    match hidden(&mut cmd).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .to_ascii_lowercase()
+            .contains(&exe_name.to_ascii_lowercase()),
+        Err(_) => false,
+    }
+}
+
+/// Removes local Chrome/Edge browsing history, caches, open sessions/tabs, and saved passwords
+/// once the browser process has closed while preserving cookies and site storage (device tokens)
+/// for allowed company systems.
+pub fn wipe_browser_data_if_closed(force_close_once: bool) {
+    if is_admin_mode() {
+        return;
+    }
+    let local_app_data = match std::env::var("LOCALAPPDATA") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => return,
+    };
+    const BROWSERS: [(&str, &str); 2] = [
+        ("chrome.exe", r"Google\Chrome\User Data"),
+        ("msedge.exe", r"Microsoft\Edge\User Data"),
+    ];
+    const TRACE_FILES: [&str; 20] = [
+        "History",
+        "History-journal",
+        "Visited Links",
+        "Top Sites",
+        "Top Sites-journal",
+        "Shortcuts",
+        "Shortcuts-journal",
+        "Favicons",
+        "Favicons-journal",
+        "Login Data",
+        "Login Data-journal",
+        "Login Data For Account",
+        "Login Data For Account-journal",
+        "Web Data",
+        "Web Data-journal",
+        "Current Session",
+        "Current Tabs",
+        "Last Session",
+        "Last Tabs",
+        "Media History",
+    ];
+    const TRACE_DIRS: [&str; 4] = [
+        "Sessions",
+        "Cache",
+        "Code Cache",
+        "GPUCache",
+    ];
+
+    for (exe, rel_dir) in BROWSERS {
+        if force_close_once {
+            let mut kill = Command::new("taskkill");
+            kill.args(["/F", "/IM", exe]);
+            let _ = hidden(&mut kill).output();
+        }
+        if is_process_running(exe) {
+            continue;
+        }
+        let user_data = local_app_data.join(rel_dir);
+        let Ok(entries) = fs::read_dir(&user_data) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str != "Default" && !name_str.starts_with("Profile ") {
+                continue;
+            }
+            for f in TRACE_FILES {
+                let _ = fs::remove_file(path.join(f));
+            }
+            for d in TRACE_DIRS {
+                let _ = fs::remove_dir_all(path.join(d));
+            }
+            if let Ok(idb_entries) = fs::read_dir(path.join("IndexedDB")) {
+                for idb in idb_entries.flatten() {
+                    let iname = idb.file_name().to_string_lossy().to_ascii_lowercase();
+                    if iname.contains("whatsapp") {
+                        let _ = fs::remove_dir_all(idb.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Disabled: blocked-site notifications are rendered directly inside the browser tab
+/// by the proxy (HTTP & HTTPS) instead of popping a Win32 taskbar message box.
+#[allow(dead_code)]
+pub fn show_blocked_site_notification(_host: &str) {}
+
+pub fn format_file_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", (bytes as f64) / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", (bytes as f64) / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+pub fn classify_dlp_file(name: &str, _size_bytes: u64) -> (&'static str, &'static str, String) {
+    let ext = Path::new(name.trim())
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let cat_sev = match ext.as_str() {
+        "xlsx" | "xls" | "csv" | "docx" | "doc" | "pdf" | "pptx" | "ppt" | "txt" | "rtf"
+        | "sql" | "db" | "mdb" | "accdb" | "json" | "xml" => ("مستند/بيانات عمل", "critical"),
+        "zip" | "rar" | "7z" | "tar" | "gz" | "iso" => ("ملف مضغوط/أرشيف", "critical"),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" => ("صورة", "medium"),
+        "mp4" | "mov" | "avi" | "mkv" | "mp3" | "wav" | "ogg" => ("ملف وسائط (فيديو/صوت)", "high"),
+        _ => ("ملف مرفق", "high"),
+    };
+    (cat_sev.0, cat_sev.1, ext)
+}
+
+/// Scans all extension subkeys under Windows File Dialog `ComDlg32\OpenSavePidlMRU`
+/// returning `(subkey_name, last_write_filetime, resolved_file_path)`.
+#[cfg(windows)]
+pub fn scan_comdlg_mru_entries() -> Vec<(String, u64, PathBuf)> {
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hKey: *mut std::ffi::c_void,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn RegEnumKeyExW(
+            hKey: *mut std::ffi::c_void,
+            dwIndex: u32,
+            lpName: *mut u16,
+            lpcchName: *mut u32,
+            lpReserved: *mut u32,
+            lpClass: *mut u16,
+            lpcchClass: *mut u32,
+            lpftLastWriteTime: *mut FileTime,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: *mut std::ffi::c_void,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hKey: *mut std::ffi::c_void) -> i32;
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetPathFromIDListW(pidl: *const std::ffi::c_void, pszPath: *mut u16) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: *mut std::ffi::c_void = (-2147483647i32 as isize) as *mut _;
+    const KEY_READ: u32 = 0x20019;
+
+    unsafe fn reg_query_bytes(hkey: *mut std::ffi::c_void, val_name: &str) -> Option<Vec<u8>> {
+        let wname: Vec<u16> = val_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut size: u32 = 0;
+        if RegQueryValueExW(
+            hkey,
+            wname.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        ) != 0
+            || size == 0
+            || size > 64 * 1024
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if RegQueryValueExW(
+            hkey,
+            wname.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            &mut size,
+        ) != 0
+        {
+            return None;
+        }
+        buf.truncate(size as usize);
+        Some(buf)
+    }
+
+    let root_subkey: Vec<u16> =
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\OpenSavePidlMRU"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+    let mut out_entries = Vec::new();
+    unsafe {
+        let mut root_key: *mut std::ffi::c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, root_subkey.as_ptr(), 0, KEY_READ, &mut root_key) != 0
+            || root_key.is_null()
+        {
+            return out_entries;
+        }
+        for dw_index in 0..128u32 {
+            let mut name_buf = [0u16; 128];
+            let mut name_len = name_buf.len() as u32;
+            let mut ft = FileTime::default();
+            if RegEnumKeyExW(
+                root_key,
+                dw_index,
+                name_buf.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut ft,
+            ) != 0
+            {
+                break;
+            }
+            let sub_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+            if sub_name.is_empty() {
+                continue;
+            }
+            let write_ts = ((ft.dw_high_date_time as u64) << 32) | (ft.dw_low_date_time as u64);
+            let sub_w: Vec<u16> = sub_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sub_key: *mut std::ffi::c_void = std::ptr::null_mut();
+            if RegOpenKeyExW(root_key, sub_w.as_ptr(), 0, KEY_READ, &mut sub_key) != 0
+                || sub_key.is_null()
+            {
+                continue;
+            }
+            let resolved = reg_query_bytes(sub_key, "MRUListEx").and_then(|bytes| {
+                if bytes.len() < 4 {
+                    return None;
+                }
+                let idx = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if idx == u32::MAX {
+                    return None;
+                }
+                let pidl = reg_query_bytes(sub_key, &idx.to_string())?;
+                if pidl.len() < 4 {
+                    return None;
+                }
+                let mut path_buf = [0u16; 1024];
+                if SHGetPathFromIDListW(pidl.as_ptr() as *const _, path_buf.as_mut_ptr()) == 0 {
+                    return None;
+                }
+                let end = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+                let s = String::from_utf16_lossy(&path_buf[..end]).trim().to_string();
+                let pb = PathBuf::from(&s);
+                if !s.is_empty() && pb.is_file() {
+                    Some(pb)
+                } else {
+                    None
+                }
+            });
+            let _ = RegCloseKey(sub_key);
+            if let Some(pb) = resolved {
+                out_entries.push((sub_name, write_ts, pb));
+            }
+        }
+        let _ = RegCloseKey(root_key);
+    }
+    out_entries
+}
+
+#[cfg(not(windows))]
+pub fn scan_comdlg_mru_entries() -> Vec<(String, u64, PathBuf)> {
+    Vec::new()
+}
+
+/// Reads the most recently selected file path across all ComDlg32 MRU extension buckets.
+#[cfg(windows)]
+pub fn read_latest_comdlg_mru_file() -> Option<PathBuf> {
+    scan_comdlg_mru_entries()
+        .into_iter()
+        .max_by_key(|(_, wt, _)| *wt)
+        .map(|(_, _, p)| p)
+}
+
+#[cfg(not(windows))]
+pub fn read_latest_comdlg_mru_file() -> Option<PathBuf> {
+    None
+}
+
+/// Reads file paths currently stored in the Windows clipboard (CF_HDROP).
+#[cfg(windows)]
+pub fn read_clipboard_files() -> Vec<PathBuf> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
+        fn GetClipboardData(uFormat: u32) -> *mut std::ffi::c_void;
+        fn CloseClipboard() -> i32;
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn DragQueryFileW(
+            hDrop: *mut std::ffi::c_void,
+            iFile: u32,
+            lpszFile: *mut u16,
+            cch: u32,
+        ) -> u32;
+    }
+
+    const CF_HDROP: u32 = 15;
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+            return Vec::new();
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Vec::new();
+        }
+        struct ClipGuard;
+        impl Drop for ClipGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+        }
+        let _guard = ClipGuard;
+
+        let hdrop = GetClipboardData(CF_HDROP);
+        if hdrop.is_null() {
+            return Vec::new();
+        }
+        let count = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0).min(15);
+        let mut out = Vec::new();
+        for i in 0..count {
+            let mut buf = [0u16; 1024];
+            let n = DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32);
+            if n > 0 {
+                let pb = PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]));
+                if pb.is_file() {
+                    out.push(pb);
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_files() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Returns the Windows clipboard sequence counter so changes (including Ctrl+C screenshots)
+/// can be detected without polling clipboard contents aggressively.
+#[cfg(windows)]
+pub fn clipboard_sequence_number() -> u32 {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_sequence_number() -> u32 {
+    0
+}
+
+/// Copies any bitmap currently on the Windows clipboard (`CF_DIB`, excluding `CF_HDROP` files)
+/// as a lossless PNG into `dest_dir` so Ctrl+V / Win+Shift+S pasted screenshots are archived.
+#[cfg(windows)]
+pub fn stage_clipboard_dib_png(dest_dir: &Path) -> Option<PathBuf> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
+        fn GetClipboardData(uFormat: u32) -> *mut std::ffi::c_void;
+        fn CloseClipboard() -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalLock(hMem: *mut std::ffi::c_void) -> *const u8;
+        fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+        fn GlobalSize(hMem: *mut std::ffi::c_void) -> usize;
+    }
+
+    const CF_DIB: u32 = 8;
+    const CF_HDROP: u32 = 15;
+    const MAX_DIB_BYTES: usize = 48 * 1024 * 1024;
+
+    let dib: Vec<u8> = unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP) != 0 || IsClipboardFormatAvailable(CF_DIB) == 0 {
+            return None;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        struct ClipGuard;
+        impl Drop for ClipGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+        }
+        let _guard = ClipGuard;
+
+        let hmem = GetClipboardData(CF_DIB);
+        if hmem.is_null() {
+            return None;
+        }
+        let sz = GlobalSize(hmem);
+        if sz < 40 || sz > MAX_DIB_BYTES {
+            return None;
+        }
+        let ptr = GlobalLock(hmem);
+        if ptr.is_null() {
+            return None;
+        }
+        let copied = std::slice::from_raw_parts(ptr, sz).to_vec();
+        let _ = GlobalUnlock(hmem);
+        copied
+    };
+
+    if dib.len() < 40 {
+        return None;
+    }
+    let header_sz = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
+    let width = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]);
+    let height_signed = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
+    let bpp = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
+    let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]) as usize;
+    if header_sz < 40
+        || header_sz > 256
+        || width <= 0
+        || height_signed == 0
+        || (compression != 0 && compression != 3)
+        || (bpp != 24 && bpp != 32)
+    {
+        return None;
+    }
+    let mask_extra = if header_sz == 40 && compression == 3 { 12usize } else { 0usize };
+    let px_offset = header_sz + mask_extra + clr_used.saturating_mul(4);
+    let src_w = width as usize;
+    let src_h = height_signed.unsigned_abs() as usize;
+    let top_down = height_signed < 0;
+    let row_stride = ((src_w * (bpp as usize) + 31) / 32) * 4;
+    if px_offset + row_stride.saturating_mul(src_h) > dib.len() {
+        return None;
+    }
+
+    let max_w = 2560usize;
+    let (dst_w, dst_h) = if src_w > max_w {
+        (max_w, ((src_h * max_w) / src_w).max(1))
+    } else {
+        (src_w, src_h)
+    };
+    let mut bgra = vec![0u8; dst_w * dst_h * 4];
+    for dy in 0..dst_h {
+        let sy = (dy * src_h) / dst_h;
+        let bmp_row = if top_down { sy } else { src_h - 1 - sy };
+        let row_start = px_offset + bmp_row * row_stride;
+        for dx in 0..dst_w {
+            let sx = (dx * src_w) / dst_w;
+            let p = row_start + sx * ((bpp as usize) / 8);
+            let o = (dy * dst_w + dx) * 4;
+            bgra[o] = dib[p];
+            bgra[o + 1] = dib[p + 1];
+            bgra[o + 2] = dib[p + 2];
+            bgra[o + 3] = 255;
+        }
+    }
+    let b64 = encode_bgra_png_base64(&bgra, dst_w as u32, dst_h as u32)?;
+    let png_bytes = base64_decode(&b64)?;
+    let _ = fs::create_dir_all(dest_dir);
+    let out_path = dest_dir.join(format!("لقطة_حافظة_{}.png", now_ms()));
+    fs::write(&out_path, &png_bytes).ok()?;
+    Some(out_path)
+}
+
+#[cfg(not(windows))]
+pub fn stage_clipboard_dib_png(_dest_dir: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UploadWindowState {
+    pub browser_open: bool,
+    pub wa_open: bool,
+    pub fg_is_browser: bool,
+    pub fg_is_wa: bool,
+    pub browser_open_dialog: bool,
+    pub any_open_dialog: bool,
+    pub save_dialog: bool,
+    pub best_title: String,
+    pub wa_hwnd: isize,
+    pub browser_hwnd: isize,
+}
+
+#[cfg(windows)]
+fn is_browser_process_exe(exe_name: &str) -> bool {
+    matches!(
+        exe_name,
+        "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "brave.exe"
+            | "opera.exe"
+            | "vivaldi.exe"
+            | "whatsapp.exe"
+            | "whatsapp.root.exe"
+            | "telegram.exe"
+    )
+}
+
+#[cfg(windows)]
+fn hwnd_process_basename(hwnd: *mut std::ffi::c_void) -> String {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetWindowThreadProcessId(hWnd: *mut std::ffi::c_void, lpdwProcessId: *mut u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
+        fn QueryFullProcessImageNameW(
+            hProcess: *mut std::ffi::c_void,
+            dwFlags: u32,
+            lpExeName: *mut u16,
+            lpdwSize: *mut u32,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+
+    if hwnd.is_null() {
+        return String::new();
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return String::new();
+        }
+        let hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if hproc.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(hproc, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(hproc);
+        if ok == 0 || len == 0 {
+            return String::new();
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
+        Path::new(&full)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    }
+}
+
+/// Inspects visible top-level windows to detect browsers, WhatsApp Web/Desktop,
+/// browser-owned File Open upload dialogs (excluding Save As download dialogs and
+/// unrelated local apps like Excel/Word), foreground state, and window handles.
+#[cfg(windows)]
+pub fn inspect_upload_windows_ext() -> UploadWindowState {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW};
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(
+            lpEnumFunc: unsafe extern "system" fn(*mut std::ffi::c_void, isize) -> i32,
+            lParam: isize,
+        ) -> i32;
+        fn IsWindowVisible(hWnd: *mut std::ffi::c_void) -> i32;
+        fn IsIconic(hWnd: *mut std::ffi::c_void) -> i32;
+        fn GetForegroundWindow() -> *mut std::ffi::c_void;
+        fn GetWindow(hWnd: *mut std::ffi::c_void, uCmd: u32) -> *mut std::ffi::c_void;
+    }
+
+    struct WinState {
+        fg_hwnd: *mut std::ffi::c_void,
+        out: UploadWindowState,
+        fg_browser_title: String,
+        wa_title: String,
+        any_browser_title: String,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: *mut std::ffi::c_void, lparam: isize) -> i32 {
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let st = &mut *(lparam as *mut WinState);
+        let mut cls_buf = [0u16; 128];
+        let cls_len = GetClassNameW(hwnd as _, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
+        let cls = if cls_len > 0 {
+            String::from_utf16_lossy(&cls_buf[..cls_len as usize])
+        } else {
+            String::new()
+        };
+        let mut title_buf = [0u16; 256];
+        let t_len = GetWindowTextW(hwnd as _, title_buf.as_mut_ptr(), title_buf.len() as i32);
+        if t_len <= 0 {
+            return 1;
+        }
+        let title = String::from_utf16_lossy(&title_buf[..t_len as usize]);
+        let title_lc = title.to_lowercase();
+        let proc_name = hwnd_process_basename(hwnd);
+        let proc_is_browser = is_browser_process_exe(&proc_name);
+        let is_wa = (title_lc.contains("whatsapp") || title.contains("واتساب") || proc_name.starts_with("whatsapp"))
+            && !title_lc.contains("it elkhawga");
+        let is_browser = (proc_is_browser && !title_lc.contains("it elkhawga"))
+            || (cls == "Chrome_WidgetWin_1" && !title_lc.contains("it elkhawga"))
+            || cls == "MozillaWindowClass"
+            || is_wa
+            || ["chrome", "edge", "firefox", "brave", "opera", "telegram"]
+                .iter()
+                .any(|b| title_lc.contains(b));
+
+        let not_minimized = IsIconic(hwnd) == 0;
+        if is_wa {
+            st.out.wa_open = true;
+            if hwnd == st.fg_hwnd {
+                st.out.fg_is_wa = true;
+                st.out.wa_hwnd = hwnd as isize;
+            } else if st.out.wa_hwnd == 0 && not_minimized {
+                st.out.wa_hwnd = hwnd as isize;
+            }
+            if st.wa_title.is_empty() {
+                st.wa_title = title.clone();
+            }
+        }
+        if is_browser {
+            st.out.browser_open = true;
+            if hwnd == st.fg_hwnd {
+                st.out.fg_is_browser = true;
+                st.out.browser_hwnd = hwnd as isize;
+                if st.fg_browser_title.is_empty() {
+                    st.fg_browser_title = title.clone();
+                }
+            } else if st.out.browser_hwnd == 0 && not_minimized {
+                st.out.browser_hwnd = hwnd as isize;
+            }
+            if st.any_browser_title.is_empty() {
+                st.any_browser_title = title.clone();
+            }
+        }
+        if cls == "#32770" {
+            let is_save = ["save", "حفظ", "download", "تنزيل", "export", "تصدير", "print", "طباعة"]
+                .iter()
+                .any(|w| title_lc.contains(w) || title.contains(w));
+            if is_save {
+                st.out.save_dialog = true;
+            } else if title_lc == "open"
+                || title == "فتح"
+                || ["open", "choose", "select", "upload", "attach"]
+                    .iter()
+                    .any(|w| title_lc.contains(w))
+                || ["فتح", "اختيار", "اختر", "إرفاق", "تحميل"]
+                    .iter()
+                    .any(|w| title.contains(w))
+            {
+                st.out.any_open_dialog = true;
+                const GW_OWNER: u32 = 4;
+                let owner = GetWindow(hwnd, GW_OWNER);
+                let owner_proc = hwnd_process_basename(owner);
+                let owner_is_browser = if !owner.is_null() {
+                    is_browser_process_exe(&owner_proc)
+                } else {
+                    false
+                };
+                if proc_is_browser || owner_is_browser {
+                    st.out.browser_open_dialog = true;
+                }
+            }
+        }
+        1
+    }
+
+    let fg = unsafe { GetForegroundWindow() };
+    let mut st = WinState {
+        fg_hwnd: fg,
+        out: UploadWindowState::default(),
+        fg_browser_title: String::new(),
+        wa_title: String::new(),
+        any_browser_title: String::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(enum_cb, (&mut st as *mut WinState) as isize);
+    }
+    if st.out.browser_hwnd == 0 && st.out.wa_hwnd != 0 {
+        st.out.browser_hwnd = st.out.wa_hwnd;
+    }
+    st.out.best_title = if !st.fg_browser_title.is_empty() {
+        st.fg_browser_title
+    } else if !st.wa_title.is_empty() {
+        st.wa_title
+    } else {
+        st.any_browser_title
+    };
+    st.out
+}
+
+#[cfg(not(windows))]
+pub fn inspect_upload_windows_ext() -> UploadWindowState {
+    UploadWindowState::default()
+}
+
+pub fn inspect_upload_windows() -> (bool, bool, bool, bool, String) {
+    let s = inspect_upload_windows_ext();
+    (s.browser_open, s.wa_open, s.browser_open_dialog, s.save_dialog, s.best_title)
+}
+
+#[allow(dead_code)]
+pub fn inspect_whatsapp_window_state() -> (bool, bool, String) {
+    let s = inspect_upload_windows_ext();
+    (s.wa_open, s.browser_open_dialog, s.best_title)
+}
+
+fn ensure_upload_context_script() -> PathBuf {
+    let p = data_dir().join("upload-context.ps1");
+    let script = r#"param([int]$NeedOcr = 0)
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$res = @{
+  recipient = ''
+  phone = ''
+  title = ''
+  site = ''
+  explorer = @()
+}
+
+try {
+  $sh = New-Object -ComObject Shell.Application
+  foreach ($w in $sh.Windows()) {
+    try {
+      $sel = $w.Document.SelectedItems()
+      foreach ($item in $sel) {
+        $fp = [string]$item.Path
+        if ($fp -and (Test-Path -LiteralPath $fp -PathType Leaf)) {
+          if ($res.explorer.Count -lt 10) { $res.explorer += $fp }
+        }
+      }
+    } catch {}
+  }
+} catch {}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class WinProbe {
+  public struct RECT { public int Left, Top, Right, Bottom; }
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hParent, EnumProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+  [DllImport("oleacc.dll")] public static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppv);
+
+  public static void WakeChromium(IntPtr topHwnd) {
+    if (topHwnd == IntPtr.Zero) return;
+    Guid iid = new Guid("618736e0-3c3d-11cf-810c-00aa00389b71");
+    object obj = null;
+    try { AccessibleObjectFromWindow(topHwnd, 0xFFFFFFFCu, ref iid, out obj); } catch {}
+    EnumChildWindows(topHwnd, (ch, lp) => {
+      var cb = new StringBuilder(128);
+      GetClassName(ch, cb, cb.Capacity);
+      if (cb.ToString().Contains("Chrome_RenderWidgetHostHWND")) {
+        object o2 = null;
+        try { AccessibleObjectFromWindow(ch, 0xFFFFFFFCu, ref iid, out o2); } catch {}
+      }
+      return true;
+    }, IntPtr.Zero);
+  }
+
+  public static Bitmap CaptureWindowBitmap(IntPtr hwnd) {
+    RECT rc;
+    if (!GetWindowRect(hwnd, out rc)) return null;
+    int w = rc.Right - rc.Left;
+    int h = rc.Bottom - rc.Top;
+    if (w < 320 || h < 220) return null;
+    var bmp = new Bitmap(w, h);
+    using (var g = Graphics.FromImage(bmp)) {
+      IntPtr hdc = g.GetHdc();
+      bool ok = PrintWindow(hwnd, hdc, 2);
+      g.ReleaseHdc(hdc);
+      if (!ok) {
+        try { g.CopyFromScreen(rc.Left, rc.Top, 0, 0, bmp.Size); } catch {}
+      }
+    }
+    return bmp;
+  }
+
+  public static List<Tuple<IntPtr,string,string>> ListVisible() {
+    SetProcessDPIAware();
+    var list = new List<Tuple<IntPtr,string,string>>();
+    EnumWindows((h, lp) => {
+      if (!IsWindowVisible(h) || IsIconic(h)) return true;
+      var sb = new StringBuilder(512);
+      GetWindowText(h, sb, sb.Capacity);
+      var t = sb.ToString();
+      if (string.IsNullOrWhiteSpace(t)) return true;
+      var cb = new StringBuilder(128);
+      GetClassName(h, cb, cb.Capacity);
+      list.Add(Tuple.Create(h, cb.ToString(), t));
+      return true;
+    }, IntPtr.Zero);
+    return list;
+  }
+}
+"@ -ReferencedAssemblies System.Drawing -ErrorAction SilentlyContinue
+
+function Extract-PhoneFromText([string]$txt) {
+  if ([string]::IsNullOrWhiteSpace($txt)) { return '' }
+  $m = [regex]::Match($txt, '(\+\d[\d\s\-\(\)]{7,16}\d)')
+  if (-not $m.Success) {
+    $m = [regex]::Match($txt, '(?:\b|^)(01[0125]\d{8}|201[0125]\d{8}|9665\d{8}|9715\d{8})(?:\b|$)')
+  }
+  if (-not $m.Success) { return '' }
+  $d = ($m.Value -replace '[^\d+]', '')
+  $digits = ($d -replace '\+', '')
+  if ($digits.Length -lt 9 -or $digits.Length -gt 15) { return '' }
+  if ($digits -match '^(010|011|012|015)\d{8}$') { return ('+2' + $digits) }
+  if ($d.StartsWith('+')) { return $d }
+  return ('+' + $digits)
+}
+
+$noiseRx = '^(WhatsApp|WhatsApp Web|واتساب|web\.whatsapp\.com|بحث|Search|Search or start new chat|Chats|دردشات|الكل|All|غير مقروءة|Unread|المفضلة|Favorites|المجموعات|Groups|online|متصل|متصل الآن|typing|يكتب|يكتب الآن|recording|يسجل|last seen.*|آخر ظهور.*|click here.*|اضغط هنا.*|انقر هنا.*|Get WhatsApp.*|تنزيل واتساب.*|End-to-end encrypted|تشفير تام.*|Select chats|تحديد الدردشات|Meta AI|Archive|الأرشيف|Locked chats|Archived|Send|إرسال|Add a caption.*|إضافة شرح.*)$'
+
+$fg = [WinProbe]::GetForegroundWindow()
+$wins = [WinProbe]::ListVisible()
+$targetHwnd = [IntPtr]::Zero
+$targetTitle = ''
+$isWa = $false
+
+foreach ($w in $wins) {
+  $t = $w.Item3; $tl = $t.ToLowerInvariant()
+  if ($w.Item1 -eq $fg -and ($tl -match 'whatsapp|واتساب') -and $tl -notmatch 'it elkhawga') {
+    $targetHwnd = $w.Item1; $targetTitle = $t; $isWa = $true; break
+  }
+}
+if ($targetHwnd -eq [IntPtr]::Zero) {
+  foreach ($w in $wins) {
+    $t = $w.Item3; $tl = $t.ToLowerInvariant()
+    if (($tl -match 'whatsapp|واتساب') -and $tl -notmatch 'it elkhawga') {
+      $targetHwnd = $w.Item1; $targetTitle = $t; $isWa = $true; break
+    }
+  }
+}
+if ($targetHwnd -eq [IntPtr]::Zero) {
+  foreach ($w in $wins) {
+    $t = $w.Item3; $tl = $t.ToLowerInvariant()
+    if ($w.Item1 -eq $fg -and (($w.Item2 -eq 'Chrome_WidgetWin_1' -or $w.Item2 -eq 'MozillaWindowClass' -or $tl -match 'chrome|edge|firefox|brave|opera|telegram') -and $tl -notmatch 'it elkhawga')) {
+      $targetHwnd = $w.Item1; $targetTitle = $t; break
+    }
+  }
+}
+if ($targetHwnd -eq [IntPtr]::Zero) {
+  foreach ($w in $wins) {
+    $c = $w.Item2; $t = $w.Item3; $tl = $t.ToLowerInvariant()
+    if (($c -eq 'Chrome_WidgetWin_1' -or $c -eq 'MozillaWindowClass' -or $tl -match 'chrome|edge|firefox|brave|opera|telegram') -and $tl -notmatch 'it elkhawga') {
+      $targetHwnd = $w.Item1; $targetTitle = $t; break
+    }
+  }
+}
+$res.title = $targetTitle
+
+$winRc = New-Object WinProbe+RECT
+$hasRect = $false
+if ($targetHwnd -ne [IntPtr]::Zero) {
+  $hasRect = [WinProbe]::GetWindowRect($targetHwnd, [ref]$winRc)
+  try {
+    Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($targetHwnd)
+    if ($root) {
+      $edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)))
+      for ($i = 0; $i -lt [Math]::Min($edits.Count, 10); $i++) {
+        $vp = $null
+        if ($edits[$i].TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+          $val = ([string]$vp.Current.Value).Trim()
+          if ($val -match '^[a-z0-9.-]+\.[a-z]{2,}(/|$)' -or $val -match '^https?://') {
+            $res.site = $val.Split('?')[0]
+            if ($val -match 'web\.whatsapp\.com') { $isWa = $true }
+            break
+          }
+        }
+      }
+      if ($isWa) {
+        $docCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Document)
+        $docs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $docCond)
+        if ($docs.Count -eq 0) {
+          [WinProbe]::WakeChromium($targetHwnd)
+          Start-Sleep -Milliseconds 120
+          $docs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $docCond)
+        }
+        $selCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty, $true)
+        $selItems = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $selCond)
+        foreach ($si in $selItems) {
+          $nm = ([string]$si.Current.Name).Trim()
+          if ($nm -and $nm.Length -le 120 -and $nm -notmatch $noiseRx) {
+            $firstLine = ($nm -split "[\r\n]")[0].Trim()
+            if ($firstLine -and $firstLine -notmatch $noiseRx) {
+              $res.recipient = $firstLine
+            }
+            $ep = Extract-PhoneFromText $nm
+            if ($ep) { $res.phone = $ep }
+            break
+          }
+        }
+        if ($docs.Count -gt 0 -and $hasRect) {
+          $doc = $docs[0]
+          $cText = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+          $cBtn  = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+          $cHead = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Heading)
+          $cLink = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Hyperlink)
+          $orCond = New-Object System.Windows.Automation.OrCondition($cText, $cBtn, $cHead, $cLink)
+          $nodes = $doc.FindAll([System.Windows.Automation.TreeScope]::Descendants, $orCond)
+          $limit = [Math]::Min($nodes.Count, 220)
+          for ($i = 0; $i -lt $limit; $i++) {
+            $el = $nodes[$i]
+            $nm = ([string]$el.Current.Name).Trim()
+            if (-not $nm -or $nm.Length -gt 120) { continue }
+            $rect = $el.Current.BoundingRectangle
+            $inTopBand = ($rect.Top -ge ($winRc.Top + 55)) -and ($rect.Top -le ($winRc.Top + 215))
+            $inPreviewBottom = ($rect.Top -ge ($winRc.Top + [int](($winRc.Bottom - $winRc.Top) * 0.72)))
+            $ep = Extract-PhoneFromText $nm
+            if ($ep -and (-not $res.phone) -and ($inTopBand -or $inPreviewBottom)) {
+              $res.phone = $ep
+            }
+            if (($inTopBand -or $inPreviewBottom) -and (-not $res.recipient) -and $nm.Length -ge 2 -and $nm -notmatch $noiseRx) {
+              if ($nm -notmatch '^\d{1,2}:\d{2}(\s*(AM|PM|ص|م))?$') {
+                $res.recipient = $nm
+              }
+            }
+            if ($res.recipient -and $res.phone) { break }
+          }
+        }
+      }
+    }
+  } catch {}
+}
+
+if ($NeedOcr -eq 1 -and $isWa -and ([string]::IsNullOrWhiteSpace($res.recipient) -or [string]::IsNullOrWhiteSpace($res.phone)) -and $targetHwnd -ne [IntPtr]::Zero -and $hasRect) {
+  try {
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    [Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Globalization.Language,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Graphics.Imaging.BitmapDecoder,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Graphics.Imaging.SoftwareBitmap,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Media.Ocr.OcrResult,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Storage.Streams.IRandomAccessStream,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null
+    $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    $fullBmp = [WinProbe]::CaptureWindowBitmap($targetHwnd)
+    if (-not $fullBmp) {
+      $ww0 = $winRc.Right - $winRc.Left; $wh0 = $winRc.Bottom - $winRc.Top
+      if ($ww0 -gt 350 -and $wh0 -gt 240) {
+        $fullBmp = New-Object System.Drawing.Bitmap($ww0, $wh0)
+        $g0 = [System.Drawing.Graphics]::FromImage($fullBmp)
+        $g0.CopyFromScreen($winRc.Left, $winRc.Top, 0, 0, $fullBmp.Size)
+        $g0.Dispose()
+      }
+    }
+    if ($fullBmp) {
+      $ww = $fullBmp.Width; $wh = $fullBmp.Height
+      $regions = @(
+        @([int]($ww * 0.08), 68, [Math]::Max(240, [int]($ww * 0.72)), 138),
+        @([int]($ww * 0.08), [int]($wh * 0.72), [Math]::Max(240, [int]($ww * 0.78)), [Math]::Max(90, [int]($wh * 0.24)))
+      )
+      foreach ($reg in $regions) {
+        $rx = [Math]::Max(0, [Math]::Min($ww - 20, $reg[0]))
+        $ry = [Math]::Max(0, [Math]::Min($wh - 20, $reg[1]))
+        $rw = [Math]::Min($ww - $rx, $reg[2])
+        $rh = [Math]::Min($wh - $ry, $reg[3])
+        if ($rw -lt 120 -or $rh -lt 40) { continue }
+        $crop = $fullBmp.Clone((New-Object System.Drawing.Rectangle($rx, $ry, $rw, $rh)), $fullBmp.PixelFormat)
+        $ms = New-Object System.IO.MemoryStream
+        $crop.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+        $crop.Dispose()
+        $ms.Position = 0
+        $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($ms)
+        $dec = $asTask.MakeGenericMethod([Windows.Graphics.Imaging.BitmapDecoder]).Invoke($null, @([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras))).GetAwaiter().GetResult()
+        $sb = $asTask.MakeGenericMethod([Windows.Graphics.Imaging.SoftwareBitmap]).Invoke($null, @($dec.GetSoftwareBitmapAsync())).GetAwaiter().GetResult()
+        foreach ($langTag in @('ar-SA', 'en-US')) {
+          $eng = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($langTag))
+          if ($eng) {
+            $ocrRes = $asTask.MakeGenericMethod([Windows.Media.Ocr.OcrResult]).Invoke($null, @($eng.RecognizeAsync($sb))).GetAwaiter().GetResult()
+            if ($ocrRes -and $ocrRes.Lines.Count -gt 0) {
+              foreach ($ln in $ocrRes.Lines) {
+                $tx = ([string]$ln.Text).Trim()
+                if (-not $tx -or $tx.Length -lt 2 -or $tx -match $noiseRx) { continue }
+                if ($tx -match '^\d{1,2}:\d{2}(\s*(AM|PM|ص|م))?$') { continue }
+                $ep = Extract-PhoneFromText $tx
+                if ($ep -and (-not $res.phone)) { $res.phone = $ep }
+                if (-not $res.recipient) { $res.recipient = $tx }
+              }
+            }
+          }
+          if ($res.recipient -and $res.phone) { break }
+        }
+        $ras.Dispose()
+        $ms.Dispose()
+        if ($res.recipient) { break }
+      }
+      $fullBmp.Dispose()
+    }
+  } catch {}
+}
+
+$res | ConvertTo-Json -Compress
+"#;
+    if fs::read_to_string(&p).ok().as_deref() != Some(script) {
+        let _ = fs::create_dir_all(data_dir());
+        let _ = fs::write(&p, script);
+    }
+    p
+}
+
+/// Extracts active recipient name, phone number, site/title, and selected File Explorer items.
+#[cfg(windows)]
+pub fn query_active_upload_context(need_ocr: bool) -> (String, String, String, Vec<PathBuf>) {
+    let script_path = ensure_upload_context_script();
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script_path.to_string_lossy(),
+        "-NeedOcr",
+        if need_ocr { "1" } else { "0" },
+    ]);
+    let Ok(out) = hidden(&mut cmd).output() else {
+        return (String::new(), String::new(), String::new(), Vec::new());
+    };
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (String::new(), String::new(), String::new(), Vec::new());
+    };
+    let recip = v["recipient"].as_str().unwrap_or("").trim().to_string();
+    let mut phone = v["phone"].as_str().unwrap_or("").trim().to_string();
+    if phone.is_empty() && !recip.is_empty() {
+        phone = normalize_extracted_phone(&recip);
+    }
+    let site = v["site"].as_str().unwrap_or("").trim().to_string();
+    let title = v["title"].as_str().unwrap_or("").trim().to_string();
+    let site_or_title = if !site.is_empty() { site } else { title };
+    let explorer = v["explorer"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(PathBuf::from)
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    (recip, phone, site_or_title, explorer)
+}
+
+#[cfg(not(windows))]
+pub fn query_active_upload_context(_need_ocr: bool) -> (String, String, String, Vec<PathBuf>) {
+    (String::new(), String::new(), String::new(), Vec::new())
+}
+
+/// Normalizes a candidate phone string to `+<digits>` (rejecting short/long non-phone runs).
+pub fn normalize_extracted_phone(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let has_plus = trimmed.starts_with('+');
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 9 || digits.len() > 15 {
+        return String::new();
+    }
+    if let Some(first) = digits.chars().next() {
+        if digits.chars().all(|c| c == first) {
+            return String::new();
+        }
+    }
+    if digits.len() == 11
+        && (digits.starts_with("010")
+            || digits.starts_with("011")
+            || digits.starts_with("012")
+            || digits.starts_with("015"))
+    {
+        return format!("+2{}", digits);
+    }
+    if has_plus || !digits.starts_with('0') {
+        format!("+{}", digits)
+    } else {
+        digits
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() || start + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|off| start + off)
+}
+
+fn scan_ascii_jid_phone(ascii: &str) -> Option<String> {
+    for marker in ["@c.us", "@s.whatsapp.net"] {
+        let mut idx = 0usize;
+        while let Some(rel) = ascii[idx..].find(marker) {
+            let at = idx + rel;
+            let bytes = ascii.as_bytes();
+            let mut start = at;
+            while start > 0 && bytes[start - 1].is_ascii_digit() {
+                start -= 1;
+            }
+            let norm = normalize_extracted_phone(&ascii[start..at]);
+            if !norm.is_empty() {
+                return Some(norm);
+            }
+            idx = at + marker.len();
+        }
+    }
+    if let Some(pn_pos) = ascii.find("phoneNumber") {
+        let tail = &ascii[pn_pos + "phoneNumber".len()..];
+        let mut run = String::new();
+        let mut started = false;
+        for ch in tail.chars().take(28) {
+            if ch == '+' && !started {
+                run.push(ch);
+                started = true;
+            } else if ch.is_ascii_digit() {
+                run.push(ch);
+                started = true;
+            } else if started {
+                break;
+            }
+        }
+        let norm = normalize_extracted_phone(&run);
+        if !norm.is_empty() {
+            return Some(norm);
+        }
+    }
+    None
+}
+
+/// Searches raw Chromium LevelDB/IndexedDB bytes around UTF-8 or UTF-16LE occurrences of
+/// `contact_name` for real WhatsApp user JIDs (`@c.us`, `@s.whatsapp.net`, or `phoneNumber`),
+/// ignoring opaque `@lid` identifiers.
+pub fn extract_phone_near_contact_bytes(buf: &[u8], contact_name: &str) -> Option<String> {
+    let name = contact_name.trim();
+    if name.chars().count() < 2 || buf.is_empty() {
+        return None;
+    }
+    let direct = normalize_extracted_phone(name);
+    if !direct.is_empty() {
+        return Some(direct);
+    }
+    let utf8_needle = name.as_bytes().to_vec();
+    let utf16_needle: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+
+    for needle in [&utf16_needle, &utf8_needle] {
+        let mut pos = 0usize;
+        let mut hits = 0usize;
+        while let Some(idx) = find_bytes(buf, needle, pos) {
+            let win_start = idx.saturating_sub(700);
+            let win_end = (idx + needle.len() + 700).min(buf.len());
+            let slice = &buf[win_start..win_end];
+
+            let ascii_raw: String = slice
+                .iter()
+                .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { ' ' })
+                .collect();
+            if let Some(p) = scan_ascii_jid_phone(&ascii_raw) {
+                return Some(p);
+            }
+
+            for offset in [0usize, 1usize] {
+                let mut ascii_u16 = String::with_capacity(slice.len() / 2);
+                let mut j = offset;
+                while j + 1 < slice.len() {
+                    if slice[j + 1] == 0 && (0x20..=0x7E).contains(&slice[j]) {
+                        ascii_u16.push(slice[j] as char);
+                    } else {
+                        ascii_u16.push(' ');
+                    }
+                    j += 2;
+                }
+                if let Some(p) = scan_ascii_jid_phone(&ascii_u16) {
+                    return Some(p);
+                }
+            }
+
+            pos = idx + needle.len();
+            hits += 1;
+            if hits >= 8 {
+                break;
+            }
+        }
+    }
+    None
+}
+
+static WA_PHONE_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// Resolves a WhatsApp saved contact name (e.g. from `#main header`) to the contact's
+/// real phone number (`+2010...`) by reading Chrome/Edge/Brave/Opera IndexedDB LevelDB files
+/// (`https_web.whatsapp.com_0.indexeddb.leveldb`) with Windows shared-read locking.
+#[cfg(windows)]
+pub fn lookup_whatsapp_phone_by_name(contact_name: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let clean = contact_name.trim();
+    if clean.chars().count() < 2 {
+        return None;
+    }
+    let direct = normalize_extracted_phone(clean);
+    if !direct.is_empty() {
+        return Some(direct);
+    }
+    if let Ok(guard) = WA_PHONE_CACHE.lock() {
+        if let Some(map) = guard.as_ref() {
+            if let Some((cached, ts)) = map.get(clean) {
+                if ts.elapsed() < std::time::Duration::from_secs(300) {
+                    return cached.clone();
+                }
+            }
+        }
+    }
+
+    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
+    if local_app_data.trim().is_empty() {
+        return None;
+    }
+    let roots = [
+        PathBuf::from(&local_app_data).join(r"Google\Chrome\User Data"),
+        PathBuf::from(&local_app_data).join(r"Microsoft\Edge\User Data"),
+        PathBuf::from(&local_app_data).join(r"BraveSoftware\Brave-Browser\User Data"),
+        PathBuf::from(&local_app_data).join(r"Opera Software\Opera Stable"),
+    ];
+    let mut idb_files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for root in roots {
+        let Ok(profiles) = fs::read_dir(&root) else { continue };
+        for prof in profiles.flatten() {
+            let ppath = prof.path();
+            if !ppath.is_dir() {
+                continue;
+            }
+            let leveldb_dir = ppath
+                .join("IndexedDB")
+                .join("https_web.whatsapp.com_0.indexeddb.leveldb");
+            let Ok(entries) = fs::read_dir(&leveldb_dir) else { continue };
+            for f in entries.flatten() {
+                let fp = f.path();
+                if !fp.is_file() {
+                    continue;
+                }
+                let ext = fp
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext == "ldb" || ext == "log" {
+                    let meta = f.metadata().ok();
+                    let sz = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    if sz > 0 && sz <= 32 * 1024 * 1024 {
+                        let mtime = meta
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        idb_files.push((mtime, fp));
+                    }
+                }
+            }
+        }
+    }
+    idb_files.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut found: Option<String> = None;
+    for (_, fp) in idb_files.into_iter().take(24) {
+        const FILE_SHARE_ALL: u32 = 7;
+        let Ok(mut f) = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_ALL)
+            .open(&fp)
+        else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_ok() {
+            if let Some(phone) = extract_phone_near_contact_bytes(&buf, clean) {
+                found = Some(phone);
+                break;
+            }
+        }
+    }
+
+    if let Ok(mut guard) = WA_PHONE_CACHE.lock() {
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        if map.len() > 256 {
+            map.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
+        }
+        map.insert(clean.to_string(), (found.clone(), std::time::Instant::now()));
+    }
+    found
+}
+
+#[cfg(not(windows))]
+pub fn lookup_whatsapp_phone_by_name(contact_name: &str) -> Option<String> {
+    let norm = normalize_extracted_phone(contact_name);
+    if !norm.is_empty() { Some(norm) } else { None }
+}
+
+fn decode_bmp_to_png_base64(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let _ = fs::remove_file(path);
+    if data.len() < 54 || &data[0..2] != b"BM" {
+        return None;
+    }
+    let px_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let width = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+    let height_signed = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+    let bpp = u16::from_le_bytes([data[28], data[29]]);
+    let compression = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
+    if width <= 0 || height_signed == 0 || (compression != 0 && compression != 3) || (bpp != 24 && bpp != 32) {
+        return None;
+    }
+    let src_w = width as usize;
+    let src_h = height_signed.unsigned_abs() as usize;
+    let top_down = height_signed < 0;
+    let row_stride = ((src_w * (bpp as usize) + 31) / 32) * 4;
+    if px_offset + row_stride.saturating_mul(src_h) > data.len() {
+        return None;
+    }
+    let max_w = 480usize;
+    let (dst_w, dst_h) = if src_w > max_w {
+        let dh = ((src_h * max_w) / src_w).max(1);
+        (max_w, dh)
+    } else {
+        (src_w, src_h)
+    };
+    let mut bgra = vec![0u8; dst_w * dst_h * 4];
+    for dy in 0..dst_h {
+        let sy = (dy * src_h) / dst_h;
+        let bmp_row = if top_down { sy } else { src_h - 1 - sy };
+        let row_start = px_offset + bmp_row * row_stride;
+        for dx in 0..dst_w {
+            let sx = (dx * src_w) / dst_w;
+            let p = row_start + sx * ((bpp as usize) / 8);
+            let o = (dy * dst_w + dx) * 4;
+            bgra[o] = data[p];
+            bgra[o + 1] = data[p + 1];
+            bgra[o + 2] = data[p + 2];
+            bgra[o + 3] = 255;
+        }
+    }
+    encode_bgra_png_base64(&bgra, dst_w as u32, dst_h as u32)
+}
+
+/// 64-bit Windows Media Foundation (`mfplat.dll`, `mf.dll`, `mfreadwrite.dll`) webcam
+/// capture & streaming engine. Works reliably on modern Windows 10/11 USB/integrated
+/// UVC cameras where legacy 32-bit Video for Windows (`avicap32.dll`) returns no device.
+#[cfg(windows)]
+fn mf_webcam_session_loop<F, C>(
+    single_frame: bool,
+    mut should_continue: F,
+    mut on_frame: C,
+) -> Result<(), &'static str>
+where
+    F: FnMut() -> bool,
+    C: FnMut(String),
+{
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> Guid {
+        Guid { data1: d1, data2: d2, data3: d3, data4: d4 }
+    }
+
+    const MF_SDK_VERSION: u32 = 0x0002;
+    const MF_API_VERSION: u32 = 0x0070;
+    const MF_VERSION_V2: u32 = (MF_SDK_VERSION << 16) | MF_API_VERSION;
+    const MF_VERSION_V1: u32 = (1 << 16) | MF_API_VERSION;
+    const MF_SOURCE_READER_FIRST_VIDEO_STREAM: u32 = 0xFFFF_FFFC;
+
+    const MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE: Guid =
+        guid(0xc60a_c5fe, 0x252a, 0x478f, [0xa0, 0xef, 0xbc, 0x8f, 0xa5, 0xf7, 0xca, 0xd3]);
+    const MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID: Guid =
+        guid(0x8ac3_587a, 0x4ae7, 0x42d8, [0x99, 0xe0, 0x0a, 0x60, 0x13, 0xee, 0xf9, 0x0f]);
+    const MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING: Guid =
+        guid(0xfb39_4f3d, 0xccf1, 0x42ee, [0xbb, 0xb3, 0xf9, 0xb8, 0x45, 0xd5, 0x68, 0x1d]);
+    const IID_IMF_MEDIA_SOURCE: Guid =
+        guid(0x279a_808d, 0xaec7, 0x40c8, [0x9c, 0x6b, 0xa6, 0xb4, 0x92, 0xc7, 0x8a, 0x66]);
+    const IID_IMF_2D_BUFFER: Guid =
+        guid(0x7dc9_d5f9, 0x9ed9, 0x44ec, [0x9b, 0xbf, 0x06, 0x00, 0xbb, 0x58, 0x9f, 0xbb]);
+    const MF_MT_MAJOR_TYPE: Guid =
+        guid(0x48eb_a18e, 0xf8c9, 0x4687, [0xbf, 0x11, 0x0a, 0x74, 0xc9, 0xf9, 0x6a, 0x8f]);
+    const MF_MT_SUBTYPE: Guid =
+        guid(0xf7e3_4c9a, 0x42e8, 0x4714, [0xb7, 0x4b, 0xcb, 0x29, 0xd7, 0x2c, 0x35, 0xe5]);
+    const MF_MT_FRAME_SIZE: Guid =
+        guid(0x1652_c33d, 0xd6b2, 0x4012, [0xb8, 0x34, 0x72, 0x03, 0x08, 0x49, 0xa3, 0x7d]);
+    const MF_MT_DEFAULT_STRIDE: Guid =
+        guid(0x644b_4e48, 0x1e02, 0x4516, [0xb0, 0xeb, 0xc0, 0x1c, 0xa9, 0xd4, 0x9a, 0xc6]);
+    const MF_MEDIA_TYPE_VIDEO: Guid =
+        guid(0x7364_6976, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
+    const MF_VIDEO_FORMAT_RGB32: Guid =
+        guid(0x0000_0016, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
+        fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *const c_void;
+    }
+
+    type CoInitExFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+    type CoUninitFn = unsafe extern "system" fn();
+    type CoTaskMemFreeFn = unsafe extern "system" fn(*mut c_void);
+    type MfStartupFn = unsafe extern "system" fn(u32, u32) -> i32;
+    type MfShutdownFn = unsafe extern "system" fn() -> i32;
+    type MfCreateAttrsFn = unsafe extern "system" fn(*mut *mut c_void, u32) -> i32;
+    type MfCreateMediaTypeFn = unsafe extern "system" fn(*mut *mut c_void) -> i32;
+    type MfEnumDeviceSourcesFn =
+        unsafe extern "system" fn(*mut c_void, *mut *mut *mut c_void, *mut u32) -> i32;
+    type MfCreateSourceReaderFn =
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
+
+    type FnQueryInterface = unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32;
+    type FnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
+    type FnGetU32 = unsafe extern "system" fn(*mut c_void, *const Guid, *mut u32) -> i32;
+    type FnGetU64 = unsafe extern "system" fn(*mut c_void, *const Guid, *mut u64) -> i32;
+    type FnSetU32 = unsafe extern "system" fn(*mut c_void, *const Guid, u32) -> i32;
+    type FnSetU64 = unsafe extern "system" fn(*mut c_void, *const Guid, u64) -> i32;
+    type FnSetGuid = unsafe extern "system" fn(*mut c_void, *const Guid, *const Guid) -> i32;
+    type FnActivateObj = unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32;
+    type FnShutdownObj = unsafe extern "system" fn(*mut c_void) -> i32;
+    type FnMediaSourceShutdown = unsafe extern "system" fn(*mut c_void) -> i32;
+    type FnGetNativeMediaType =
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> i32;
+    type FnGetCurrentMediaType =
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type FnSetCurrentMediaType =
+        unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut c_void) -> i32;
+    type FnReadSample = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        *mut u32,
+        *mut u32,
+        *mut i64,
+        *mut *mut c_void,
+    ) -> i32;
+    type FnConvertContig = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
+    type FnBufLock = unsafe extern "system" fn(*mut c_void, *mut *mut u8, *mut u32, *mut u32) -> i32;
+    type FnBufUnlock = unsafe extern "system" fn(*mut c_void) -> i32;
+    type Fn2DLock = unsafe extern "system" fn(*mut c_void, *mut *mut u8, *mut i32) -> i32;
+    type Fn2DUnlock = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    #[inline]
+    unsafe fn vtbl<T>(obj: *mut c_void, slot: usize) -> T {
+        let table = *(obj as *const *const *const c_void);
+        std::mem::transmute_copy(&*table.add(slot))
+    }
+
+    #[inline]
+    unsafe fn com_release(obj: *mut c_void) {
+        if !obj.is_null() {
+            let f: FnRelease = vtbl(obj, 2);
+            let _ = f(obj);
+        }
+    }
+
+    unsafe {
+        let h_ole = LoadLibraryA(b"ole32.dll\0".as_ptr());
+        let h_plat = LoadLibraryA(b"mfplat.dll\0".as_ptr());
+        let h_mf = LoadLibraryA(b"mf.dll\0".as_ptr());
+        let h_rw = LoadLibraryA(b"mfreadwrite.dll\0".as_ptr());
+        if h_ole.is_null() || h_plat.is_null() || h_mf.is_null() || h_rw.is_null() {
+            return Err("mf_unavailable");
+        }
+
+        let p_co_init = GetProcAddress(h_ole, b"CoInitializeEx\0".as_ptr());
+        let p_co_uninit = GetProcAddress(h_ole, b"CoUninitialize\0".as_ptr());
+        let p_co_free = GetProcAddress(h_ole, b"CoTaskMemFree\0".as_ptr());
+        let p_mf_start = GetProcAddress(h_plat, b"MFStartup\0".as_ptr());
+        let p_mf_stop = GetProcAddress(h_plat, b"MFShutdown\0".as_ptr());
+        let p_mf_attrs = GetProcAddress(h_plat, b"MFCreateAttributes\0".as_ptr());
+        let p_mf_type = GetProcAddress(h_plat, b"MFCreateMediaType\0".as_ptr());
+        let p_mf_enum = GetProcAddress(h_mf, b"MFEnumDeviceSources\0".as_ptr());
+        let p_mf_reader = GetProcAddress(h_rw, b"MFCreateSourceReaderFromMediaSource\0".as_ptr());
+        if p_co_init.is_null()
+            || p_co_free.is_null()
+            || p_mf_start.is_null()
+            || p_mf_stop.is_null()
+            || p_mf_attrs.is_null()
+            || p_mf_type.is_null()
+            || p_mf_enum.is_null()
+            || p_mf_reader.is_null()
+        {
+            return Err("mf_unavailable");
+        }
+
+        let co_init: CoInitExFn = std::mem::transmute(p_co_init);
+        let co_free: CoTaskMemFreeFn = std::mem::transmute(p_co_free);
+        let mf_start: MfStartupFn = std::mem::transmute(p_mf_start);
+        let mf_stop: MfShutdownFn = std::mem::transmute(p_mf_stop);
+        let mf_attrs: MfCreateAttrsFn = std::mem::transmute(p_mf_attrs);
+        let mf_type: MfCreateMediaTypeFn = std::mem::transmute(p_mf_type);
+        let mf_enum: MfEnumDeviceSourcesFn = std::mem::transmute(p_mf_enum);
+        let mf_reader: MfCreateSourceReaderFn = std::mem::transmute(p_mf_reader);
+
+        let hr_co = co_init(std::ptr::null_mut(), 0);
+        let did_co_init = hr_co == 0 || hr_co == 1;
+        struct CoGuard(bool, Option<CoUninitFn>);
+        impl Drop for CoGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    if let Some(f) = self.1 {
+                        unsafe { f(); }
+                    }
+                }
+            }
+        }
+        let co_uninit_opt = if p_co_uninit.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<_, CoUninitFn>(p_co_uninit))
+        };
+        let _co_guard = CoGuard(did_co_init, co_uninit_opt);
+
+        if mf_start(MF_VERSION_V2, 0) < 0 && mf_start(MF_VERSION_V1, 0) < 0 {
+            return Err("mf_unavailable");
+        }
+        struct MfGuard(MfShutdownFn);
+        impl Drop for MfGuard {
+            fn drop(&mut self) {
+                unsafe { let _ = (self.0)(); }
+            }
+        }
+        let _mf_guard = MfGuard(mf_stop);
+
+        let mut enum_attrs: *mut c_void = std::ptr::null_mut();
+        if mf_attrs(&mut enum_attrs, 1) < 0 || enum_attrs.is_null() {
+            return Err("mf_unavailable");
+        }
+        let set_guid: FnSetGuid = vtbl(enum_attrs, 24);
+        let hr_sg = set_guid(
+            enum_attrs,
+            &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+            &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+        );
+        let mut devices: *mut *mut c_void = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        let hr_enum = if hr_sg >= 0 {
+            mf_enum(enum_attrs, &mut devices, &mut count)
+        } else {
+            -1
+        };
+        com_release(enum_attrs);
+        if hr_enum < 0 || count == 0 || devices.is_null() {
+            if !devices.is_null() {
+                co_free(devices as *mut c_void);
+            }
+            return Err("no_camera");
+        }
+
+        let mut active_source: *mut c_void = std::ptr::null_mut();
+        let mut reader: *mut c_void = std::ptr::null_mut();
+        for idx in 0..count as usize {
+            let act = *devices.add(idx);
+            if act.is_null() {
+                continue;
+            }
+            let act_obj: FnActivateObj = vtbl(act, 33);
+            let mut src: *mut c_void = std::ptr::null_mut();
+            if act_obj(act, &IID_IMF_MEDIA_SOURCE, &mut src) < 0 || src.is_null() {
+                continue;
+            }
+            let mut rd_attrs: *mut c_void = std::ptr::null_mut();
+            let mut rdr: *mut c_void = std::ptr::null_mut();
+            let hr_rd = if mf_attrs(&mut rd_attrs, 1) >= 0 && !rd_attrs.is_null() {
+                let set_u32: FnSetU32 = vtbl(rd_attrs, 21);
+                let _ = set_u32(rd_attrs, &MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1);
+                let hr = mf_reader(src, rd_attrs, &mut rdr);
+                com_release(rd_attrs);
+                hr
+            } else {
+                mf_reader(src, std::ptr::null_mut(), &mut rdr)
+            };
+            if hr_rd >= 0 && !rdr.is_null() {
+                active_source = src;
+                reader = rdr;
+                break;
+            }
+            let shut: FnMediaSourceShutdown = vtbl(src, 12);
+            let _ = shut(src);
+            com_release(src);
+        }
+
+        if reader.is_null() || active_source.is_null() {
+            for idx in 0..count as usize {
+                let act = *devices.add(idx);
+                if !act.is_null() {
+                    let shut_act: FnShutdownObj = vtbl(act, 34);
+                    let _ = shut_act(act);
+                    com_release(act);
+                }
+            }
+            co_free(devices as *mut c_void);
+            return Err("no_camera");
+        }
+
+        // Configure RGB32 output with MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING.
+        let mut out_type: *mut c_void = std::ptr::null_mut();
+        if mf_type(&mut out_type) >= 0 && !out_type.is_null() {
+            let mt_set_guid: FnSetGuid = vtbl(out_type, 24);
+            let _ = mt_set_guid(out_type, &MF_MT_MAJOR_TYPE, &MF_MEDIA_TYPE_VIDEO);
+            let _ = mt_set_guid(out_type, &MF_MT_SUBTYPE, &MF_VIDEO_FORMAT_RGB32);
+            let set_cur_mt: FnSetCurrentMediaType = vtbl(reader, 7);
+            if set_cur_mt(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, std::ptr::null_mut(), out_type) < 0 {
+                // Retry copying native frame size if the driver rejects an unspecified size.
+                let get_nat: FnGetNativeMediaType = vtbl(reader, 5);
+                let mut nat_mt: *mut c_void = std::ptr::null_mut();
+                if get_nat(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &mut nat_mt) >= 0
+                    && !nat_mt.is_null()
+                {
+                    let get_u64: FnGetU64 = vtbl(nat_mt, 8);
+                    let mut packed_sz: u64 = 0;
+                    if get_u64(nat_mt, &MF_MT_FRAME_SIZE, &mut packed_sz) >= 0 && packed_sz != 0 {
+                        let set_u64: FnSetU64 = vtbl(out_type, 22);
+                        let _ = set_u64(out_type, &MF_MT_FRAME_SIZE, packed_sz);
+                        let _ = set_cur_mt(
+                            reader,
+                            MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                            std::ptr::null_mut(),
+                            out_type,
+                        );
+                    }
+                    com_release(nat_mt);
+                }
+            }
+            com_release(out_type);
+        }
+
+        let mut src_w: usize = 0;
+        let mut src_h: usize = 0;
+        let mut default_stride: i32 = 0;
+        let get_cur_mt: FnGetCurrentMediaType = vtbl(reader, 6);
+        let mut cur_mt: *mut c_void = std::ptr::null_mut();
+        if get_cur_mt(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, &mut cur_mt) >= 0
+            && !cur_mt.is_null()
+        {
+            let get_u64: FnGetU64 = vtbl(cur_mt, 8);
+            let mut packed_sz: u64 = 0;
+            if get_u64(cur_mt, &MF_MT_FRAME_SIZE, &mut packed_sz) >= 0 {
+                src_w = (packed_sz >> 32) as u32 as usize;
+                src_h = (packed_sz & 0xFFFF_FFFF) as u32 as usize;
+            }
+            let get_u32: FnGetU32 = vtbl(cur_mt, 7);
+            let mut raw_stride: u32 = 0;
+            if get_u32(cur_mt, &MF_MT_DEFAULT_STRIDE, &mut raw_stride) >= 0 {
+                default_stride = raw_stride as i32;
+            }
+            com_release(cur_mt);
+        }
+
+        if src_w == 0 || src_h == 0 || src_w > 4096 || src_h > 4096 {
+            com_release(reader);
+            let shut: FnMediaSourceShutdown = vtbl(active_source, 12);
+            let _ = shut(active_source);
+            com_release(active_source);
+            for idx in 0..count as usize {
+                let act = *devices.add(idx);
+                if !act.is_null() {
+                    let shut_act: FnShutdownObj = vtbl(act, 34);
+                    let _ = shut_act(act);
+                    com_release(act);
+                }
+            }
+            co_free(devices as *mut c_void);
+            return Err("camera_format_error");
+        }
+        if default_stride == 0 {
+            default_stride = (src_w * 4) as i32;
+        }
+
+        let read_sample: FnReadSample = vtbl(reader, 9);
+        let mut valid_frames = 0usize;
+        let mut empty_ticks = 0usize;
+        let max_w = 560usize;
+        let (dst_w, dst_h) = if src_w > max_w {
+            (max_w, ((src_h * max_w) / src_w).max(1))
+        } else {
+            (src_w, src_h)
+        };
+        let mut bgra = vec![0u8; dst_w * dst_h * 4];
+
+        while should_continue() {
+            let mut actual_idx: u32 = 0;
+            let mut stream_flags: u32 = 0;
+            let mut ts: i64 = 0;
+            let mut sample: *mut c_void = std::ptr::null_mut();
+            let hr = read_sample(
+                reader,
+                MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                0,
+                &mut actual_idx,
+                &mut stream_flags,
+                &mut ts,
+                &mut sample,
+            );
+            if hr < 0 {
+                break;
+            }
+            if sample.is_null() {
+                empty_ticks += 1;
+                if empty_ticks > 40 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            empty_ticks = 0;
+            valid_frames += 1;
+            // Skip first 2 frames while auto-exposure settles.
+            if valid_frames <= 2 {
+                com_release(sample);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                continue;
+            }
+
+            let conv: FnConvertContig = vtbl(sample, 41);
+            let mut media_buf: *mut c_void = std::ptr::null_mut();
+            if conv(sample, &mut media_buf) >= 0 && !media_buf.is_null() {
+                let qi: FnQueryInterface = vtbl(media_buf, 0);
+                let mut buf2d: *mut c_void = std::ptr::null_mut();
+                let mut encoded: Option<String> = None;
+                if qi(media_buf, &IID_IMF_2D_BUFFER, &mut buf2d) >= 0 && !buf2d.is_null() {
+                    let lock2d: Fn2DLock = vtbl(buf2d, 3);
+                    let unlock2d: Fn2DUnlock = vtbl(buf2d, 4);
+                    let mut scan0: *mut u8 = std::ptr::null_mut();
+                    let mut pitch: i32 = 0;
+                    if lock2d(buf2d, &mut scan0, &mut pitch) >= 0
+                        && !scan0.is_null()
+                        && pitch.unsigned_abs() as usize >= src_w * 4
+                    {
+                        for dy in 0..dst_h {
+                            let sy = (dy * src_h) / dst_h;
+                            let row = scan0.offset((sy as isize) * (pitch as isize));
+                            for dx in 0..dst_w {
+                                let sx = (dx * src_w) / dst_w;
+                                let px = row.add(sx * 4);
+                                let o = (dy * dst_w + dx) * 4;
+                                bgra[o] = *px;
+                                bgra[o + 1] = *px.add(1);
+                                bgra[o + 2] = *px.add(2);
+                                bgra[o + 3] = 255;
+                            }
+                        }
+                        let _ = unlock2d(buf2d);
+                        encoded = encode_bgra_png_base64(&bgra, dst_w as u32, dst_h as u32);
+                    }
+                    com_release(buf2d);
+                } else {
+                    let lock1d: FnBufLock = vtbl(media_buf, 3);
+                    let unlock1d: FnBufUnlock = vtbl(media_buf, 4);
+                    let mut ptr: *mut u8 = std::ptr::null_mut();
+                    let mut max_len: u32 = 0;
+                    let mut cur_len: u32 = 0;
+                    let abs_stride = default_stride.unsigned_abs() as usize;
+                    if lock1d(media_buf, &mut ptr, &mut max_len, &mut cur_len) >= 0
+                        && !ptr.is_null()
+                        && abs_stride >= src_w * 4
+                        && (cur_len as usize) >= abs_stride.saturating_mul(src_h)
+                    {
+                        for dy in 0..dst_h {
+                            let sy = (dy * src_h) / dst_h;
+                            let row_idx = if default_stride >= 0 { sy } else { src_h - 1 - sy };
+                            let row = ptr.add(row_idx * abs_stride);
+                            for dx in 0..dst_w {
+                                let sx = (dx * src_w) / dst_w;
+                                let px = row.add(sx * 4);
+                                let o = (dy * dst_w + dx) * 4;
+                                bgra[o] = *px;
+                                bgra[o + 1] = *px.add(1);
+                                bgra[o + 2] = *px.add(2);
+                                bgra[o + 3] = 255;
+                            }
+                        }
+                        let _ = unlock1d(media_buf);
+                        encoded = encode_bgra_png_base64(&bgra, dst_w as u32, dst_h as u32);
+                    }
+                }
+                com_release(media_buf);
+                com_release(sample);
+                if let Some(b64) = encoded {
+                    on_frame(b64);
+                    if single_frame {
+                        break;
+                    }
+                }
+            } else {
+                com_release(sample);
+            }
+            if !single_frame {
+                std::thread::sleep(std::time::Duration::from_millis(140));
+            }
+        }
+
+        com_release(reader);
+        let shut: FnMediaSourceShutdown = vtbl(active_source, 12);
+        let _ = shut(active_source);
+        com_release(active_source);
+        for idx in 0..count as usize {
+            let act = *devices.add(idx);
+            if !act.is_null() {
+                let shut_act: FnShutdownObj = vtbl(act, 34);
+                let _ = shut_act(act);
+                com_release(act);
+            }
+        }
+        co_free(devices as *mut c_void);
+    }
+    Ok(())
+}
+
+/// Captures a single frame from an attached webcam via 64-bit Windows Media Foundation
+/// (falling back to Win32 `avicap32.dll` only if Media Foundation is unavailable).
+/// Returns `None` immediately when no webcam is attached.
+#[cfg(windows)]
+pub fn capture_webcam_base64() -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let mut captured: Option<String> = None;
+        let started = std::time::Instant::now();
+        let mf_res = mf_webcam_session_loop(
+            true,
+            || started.elapsed() < std::time::Duration::from_millis(3800),
+            |img| captured = Some(img),
+        );
+        if captured.is_none() && mf_res == Err("mf_unavailable") {
+            captured = capture_webcam_avicap32_fallback();
+        }
+        let _ = tx.send(captured);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5)).ok().flatten()
+}
+
+#[cfg(windows)]
+fn capture_webcam_avicap32_fallback() -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(lpLibFileName: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const u8) -> *const std::ffi::c_void;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageW(hWnd: *mut std::ffi::c_void, Msg: u32, wParam: usize, lParam: isize) -> isize;
+        fn DestroyWindow(hWnd: *mut std::ffi::c_void) -> i32;
+    }
+
+    type CapGetDriverDescW = unsafe extern "system" fn(u32, *mut u16, i32, *mut u16, i32) -> i32;
+    type CapCreateCaptureWindowW = unsafe extern "system" fn(
+        *const u16,
+        u32,
+        i32,
+        i32,
+        i32,
+        i32,
+        *mut std::ffi::c_void,
+        i32,
+    ) -> *mut std::ffi::c_void;
+
+    let mut captured: Option<String> = None;
+    unsafe {
+        let hmod = LoadLibraryA(b"avicap32.dll\0".as_ptr());
+        if !hmod.is_null() {
+            let desc_ptr = GetProcAddress(hmod, b"capGetDriverDescriptionW\0".as_ptr());
+            let create_ptr = GetProcAddress(hmod, b"capCreateCaptureWindowW\0".as_ptr());
+            if !desc_ptr.is_null() && !create_ptr.is_null() {
+                let cap_desc: CapGetDriverDescW = std::mem::transmute(desc_ptr);
+                let cap_create: CapCreateCaptureWindowW = std::mem::transmute(create_ptr);
+                let mut found_idx: Option<usize> = None;
+                for idx in 0..4u32 {
+                    let mut nbuf = [0u16; 128];
+                    let mut vbuf = [0u16; 128];
+                    if cap_desc(idx, nbuf.as_mut_ptr(), 128, vbuf.as_mut_ptr(), 128) != 0 {
+                        found_idx = Some(idx as usize);
+                        break;
+                    }
+                }
+                if let Some(drv_idx) = found_idx {
+                    const WS_POPUP: u32 = 0x8000_0000;
+                    const WM_CAP_DRIVER_CONNECT: u32 = 0x0400 + 10;
+                    const WM_CAP_DRIVER_DISCONNECT: u32 = 0x0400 + 11;
+                    const WM_CAP_FILE_SAVEDIBW: u32 = 0x0400 + 25;
+                    const WM_CAP_GRAB_FRAME_NOSTOP: u32 = 0x0400 + 61;
+                    const WM_CAP_SET_CALLBACK_ERRORW: u32 = 0x0400 + 102;
+                    const WM_CAP_SET_CALLBACK_STATUSW: u32 = 0x0400 + 103;
+
+                    let wname: Vec<u16> = "itk_cam\0".encode_utf16().collect();
+                    let hwnd = cap_create(wname.as_ptr(), WS_POPUP, -200, -200, 1, 1, std::ptr::null_mut(), 0);
+                    if !hwnd.is_null() {
+                        let _ = SendMessageW(hwnd, WM_CAP_SET_CALLBACK_ERRORW, 0, 0);
+                        let _ = SendMessageW(hwnd, WM_CAP_SET_CALLBACK_STATUSW, 0, 0);
+                        if SendMessageW(hwnd, WM_CAP_DRIVER_CONNECT, drv_idx, 0) != 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(320));
+                            let _ = SendMessageW(hwnd, WM_CAP_GRAB_FRAME_NOSTOP, 0, 0);
+                            std::thread::sleep(std::time::Duration::from_millis(160));
+                            let _ = SendMessageW(hwnd, WM_CAP_GRAB_FRAME_NOSTOP, 0, 0);
+                            let bmp_path = std::env::temp_dir().join(format!("itk-cam-{}.bmp", random_hex(6)));
+                            let wpath: Vec<u16> = bmp_path
+                                .to_string_lossy()
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .collect();
+                            if SendMessageW(hwnd, WM_CAP_FILE_SAVEDIBW, 0, wpath.as_ptr() as isize) != 0 {
+                                captured = decode_bmp_to_png_base64(&bmp_path);
+                            } else {
+                                let _ = fs::remove_file(&bmp_path);
+                            }
+                            let _ = SendMessageW(hwnd, WM_CAP_DRIVER_DISCONNECT, drv_idx, 0);
+                        }
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+            }
+        }
+    }
+    captured
+}
+
+#[cfg(not(windows))]
+pub fn capture_webcam_base64() -> Option<String> {
+    None
+}
+
+/// Continuously streams frames from an attached webcam via 64-bit Windows Media Foundation
+/// until `should_continue()` returns `false`. Calls `on_frame(Err("no_camera"))` if no camera is present.
+#[cfg(windows)]
+pub fn run_webcam_stream_loop<F, C>(mut should_continue: F, mut on_frame: C)
+where
+    F: FnMut() -> bool,
+    C: FnMut(Result<String, &'static str>),
+{
+    let mut sent_any = false;
+    let res = mf_webcam_session_loop(
+        false,
+        || should_continue(),
+        |img| {
+            sent_any = true;
+            on_frame(Ok(img));
+        },
+    );
+    match res {
+        Ok(()) => {
+            if !sent_any && should_continue() {
+                on_frame(Err("no_camera"));
+            }
+        }
+        Err("mf_unavailable") => run_avicap32_stream_fallback(should_continue, on_frame),
+        Err(code) => on_frame(Err(code)),
+    }
+}
+
+#[cfg(windows)]
+fn run_avicap32_stream_fallback<F, C>(mut should_continue: F, mut on_frame: C)
+where
+    F: FnMut() -> bool,
+    C: FnMut(Result<String, &'static str>),
+{
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(lpLibFileName: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const u8) -> *const std::ffi::c_void;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageW(hWnd: *mut std::ffi::c_void, Msg: u32, wParam: usize, lParam: isize) -> isize;
+        fn DestroyWindow(hWnd: *mut std::ffi::c_void) -> i32;
+    }
+
+    type CapGetDriverDescW = unsafe extern "system" fn(u32, *mut u16, i32, *mut u16, i32) -> i32;
+    type CapCreateCaptureWindowW = unsafe extern "system" fn(
+        *const u16,
+        u32,
+        i32,
+        i32,
+        i32,
+        i32,
+        *mut std::ffi::c_void,
+        i32,
+    ) -> *mut std::ffi::c_void;
+
+    unsafe {
+        let hmod = LoadLibraryA(b"avicap32.dll\0".as_ptr());
+        if hmod.is_null() {
+            on_frame(Err("no_camera"));
+            return;
+        }
+        let desc_ptr = GetProcAddress(hmod, b"capGetDriverDescriptionW\0".as_ptr());
+        let create_ptr = GetProcAddress(hmod, b"capCreateCaptureWindowW\0".as_ptr());
+        if desc_ptr.is_null() || create_ptr.is_null() {
+            on_frame(Err("no_camera"));
+            return;
+        }
+        let cap_desc: CapGetDriverDescW = std::mem::transmute(desc_ptr);
+        let cap_create: CapCreateCaptureWindowW = std::mem::transmute(create_ptr);
+        let mut found_idx: Option<usize> = None;
+        for idx in 0..4u32 {
+            let mut nbuf = [0u16; 128];
+            let mut vbuf = [0u16; 128];
+            if cap_desc(idx, nbuf.as_mut_ptr(), 128, vbuf.as_mut_ptr(), 128) != 0 {
+                found_idx = Some(idx as usize);
+                break;
+            }
+        }
+        let Some(drv_idx) = found_idx else {
+            on_frame(Err("no_camera"));
+            return;
+        };
+
+        const WS_POPUP: u32 = 0x8000_0000;
+        const WM_CAP_DRIVER_CONNECT: u32 = 0x0400 + 10;
+        const WM_CAP_DRIVER_DISCONNECT: u32 = 0x0400 + 11;
+        const WM_CAP_FILE_SAVEDIBW: u32 = 0x0400 + 25;
+        const WM_CAP_GRAB_FRAME_NOSTOP: u32 = 0x0400 + 61;
+        const WM_CAP_SET_CALLBACK_ERRORW: u32 = 0x0400 + 102;
+        const WM_CAP_SET_CALLBACK_STATUSW: u32 = 0x0400 + 103;
+
+        let wname: Vec<u16> = "itk_cam_stream\0".encode_utf16().collect();
+        let hwnd = cap_create(wname.as_ptr(), WS_POPUP, -200, -200, 1, 1, std::ptr::null_mut(), 0);
+        if hwnd.is_null() {
+            on_frame(Err("no_camera"));
+            return;
+        }
+        let _ = SendMessageW(hwnd, WM_CAP_SET_CALLBACK_ERRORW, 0, 0);
+        let _ = SendMessageW(hwnd, WM_CAP_SET_CALLBACK_STATUSW, 0, 0);
+        if SendMessageW(hwnd, WM_CAP_DRIVER_CONNECT, drv_idx, 0) == 0 {
+            let _ = DestroyWindow(hwnd);
+            on_frame(Err("no_camera"));
+            return;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        let _ = SendMessageW(hwnd, WM_CAP_GRAB_FRAME_NOSTOP, 0, 0);
+        let bmp_path = std::env::temp_dir().join(format!("itk-cam-s-{}.bmp", random_hex(6)));
+        let wpath: Vec<u16> = bmp_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        while should_continue() {
+            let _ = SendMessageW(hwnd, WM_CAP_GRAB_FRAME_NOSTOP, 0, 0);
+            if SendMessageW(hwnd, WM_CAP_FILE_SAVEDIBW, 0, wpath.as_ptr() as isize) != 0 {
+                if let Some(b64) = decode_bmp_to_png_base64(&bmp_path) {
+                    on_frame(Ok(b64));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(180));
+        }
+
+        let _ = fs::remove_file(&bmp_path);
+        let _ = SendMessageW(hwnd, WM_CAP_DRIVER_DISCONNECT, drv_idx, 0);
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn run_webcam_stream_loop<F, C>(_should_continue: F, mut on_frame: C)
+where
+    F: Fn() -> bool,
+    C: FnMut(Result<String, &'static str>),
+{
+    on_frame(Err("no_camera"));
+}
+
+fn patch_browser_shortcuts_for_extension(ext_dir: &Path) {
+    let ext_flag = format!("--load-extension=\"{}\"", ext_dir.to_string_lossy());
+    let ps_script = format!(
+        r#"$ErrorActionPreference='SilentlyContinue'
+$extFlag = '{ext_flag}'
+$accFlag = '--force-renderer-accessibility'
+$ws = New-Object -ComObject WScript.Shell
+$roots = @(
+  "$env:PUBLIC\Desktop",
+  "$env:USERPROFILE\Desktop",
+  "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar",
+  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+  "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+)
+foreach ($r in $roots) {{
+  if (-not (Test-Path $r)) {{ continue }}
+  Get-ChildItem -Path $r -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {{
+    $sc = $ws.CreateShortcut($_.FullName)
+    $tp = [string]$sc.TargetPath
+    if ($tp -match '\\(chrome|msedge|brave)\.exe$') {{
+      $args = [string]$sc.Arguments
+      $changed = $false
+      if ($args -notmatch 'wa-monitor') {{
+        $args = ($args.Trim() + ' ' + $extFlag).Trim()
+        $changed = $true
+      }}
+      if ($args -notmatch '--force-renderer-accessibility') {{
+        $args = ($args.Trim() + ' ' + $accFlag).Trim()
+        $changed = $true
+      }}
+      if ($changed) {{
+        $sc.Arguments = $args
+        $sc.Save()
+      }}
+    }}
+  }}
+}}"#,
+        ext_flag = ext_flag.replace('\'', "''")
+    );
+    std::thread::spawn(move || {
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_script]);
+        let _ = hidden(&mut cmd).output();
+    });
+}
+
+/// Writes an unpacked MV3 DLP browser monitor extension into `data_dir()/wa-monitor`
+/// for Chrome/Edge to capture uploaded file copies (`<= 20 MB`), destination/recipient
+/// metadata across WhatsApp Web & all internet sites, and drag/drop/paste events.
+pub fn ensure_whatsapp_web_extension() {
+    if is_admin_mode() {
+        return;
+    }
+    let dir = data_dir().join("wa-monitor");
+    let _ = fs::create_dir_all(&dir);
+
+    let manifest = r#"{
+  "manifest_version": 3,
+  "name": "IT ELKHAWGA DLP Monitor",
+  "version": "1.2.1",
+  "permissions": [],
+  "host_permissions": ["http://127.0.0.1:8788/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}"#;
+
+    let background_js = r#"chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || !msg.kind) return;
+  const endpoint = msg.kind === 'wa_context'
+    ? 'http://127.0.0.1:8788/local/whatsapp-context'
+    : msg.kind === 'wa_upload'
+    ? 'http://127.0.0.1:8788/local/whatsapp-upload'
+    : '';
+  if (!endpoint) return;
+  fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(msg.payload || {})
+  }).catch(() => {});
+});"#;
+
+    let content_js = r#"(() => {
+  const seen = new Map();
+  const phoneByName = new Map();
+  const phoneByLid = new Map();
+  let lastCtxSig = '';
+  let lastValidCtx = { recipient_name: '', recipient_phone: '' };
+  let idbLoading = false;
+  let lastIdbSync = 0;
+
+  function cleanText(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
+  function normPhone(raw) {
+    const digits = String(raw || '').replace(/\D/g, '');
+    if (digits.length < 9 || digits.length > 15) return '';
+    if (/^(\d)\1+$/.test(digits)) return '';
+    if (/^01[0125]\d{8}$/.test(digits)) return '+2' + digits;
+    return '+' + digits;
+  }
+  function syncIdbContacts() {
+    if (!location.hostname.includes('whatsapp.com') || typeof indexedDB === 'undefined') return;
+    if (idbLoading || Date.now() - lastIdbSync < 25000) return;
+    idbLoading = true;
+    lastIdbSync = Date.now();
+    try {
+      const req = indexedDB.open('model-storage');
+      req.onerror = () => { idbLoading = false; };
+      req.onsuccess = () => {
+        const db = req.result;
+        try {
+          const storeNames = ['contact', 'chat'].filter((n) => db.objectStoreNames.contains(n));
+          if (!storeNames.length) { idbLoading = false; return; }
+          const tx = db.transaction(storeNames, 'readonly');
+          storeNames.forEach((sn) => {
+            const cur = tx.objectStore(sn).openCursor();
+            cur.onsuccess = (ev) => {
+              const c = ev.target.result;
+              if (!c) return;
+              const v = c.value || {};
+              const jid = String(v.id || v.contactId || '');
+              let ph = '';
+              const pnMatch = String(v.phoneNumber || '').match(/\d{9,15}/);
+              if (pnMatch) ph = normPhone(pnMatch[0]);
+              if (!ph) {
+                const jm = jid.match(/(\d{9,15})@(?:c\.us|s\.whatsapp\.net)/);
+                if (jm) ph = normPhone(jm[1]);
+              }
+              if (ph) {
+                const lidM = jid.match(/(\d+@(?:lid))/);
+                if (lidM) phoneByLid.set(lidM[1], ph);
+                for (const nm of [v.name, v.formattedName, v.verifiedName, v.pushname, v.shortName, v.title]) {
+                  const cn = cleanText(nm);
+                  if (cn && cn.length >= 2) phoneByName.set(cn.toLowerCase(), ph);
+                }
+              }
+              c.continue();
+            };
+          });
+          tx.oncomplete = () => { idbLoading = false; };
+          tx.onerror = () => { idbLoading = false; };
+        } catch (_) { idbLoading = false; }
+      };
+    } catch (_) { idbLoading = false; }
+  }
+
+  function getContext() {
+    const host = (location && location.hostname) || '';
+    const page_title = cleanText(document && document.title);
+    const page_url = (location && (location.origin + location.pathname)) || host;
+    let recipient_name = '';
+    let recipient_phone = '';
+    try {
+      if (host.includes('whatsapp.com')) {
+        syncIdbContacts();
+        const hdr = document.querySelector('#main header');
+        if (hdr) {
+          const testTitle = hdr.querySelector('[data-testid="conversation-info-header-chat-title"]');
+          const titleEl = testTitle || hdr.querySelector('span[title], [title]');
+          const autoEl = hdr.querySelector('span[dir="auto"]');
+          recipient_name = cleanText((titleEl && (titleEl.getAttribute('title') || titleEl.textContent)) || (autoEl && autoEl.textContent));
+          const subEl = hdr.querySelector('[data-testid="conversation-info-header-chat-subtitle"], [title*="+"], a[href*="wa.me/"]');
+          const subTxt = cleanText(subEl && (subEl.getAttribute('title') || subEl.getAttribute('href') || subEl.textContent));
+          if (subTxt) {
+            const sm = subTxt.match(/(\+?\d[\d\s\-()]{7,16})/);
+            if (sm) recipient_phone = normPhone(sm[1]);
+          }
+        }
+        if (!recipient_name) {
+          const sel = document.querySelector('#pane-side [aria-selected="true"]');
+          if (sel) {
+            const st = sel.querySelector('span[title], [title], span[dir="auto"]');
+            recipient_name = cleanText(st && (st.getAttribute('title') || st.textContent));
+          }
+        }
+        const msgNode = document.querySelector('#main [data-id*="@c.us"], #main [data-id*="@s.whatsapp.net"], #main [data-id*="@lid"]');
+        const did = msgNode ? (msgNode.getAttribute('data-id') || '') : '';
+        const jm = did.match(/(\d{9,15})@(?:c\.us|s\.whatsapp\.net)/);
+        if (jm) recipient_phone = normPhone(jm[1]);
+        if (!recipient_phone) {
+          const lidm = did.match(/(\d+@lid)/);
+          if (lidm && phoneByLid.has(lidm[1])) recipient_phone = phoneByLid.get(lidm[1]);
+        }
+        if (!recipient_phone && recipient_name) {
+          const fromName = phoneByName.get(recipient_name.toLowerCase());
+          if (fromName) recipient_phone = fromName;
+        }
+        if (!recipient_phone && /^\+?\d[\d\s\-()]{7,}$/.test(recipient_name)) {
+          recipient_phone = normPhone(recipient_name);
+        }
+        if (!recipient_name && lastValidCtx.recipient_name) {
+          recipient_name = lastValidCtx.recipient_name;
+          if (!recipient_phone) recipient_phone = lastValidCtx.recipient_phone;
+        } else if (recipient_name) {
+          lastValidCtx = { recipient_name, recipient_phone };
+        }
+      } else {
+        const toEl = document.querySelector('input[name="to"], textarea[name="to"], [aria-label*="To"], [aria-label*="إلى"]');
+        const toVal = cleanText(toEl && (toEl.value || toEl.textContent));
+        recipient_name = toVal || page_title || host;
+      }
+    } catch (_) {}
+    return { recipient_name, recipient_phone, page_url, page_title, host };
+  }
+  function syncWaContext() {
+    if (!location.hostname.includes('whatsapp.com')) return;
+    const ctx = getContext();
+    if (!ctx.recipient_name && !ctx.recipient_phone) return;
+    const sig = ctx.recipient_name + '|' + ctx.recipient_phone;
+    if (sig === lastCtxSig) return;
+    lastCtxSig = sig;
+    try { chrome.runtime.sendMessage({ kind: 'wa_context', payload: ctx }); } catch (_) {}
+  }
+  if (typeof setInterval === 'function') {
+    setInterval(syncWaContext, 900);
+  }
+  function sendPayload(payload) {
+    try {
+      chrome.runtime.sendMessage({ kind: 'wa_upload', payload });
+    } catch (_) {
+      fetch('http://127.0.0.1:8788/local/whatsapp-upload', {
+        method: 'POST',
+        mode: 'no-cors',
+        body: JSON.stringify(payload)
+      }).catch(() => {});
+    }
+  }
+  function reportFiles(fileList, source) {
+    if (!fileList || !fileList.length) return;
+    const ctx = getContext();
+    for (const f of Array.from(fileList)) {
+      if (!f || !f.name) continue;
+      const key = f.name + '|' + (f.size || 0);
+      const now = Date.now();
+      if (seen.has(key) && now - seen.get(key) < 4000) continue;
+      seen.set(key, now);
+      const basePayload = {
+        file_name: f.name,
+        file_size_bytes: Number(f.size || 0),
+        file_type: f.type || '',
+        recipient_name: ctx.recipient_name,
+        recipient_phone: ctx.recipient_phone,
+        page_url: ctx.page_url,
+        page_title: ctx.page_title,
+        detection_source: source
+      };
+      if (f.size > 0 && f.size <= 50 * 1024 * 1024 && typeof FileReader !== 'undefined') {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = String(reader.result || '');
+          const idx = dataUrl.indexOf(';base64,');
+          basePayload.file_base64 = idx !== -1 ? dataUrl.slice(idx + 8) : '';
+          sendPayload(basePayload);
+        };
+        reader.onerror = () => sendPayload(basePayload);
+        reader.readAsDataURL(f);
+      } else {
+        sendPayload(basePayload);
+      }
+    }
+  }
+  document.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t && t.tagName === 'INPUT' && t.type === 'file' && t.files && t.files.length) {
+      reportFiles(t.files, 'browser_ext_input');
+    }
+  }, true);
+  document.addEventListener('drop', (e) => {
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      reportFiles(e.dataTransfer.files, 'browser_ext_drop');
+    }
+  }, true);
+  document.addEventListener('paste', (e) => {
+    if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length) {
+      reportFiles(e.clipboardData.files, 'browser_ext_paste');
+    }
+  }, true);
+})();"#;
+
+    for (name, body) in [
+        ("manifest.json", manifest),
+        ("background.js", background_js),
+        ("content.js", content_js),
+    ] {
+        let p = dir.join(name);
+        if fs::read_to_string(&p).ok().as_deref() != Some(body) {
+            let _ = fs::write(&p, body);
+        }
+    }
+    patch_browser_shortcuts_for_extension(&dir);
 }

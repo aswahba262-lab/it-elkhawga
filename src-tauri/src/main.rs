@@ -6,6 +6,7 @@ mod common;
 mod proxy;
 mod server;
 mod transport;
+mod auth;
 
 use std::sync::Mutex;
 
@@ -22,11 +23,22 @@ fn main() {
 
     common::ensure_data();
 
-    // The admin build hosts the server that employee machines connect to.
+    // The admin build hosts the server that employee machines connect to;
+    // only client installs run the local blocking proxy / background agents.
     let server = if common::is_admin_mode() {
         let cfg = common::read_config();
         server::start(cfg.api_token, cfg.server_port).ok()
     } else {
+        proxy::start_default();
+        // Ensure both the background agent and user-session screenshot helper are running
+        // immediately without waiting for reboot or re-login. Each exits cleanly if already active.
+        if let Ok(exe) = std::env::current_exe() {
+            for flag in ["--agent", "--capture-agent"] {
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg(flag);
+                let _ = common::hidden(&mut cmd).spawn();
+            }
+        }
         None
     };
 
@@ -65,6 +77,11 @@ fn main() {
             commands::sync_policy_now,
             commands::get_dashboard_stats,
             commands::get_relay_alerts,
+            commands::get_alert_media,
+            commands::get_uploaded_files,
+            commands::save_uploaded_file,
+            commands::save_base64_image,
+            commands::open_archive_folder,
             commands::get_audit_log,
             commands::ack_alert,
             commands::get_relay_groups,
