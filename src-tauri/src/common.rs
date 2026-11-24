@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const APP_VERSION: &str = "1.1.1";
 pub const APP_NAME: &str = "IT ELKHAWGA";
 pub const DEFAULT_SUPER_ADMIN_USERNAME: &str = "admin";
 pub const DEFAULT_SUPER_ADMIN_PASSWORD: &str = "Admin@123";
@@ -30,6 +30,10 @@ pub const DEFAULT_ADMIN_KEY: &str =
 pub const DEFAULT_PAIRING_TOKEN: &str = "pair_it_elkhawga_forever";
 pub const APP_AUTHOR: &str = "Ahmed Wahba";
 pub const LOCAL_API_ADDR: &str = "127.0.0.1:8788";
+/// Primary company ERP domain whose browser Cookies, LocalStorage, and IndexedDB device tokens are always preserved.
+pub const DEFAULT_ERP_DOMAIN: &str = "elkhawaga.uk";
+/// Master QR enrollment code used by IT engineers when registering a new company PC on the ERP system.
+pub const DEFAULT_ERP_MASTER_TOKEN: &str = "QRM-v1-sNv4DGnLKrO01NKYCQi2RQ";
 
 // ---------- Paths ----------
 
@@ -146,6 +150,58 @@ pub struct Config {
     /// Open Chrome & Edge with ephemeral profiles and zero history/cache/password persistence.
     #[serde(default)]
     pub ephemeral_browser: bool,
+    /// Restrict viewing and downloading archived sensitive DLP files to Super Admin accounts only.
+    #[serde(default)]
+    pub dlp_super_only: bool,
+    /// Custom server directory where exact-copy DLP uploaded files are archived (empty = C:\IT-ELKHAWGA-Archive).
+    #[serde(default)]
+    pub archive_dir: String,
+    /// Custom server directory where automated and manual system backups are stored (empty = <archive_dir>\Backups).
+    #[serde(default)]
+    pub backup_dir: String,
+    /// Company ERP/internal domains whose browser device tokens (Cookies, LocalStorage, IndexedDB) must never be wiped.
+    #[serde(default)]
+    pub erp_domains: Vec<String>,
+    /// Company ERP Master enrollment token stored for IT convenience in Settings.
+    #[serde(default)]
+    pub erp_master_token: String,
+    /// Enable automatic scheduled backups pulled from the company ERP website (elkhawaga.uk).
+    #[serde(default)]
+    pub erp_backup_enabled: bool,
+    /// Interval in minutes between automatic ERP website backups (default 60 = every hour).
+    #[serde(default = "default_erp_backup_interval_mins")]
+    pub erp_backup_interval_mins: u64,
+    /// Base URL of the company ERP website for automated backups.
+    #[serde(default = "default_erp_backup_url")]
+    pub erp_backup_url: String,
+    /// Admin username on the company ERP website used to create & download backups.
+    #[serde(default)]
+    pub erp_backup_username: String,
+    /// Admin password on the company ERP website (never exposed in plaintext to Web UI).
+    #[serde(default)]
+    pub erp_backup_password: String,
+    /// Optional registered device cookie (`elkhawaga_did`) passed during ERP login.
+    #[serde(default = "default_erp_backup_did")]
+    pub erp_backup_did_cookie: String,
+    /// Optional registered device UUID (`device_token`) passed during ERP login.
+    #[serde(default = "default_erp_backup_dev_token")]
+    pub erp_backup_device_token: String,
+    /// Custom server directory where pulled ERP website backups are saved (empty = <archive_dir>\ERP-Backups).
+    #[serde(default)]
+    pub erp_backup_dir: String,
+}
+
+fn default_erp_backup_interval_mins() -> u64 {
+    60
+}
+fn default_erp_backup_url() -> String {
+    "https://elkhawaga.uk".to_string()
+}
+fn default_erp_backup_did() -> String {
+    "lncbD_iTXRf1".to_string()
+}
+fn default_erp_backup_dev_token() -> String {
+    "4ef685ca-2e40-49f9-8c48-9b5ec5b7143c".to_string()
 }
 
 fn default_mode() -> String {
@@ -174,6 +230,19 @@ impl Default for Config {
             rustdesk_key: String::new(),
             rustdesk_password: String::new(),
             ephemeral_browser: false,
+            dlp_super_only: false,
+            archive_dir: String::new(),
+            backup_dir: String::new(),
+            erp_domains: vec![DEFAULT_ERP_DOMAIN.to_string()],
+            erp_master_token: DEFAULT_ERP_MASTER_TOKEN.to_string(),
+            erp_backup_enabled: false,
+            erp_backup_interval_mins: default_erp_backup_interval_mins(),
+            erp_backup_url: default_erp_backup_url(),
+            erp_backup_username: String::new(),
+            erp_backup_password: String::new(),
+            erp_backup_did_cookie: default_erp_backup_did(),
+            erp_backup_device_token: default_erp_backup_dev_token(),
+            erp_backup_dir: String::new(),
         }
     }
 }
@@ -204,6 +273,24 @@ pub fn read_config() -> Config {
     if !is_admin_mode() && c.password_hash.trim().is_empty() {
         c.password_hash = DEFAULT_CLIENT_PASSWORD_HASH.to_string();
     }
+    if c.erp_domains.is_empty() {
+        c.erp_domains = vec![DEFAULT_ERP_DOMAIN.to_string()];
+    }
+    if c.erp_master_token.trim().is_empty() {
+        c.erp_master_token = DEFAULT_ERP_MASTER_TOKEN.to_string();
+    }
+    if c.erp_backup_url.trim().is_empty() {
+        c.erp_backup_url = default_erp_backup_url();
+    }
+    if c.erp_backup_interval_mins == 0 {
+        c.erp_backup_interval_mins = 60;
+    }
+    if c.erp_backup_did_cookie.trim().is_empty() {
+        c.erp_backup_did_cookie = default_erp_backup_did();
+    }
+    if c.erp_backup_device_token.trim().is_empty() {
+        c.erp_backup_device_token = default_erp_backup_dev_token();
+    }
     c
 }
 
@@ -227,7 +314,118 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 
 pub fn write_config(c: &Config) -> Result<(), String> {
     let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    atomic_write(&config_path(), &s)
+    let res = atomic_write(&config_path(), &s);
+    invalidate_policy_cache();
+    res
+}
+
+// ---------- In-Memory Proxy Policy & Config Cache ----------
+
+#[derive(Clone, Debug)]
+pub struct ProxyPolicySnapshot {
+    pub mode: String,
+    pub exfil_threshold_mb: u64,
+    pub exfil_window_secs: u64,
+    pub always_allowed_hosts: Vec<String>,
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+}
+
+static POLICY_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static POLICY_CACHE_STATE: std::sync::Mutex<
+    Option<(u64, PathBuf, std::time::Instant, std::sync::Arc<ProxyPolicySnapshot>)>,
+> = std::sync::Mutex::new(None);
+
+pub fn invalidate_policy_cache() {
+    POLICY_CACHE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn extract_policy_url_host(s: &str) -> String {
+    s.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("www.")
+        .to_lowercase()
+}
+
+pub fn cached_policy_snapshot() -> std::sync::Arc<ProxyPolicySnapshot> {
+    let cur_gen = POLICY_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let cur_dir = data_dir();
+    let ttl = if cfg!(test) {
+        std::time::Duration::from_millis(0)
+    } else {
+        std::time::Duration::from_secs(2)
+    };
+
+    if ttl > std::time::Duration::ZERO {
+        if let Ok(guard) = POLICY_CACHE_STATE.lock() {
+            if let Some((gen_id, ref dir, fetched_at, ref snap)) = *guard {
+                if gen_id == cur_gen && dir == &cur_dir && fetched_at.elapsed() < ttl {
+                    return std::sync::Arc::clone(snap);
+                }
+            }
+        }
+    }
+
+    let cfg = read_config();
+    let link = read_client();
+    let mut always_allowed_hosts = vec!["rustdesk.com".to_string(), "rustdesk.net".to_string()];
+    for candidate in [&link.server_url, &cfg.relay_url, &link.relay_url] {
+        let h = extract_policy_url_host(candidate);
+        if !h.is_empty() && !always_allowed_hosts.contains(&h) {
+            always_allowed_hosts.push(h);
+        }
+    }
+    if !cfg.rustdesk_server.trim().is_empty() {
+        let rs_host = extract_policy_url_host(&cfg.rustdesk_server);
+        if !rs_host.is_empty() && !always_allowed_hosts.contains(&rs_host) {
+            always_allowed_hosts.push(rs_host);
+        }
+        let rs_raw = cfg.rustdesk_server.trim().to_lowercase();
+        if !rs_raw.is_empty() && !always_allowed_hosts.contains(&rs_raw) {
+            always_allowed_hosts.push(rs_raw);
+        }
+    }
+
+    let mut allowed_domains = Vec::new();
+    for entry in cfg.erp_domains.iter().chain(read_list(&allowed_path()).iter()) {
+        if let Some(clean) = clean_domain(entry) {
+            let d = clean.trim_start_matches("www.").to_lowercase();
+            if !d.is_empty() && !allowed_domains.contains(&d) {
+                allowed_domains.push(d);
+            }
+        }
+    }
+
+    let mut blocked_domains = Vec::new();
+    for entry in read_list(&blocked_path()) {
+        if let Some(clean) = clean_domain(&entry) {
+            let d = clean.trim_start_matches("www.").to_lowercase();
+            if !d.is_empty() && !blocked_domains.contains(&d) {
+                blocked_domains.push(d);
+            }
+        }
+    }
+
+    let snap = std::sync::Arc::new(ProxyPolicySnapshot {
+        mode: cfg.mode,
+        exfil_threshold_mb: cfg.exfil_threshold_mb.max(1),
+        exfil_window_secs: cfg.exfil_window_secs.max(60),
+        always_allowed_hosts,
+        allowed_domains,
+        blocked_domains,
+    });
+
+    if let Ok(mut guard) = POLICY_CACHE_STATE.lock() {
+        *guard = Some((cur_gen, cur_dir, std::time::Instant::now(), std::sync::Arc::clone(&snap)));
+    }
+    snap
 }
 
 pub fn random_hex(bytes: usize) -> String {
@@ -241,11 +439,17 @@ pub fn random_hex(bytes: usize) -> String {
 /// ureq only auto-installs a TLS backend when its rustls feature ("tls") is on.
 /// We build with native-tls, so the SChannel connector must be supplied here or
 /// every https:// request fails with "no TLS backend is configured".
-pub fn tls_agent(timeout_secs: u64) -> ureq::Agent {
-    let builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(timeout_secs));
+/// Returns a `ureq::AgentBuilder` pre-configured with the Windows SChannel TLS connector.
+pub fn tls_agent_builder() -> ureq::AgentBuilder {
     let connector = ureq::native_tls::TlsConnector::new()
         .expect("Failed to initialize native TLS backend (Schannel). Check MinGW toolchain and Windows trust store.");
-    builder.tls_connector(std::sync::Arc::new(connector)).build()
+    ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(connector))
+}
+
+pub fn tls_agent(timeout_secs: u64) -> ureq::Agent {
+    tls_agent_builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
 }
 
 /// Grants BUILTIN\Users modify rights on the data directory so the local agent,
@@ -315,8 +519,109 @@ pub fn hash_password(p: &str) -> String {
     digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut k_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = Sha256::digest(key);
+        k_block[..32].copy_from_slice(&hashed);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k_block[i];
+        opad[i] ^= k_block[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(data);
+    let inner_res = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_res);
+    let out_res = outer.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&out_res);
+    out
+}
+
+fn pbkdf2_hmac_sha256_32(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut salt_block = Vec::with_capacity(salt.len() + 4);
+    salt_block.extend_from_slice(salt);
+    salt_block.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &salt_block);
+    let mut t = u;
+    for _ in 1..iterations {
+        u = hmac_sha256(password, &u);
+        for j in 0..32 {
+            t[j] ^= u[j];
+        }
+    }
+    t
+}
+
+fn decode_hex_bytes(hex_str: &str) -> Option<Vec<u8>> {
+    let b = hex_str.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16)? as u8;
+        let lo = (b[i + 1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+pub fn hash_admin_password(p: &str) -> String {
+    let salt_hex = random_hex(16);
+    let salt_bytes = decode_hex_bytes(&salt_hex).unwrap_or_default();
+    let dk = pbkdf2_hmac_sha256_32(p.as_bytes(), &salt_bytes, 100_000);
+    let dk_hex: String = dk.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("pbkdf2$100000${}${}", salt_hex, dk_hex)
+}
+
+pub fn verify_password_hash(supplied: &str, stored: &str) -> bool {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return true;
+    }
+    if let Some(rest) = stored.strip_prefix("pbkdf2$") {
+        let parts: Vec<&str> = rest.split('$').collect();
+        if parts.len() != 3 {
+            return false;
+        }
+        let Ok(iters) = parts[0].parse::<u32>() else { return false };
+        if !(10_000..=1_000_000).contains(&iters) {
+            return false;
+        }
+        let Some(salt_bytes) = decode_hex_bytes(parts[1]) else { return false };
+        let Some(expected_dk) = decode_hex_bytes(parts[2]) else { return false };
+        let actual_dk = pbkdf2_hmac_sha256_32(supplied.as_bytes(), &salt_bytes, iters);
+        return constant_time_eq(&actual_dk, &expected_dk);
+    }
+    let sha_hex = hash_password(supplied);
+    constant_time_eq(sha_hex.as_bytes(), stored.as_bytes())
+}
+
 pub fn password_ok(cfg: &Config, supplied: &str) -> bool {
-    cfg.password_hash.is_empty() || hash_password(supplied) == cfg.password_hash
+    verify_password_hash(supplied, &cfg.password_hash)
 }
 
 pub fn admin_password_ok(cfg: &Config, username: &str, supplied: &str) -> bool {
@@ -326,7 +631,7 @@ pub fn admin_password_ok(cfg: &Config, username: &str, supplied: &str) -> bool {
     cfg.admins
         .iter()
         .find(|u| u.username.eq_ignore_ascii_case(username))
-        .map(|u| u.password_hash.is_empty() || hash_password(supplied) == u.password_hash)
+        .map(|u| verify_password_hash(supplied, &u.password_hash))
         .unwrap_or(false)
 }
 
@@ -347,7 +652,7 @@ pub fn admin_login_ok(cfg: &Config, username: &str, supplied: &str) -> Option<St
     }
 
     if cfg.admins.is_empty() {
-        if cfg.password_hash.is_empty() || hash_password(supplied) == cfg.password_hash {
+        if verify_password_hash(supplied, &cfg.password_hash) {
             return Some("super".to_string());
         }
         return None;
@@ -357,7 +662,7 @@ pub fn admin_login_ok(cfg: &Config, username: &str, supplied: &str) -> Option<St
         .iter()
         .find(|u| u.username.eq_ignore_ascii_case(username))
         .and_then(|u| {
-            if u.password_hash.is_empty() || hash_password(supplied) == u.password_hash {
+            if verify_password_hash(supplied, &u.password_hash) {
                 Some(normalize_admin_role(&u.role))
             } else {
                 None
@@ -586,6 +891,32 @@ mod tests {
     fn webcam_media_foundation_smoke_does_not_panic() {
         let _ = capture_webcam_base64();
     }
+
+    #[test]
+    fn rfc1321_md5_and_dahua_digest_auth_vectors() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(
+            md5_hex(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+            "d174ab98d277d9f5a5611c2c9f419d9f"
+        );
+        let hdr = r#"Digest realm="Login to DVR", qop="auth", nonce="1234567890abcdef", opaque="xyz987""#;
+        let parsed = parse_digest_header(hdr).expect("digest header");
+        assert_eq!(parsed.get("realm").map(String::as_str), Some("Login to DVR"));
+        assert_eq!(parsed.get("nonce").map(String::as_str), Some("1234567890abcdef"));
+        let auth = build_digest_authorization(
+            "GET",
+            "/cgi-bin/snapshot.cgi?channel=1&subtype=1",
+            "admin",
+            "Pass123",
+            &parsed,
+            1,
+        );
+        assert!(auth.starts_with("Digest username=\"admin\""));
+        assert!(auth.contains("qop=auth"));
+        assert!(auth.contains("nc=00000001"));
+    }
 }
 
 // ---------- Site lists ----------
@@ -608,7 +939,9 @@ pub fn read_list(path: &Path) -> Vec<String> {
 
 pub fn write_list(path: &Path, header: &str, items: &[String]) -> Result<(), String> {
     let body = format!("# {}\n\n{}\n", header, items.join("\n"));
-    fs::write(path, body).map_err(|e| e.to_string())
+    let res = fs::write(path, body).map_err(|e| e.to_string());
+    invalidate_policy_cache();
+    res
 }
 
 /// Accepts "https://Example.com/path" and returns "example.com"; rejects anything that is
@@ -685,6 +1018,60 @@ pub struct ClientLink {
     /// Ephemeral/clean browser mode pushed by the device's group policy.
     #[serde(default)]
     pub ephemeral_browser: bool,
+    /// Per-device USB mass storage override: "" = inherit group/global policy, "block" = forced locked, "unblock" = forced open.
+    #[serde(default)]
+    pub usb_override: String,
+}
+
+pub fn is_usb_effectively_blocked(cfg: &Config, link: &ClientLink) -> bool {
+    match link.usb_override.trim() {
+        "block" => true,
+        "unblock" => false,
+        _ => cfg.usb_block,
+    }
+}
+
+/// Immediately locks or unlocks USB mass storage drives & WPD mobile phone file transfer
+/// via Windows Registry policies without affecting USB mice, keyboards, printers, or webcams.
+pub fn apply_usb_storage_policy(block: bool) {
+    let start_val = if block { "4" } else { "3" };
+    let mut reg_svc = Command::new("reg");
+    reg_svc.args([
+        "add",
+        r"HKLM\SYSTEM\CurrentControlSet\Services\USBSTOR",
+        "/v",
+        "Start",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        start_val,
+        "/f",
+    ]);
+    let _ = hidden(&mut reg_svc).output();
+
+    let base_pol = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices";
+    if block {
+        let mut r_all = Command::new("reg");
+        r_all.args(["add", base_pol, "/v", "Deny_All", "/t", "REG_DWORD", "/d", "1", "/f"]);
+        let _ = hidden(&mut r_all).output();
+
+        for guid in [
+            "{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}", // Removable Disks / Flash Drives
+            "{6ac27878-a6fa-4155-ba85-f98f491d4f33}", // WPD / MTP Mobile Phone Storage
+            "{eec5ad98-8080-425f-922a-dabf3de3f69a}", // Portable Devices
+        ] {
+            let sub_key = format!(r"{}\{}", base_pol, guid);
+            for val_name in ["Deny_Read", "Deny_Write", "Deny_Execute"] {
+                let mut r_sub = Command::new("reg");
+                r_sub.args(["add", &sub_key, "/v", val_name, "/t", "REG_DWORD", "/d", "1", "/f"]);
+                let _ = hidden(&mut r_sub).output();
+            }
+        }
+    } else {
+        let mut r_del = Command::new("reg");
+        r_del.args(["delete", base_pol, "/f"]);
+        let _ = hidden(&mut r_del).output();
+    }
 }
 
 fn client_path() -> PathBuf {
@@ -738,7 +1125,9 @@ pub fn read_client() -> ClientLink {
 pub fn write_client(c: &ClientLink) -> Result<(), String> {
     // Written atomically without a BOM so concurrent readers never see a truncated 0-byte file.
     let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    atomic_write(&client_path(), &s)
+    let res = atomic_write(&client_path(), &s);
+    invalidate_policy_cache();
+    res
 }
 
 // ---------- Logging ----------
@@ -780,18 +1169,23 @@ pub fn read_log() -> String {
 // ---------- Machine info ----------
 
 pub fn hostname() -> String {
-    if let Ok(h) = std::env::var("COMPUTERNAME") {
-        if !h.is_empty() {
-            return h;
-        }
-    }
-    let mut cmd = Command::new("hostname");
-    hidden(&mut cmd)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "unknown".into())
+    static CACHED_HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED_HOST
+        .get_or_init(|| {
+            if let Ok(h) = std::env::var("COMPUTERNAME") {
+                if !h.is_empty() {
+                    return h;
+                }
+            }
+            let mut cmd = Command::new("hostname");
+            hidden(&mut cmd)
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .clone()
 }
 
 pub fn local_ip() -> String {
@@ -813,6 +1207,684 @@ pub fn local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".into())
 }
 
+// ---------- Dahua DVR / XVR Bridge & HTTP Digest Auth ----------
+
+/// Pure-Rust RFC 1321 MD5 hex digest (used for Dahua DVR HTTP Digest Authentication).
+pub fn md5_hex(data: &[u8]) -> String {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ];
+
+    let mut a0: u32 = 0x67452301;
+    let mut b0: u32 = 0xefcdab89;
+    let mut c0: u32 = 0x98badcfe;
+    let mut d0: u32 = 0x10325476;
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = Vec::with_capacity(data.len() + 72);
+    msg.extend_from_slice(data);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for (i, w) in chunk.chunks_exact(4).enumerate() {
+            m[i] = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        }
+        let mut a = a0;
+        let mut b = b0;
+        let mut c = c0;
+        let mut d = d0;
+        for i in 0..64 {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | ((!b) & d), i),
+                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | (!d)), (7 * i) % 16),
+            };
+            let temp = d;
+            d = c;
+            c = b;
+            let sum = a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]);
+            b = b.wrapping_add(sum.rotate_left(S[i]));
+            a = temp;
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn parse_digest_header(www_auth: &str) -> Option<std::collections::HashMap<String, String>> {
+    let s = www_auth.trim();
+    if s.len() < 7 || !s.get(..6).map_or(false, |p| p.eq_ignore_ascii_case("digest")) {
+        return None;
+    }
+    let rest = s.get(6..)?.trim_start();
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    let mut map = std::collections::HashMap::new();
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-') {
+            i += 1;
+        }
+        if i == key_start {
+            i += 1;
+            continue;
+        }
+        let key = String::from_utf8_lossy(&bytes[key_start..i]).to_ascii_lowercase();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let val = if bytes[i] == b'"' {
+            i += 1;
+            let val_start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let v = String::from_utf8_lossy(&bytes[val_start..i]).to_string();
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+            }
+            v
+        } else {
+            let val_start = i;
+            while i < bytes.len() && bytes[i] != b',' && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            String::from_utf8_lossy(&bytes[val_start..i]).to_string()
+        };
+        map.insert(key, val);
+    }
+    if map.contains_key("nonce") {
+        Some(map)
+    } else {
+        None
+    }
+}
+
+fn build_digest_authorization(
+    method: &str,
+    uri: &str,
+    username: &str,
+    password: &str,
+    challenge: &std::collections::HashMap<String, String>,
+    nc_num: u32,
+) -> String {
+    let alg_raw = challenge
+        .get("algorithm")
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| "MD5".to_string());
+    let is_sha256 = alg_raw.starts_with("SHA-256");
+    let hash_fn = |input: &str| -> String {
+        if is_sha256 {
+            hash_password(input)
+        } else {
+            md5_hex(input.as_bytes())
+        }
+    };
+    let realm = challenge.get("realm").map(String::as_str).unwrap_or("");
+    let nonce = challenge.get("nonce").map(String::as_str).unwrap_or("");
+    let qop_raw = challenge.get("qop").map(String::as_str).unwrap_or("");
+    let use_auth_qop = qop_raw
+        .split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case("auth"));
+    let cnonce = random_hex(8);
+    let nc_hex = format!("{:08x}", nc_num.max(1));
+
+    let mut ha1 = hash_fn(&format!("{}:{}:{}", username, realm, password));
+    if alg_raw.ends_with("-SESS") {
+        ha1 = hash_fn(&format!("{}:{}:{}", ha1, nonce, cnonce));
+    }
+    let ha2 = hash_fn(&format!("{}:{}", method, uri));
+    let response = if use_auth_qop {
+        hash_fn(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc_hex, cnonce, ha2))
+    } else {
+        hash_fn(&format!("{}:{}:{}", ha1, nonce, ha2))
+    };
+
+    let mut parts = vec![
+        format!("username=\"{}\"", username),
+        format!("realm=\"{}\"", realm),
+        format!("nonce=\"{}\"", nonce),
+        format!("uri=\"{}\"", uri),
+        format!("response=\"{}\"", response),
+    ];
+    if let Some(alg) = challenge.get("algorithm") {
+        parts.push(format!("algorithm={}", alg));
+    }
+    if let Some(opaque) = challenge.get("opaque") {
+        parts.push(format!("opaque=\"{}\"", opaque));
+    }
+    if use_auth_qop {
+        parts.push("qop=auth".to_string());
+        parts.push(format!("nc={}", nc_hex));
+        parts.push(format!("cnonce=\"{}\"", cnonce));
+    }
+    format!("Digest {}", parts.join(", "))
+}
+
+type DahuaDigestCacheMap = std::collections::HashMap<String, (std::collections::HashMap<String, String>, u32)>;
+
+fn dahua_digest_cache() -> &'static std::sync::Mutex<DahuaDigestCacheMap> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DahuaDigestCacheMap>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn dahua_raw_get(agent: &ureq::Agent, url: &str, auth_hdr: Option<&str>) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    let mut req = agent.get(url).set("User-Agent", "IT-ELKHAWGA-CCTV/1.0");
+    if let Some(h) = auth_hdr {
+        req = req.set("Authorization", h);
+    }
+    match req.call() {
+        Ok(resp) => {
+            let code = resp.status();
+            let www = resp.header("WWW-Authenticate").map(str::to_string);
+            let mut buf = Vec::new();
+            use std::io::Read;
+            let _ = resp.into_reader().take(8 * 1024 * 1024).read_to_end(&mut buf);
+            Ok((code, www, buf))
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let www = resp.header("WWW-Authenticate").map(str::to_string);
+            let mut buf = Vec::new();
+            use std::io::Read;
+            let _ = resp.into_reader().take(256 * 1024).read_to_end(&mut buf);
+            Ok((code, www, buf))
+        }
+        Err(e) => Err(format!("تعذر الاتصال بجهاز الـ DVR على الشبكة المحلية: {}", e)),
+    }
+}
+
+fn dahua_authed_get(
+    host: &str,
+    port: u16,
+    path_with_query: &str,
+    username: &str,
+    password: &str,
+) -> Result<(u16, Vec<u8>), String> {
+    static DVR_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = DVR_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_millis(1400))
+            .timeout(std::time::Duration::from_millis(2400))
+            .build()
+    });
+    let url = format!("http://{}:{}{}", host, port, path_with_query);
+    let cache_key = format!("{}:{}:{}", host, port, username);
+
+    let cached_opt = dahua_digest_cache()
+        .lock()
+        .ok()
+        .and_then(|mut map| {
+            map.get_mut(&cache_key).map(|entry| {
+                entry.1 = entry.1.wrapping_add(1).max(1);
+                (entry.0.clone(), entry.1)
+            })
+        });
+
+    if let Some((challenge, nc)) = cached_opt {
+        let hdr = build_digest_authorization("GET", path_with_query, username, password, &challenge, nc);
+        let (code, _, body) = dahua_raw_get(agent, &url, Some(&hdr))?;
+        if code != 401 {
+            return Ok((code, body));
+        }
+        if let Ok(mut map) = dahua_digest_cache().lock() {
+            map.remove(&cache_key);
+        }
+    }
+
+    let (probe_code, www_opt, probe_body) = dahua_raw_get(agent, &url, None)?;
+    if probe_code != 401 {
+        return Ok((probe_code, probe_body));
+    }
+    if let Some(ref www) = www_opt {
+        if let Some(challenge) = parse_digest_header(www) {
+            if let Ok(mut map) = dahua_digest_cache().lock() {
+                if map.len() > 64 {
+                    map.clear();
+                }
+                map.insert(cache_key, (challenge.clone(), 1));
+            }
+            let hdr = build_digest_authorization("GET", path_with_query, username, password, &challenge, 1);
+            let (code, _, body) = dahua_raw_get(agent, &url, Some(&hdr))?;
+            return Ok((code, body));
+        }
+    }
+
+    let basic = base64_encode(format!("{}:{}", username, password).as_bytes());
+    let (code, _, body) = dahua_raw_get(agent, &url, Some(&format!("Basic {}", basic)))?;
+    Ok((code, body))
+}
+
+fn is_valid_dvr_image(buf: &[u8]) -> bool {
+    buf.len() >= 256
+        && ((buf[0] == 0xff && buf[1] == 0xd8) || (buf[0] == 0x89 && buf[1] == 0x50))
+}
+
+fn is_private_lan_dvr_host(host: &str) -> bool {
+    let h = host.trim();
+    if h.starts_with("10.") || h.starts_with("192.168.") {
+        return true;
+    }
+    if let Some(rest) = h.strip_prefix("172.") {
+        if let Some(oct_str) = rest.split('.').next() {
+            if let Ok(oct) = oct_str.parse::<u8>() {
+                return (16..=31).contains(&oct);
+            }
+        }
+    }
+    false
+}
+
+/// Executes an authenticated on-demand Dahua CGI HTTP GET (`ChannelTitle`, `storageDevice`, `mediaFileFind`, `loadfile`, `ptz`)
+/// strictly against a private LAN IPv4 Dahua DVR/NVR.
+pub fn execute_dahua_cgi(
+    host: &str,
+    port: u16,
+    path_with_query: &str,
+    username: &str,
+    password: &str,
+    max_bytes: u64,
+    timeout_ms: u64,
+) -> Result<(u16, String, Vec<u8>), String> {
+    let clean_host = host.trim();
+    if !is_private_lan_dvr_host(clean_host) {
+        return Err("يُسمح فقط بعناوين الشبكة الداخلية للـ DVR".into());
+    }
+    let pq = path_with_query.trim();
+    if !pq.starts_with("/cgi-bin/") && !pq.starts_with("/RPC2") {
+        return Err("مسار CGI غير صالح".into());
+    }
+    let safe_max = max_bytes.clamp(4096, 10 * 1024 * 1024);
+    let safe_timeout = timeout_ms.clamp(1500, 35_000);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(2000))
+        .timeout(std::time::Duration::from_millis(safe_timeout))
+        .build();
+    let url = format!("http://{}:{}{}", clean_host, port.max(1), pq);
+    let cache_key = format!("{}:{}:{}", clean_host, port.max(1), username);
+
+    let do_req = |auth_hdr: Option<&str>| -> Result<(u16, Option<String>, String, Vec<u8>), String> {
+        let mut r = agent.get(&url).set("User-Agent", "IT-ELKHAWGA-CCTV/1.1");
+        if let Some(h) = auth_hdr {
+            r = r.set("Authorization", h);
+        }
+        match r.call() {
+            Ok(resp) => {
+                let code = resp.status();
+                let www = resp.header("WWW-Authenticate").map(str::to_string);
+                let ct = resp.header("Content-Type").unwrap_or("text/plain").to_string();
+                let mut buf = Vec::new();
+                use std::io::Read;
+                let _ = resp.into_reader().take(safe_max).read_to_end(&mut buf);
+                Ok((code, www, ct, buf))
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let www = resp.header("WWW-Authenticate").map(str::to_string);
+                let ct = resp.header("Content-Type").unwrap_or("text/plain").to_string();
+                let mut buf = Vec::new();
+                use std::io::Read;
+                let _ = resp.into_reader().take(256 * 1024).read_to_end(&mut buf);
+                Ok((code, www, ct, buf))
+            }
+            Err(e) => Err(format!("تعذر الاتصال بجهاز الـ DVR: {}", e)),
+        }
+    };
+
+    let cached_opt = dahua_digest_cache().lock().ok().and_then(|mut map| {
+        map.get_mut(&cache_key).map(|entry| {
+            entry.1 = entry.1.wrapping_add(1).max(1);
+            (entry.0.clone(), entry.1)
+        })
+    });
+
+    if let Some((challenge, nc)) = cached_opt {
+        let hdr = build_digest_authorization("GET", pq, username, password, &challenge, nc);
+        let (code, _, ct, body) = do_req(Some(&hdr))?;
+        if code != 401 {
+            return Ok((code, ct, body));
+        }
+        if let Ok(mut map) = dahua_digest_cache().lock() {
+            map.remove(&cache_key);
+        }
+    }
+
+    let (probe_code, www_opt, probe_ct, probe_body) = do_req(None)?;
+    if probe_code != 401 {
+        return Ok((probe_code, probe_ct, probe_body));
+    }
+    if let Some(ref www) = www_opt {
+        if let Some(challenge) = parse_digest_header(www) {
+            if let Ok(mut map) = dahua_digest_cache().lock() {
+                if map.len() > 64 {
+                    map.clear();
+                }
+                map.insert(cache_key, (challenge.clone(), 1));
+            }
+            let hdr = build_digest_authorization("GET", pq, username, password, &challenge, 1);
+            let (code, _, ct, body) = do_req(Some(&hdr))?;
+            return Ok((code, ct, body));
+        }
+    }
+    let basic = base64_encode(format!("{}:{}", username, password).as_bytes());
+    let (code, _, ct, body) = do_req(Some(&format!("Basic {}", basic)))?;
+    Ok((code, ct, body))
+}
+
+/// Opens a single on-demand live HTTP audio stream (`/cgi-bin/audio.cgi?action=getAudio&httptype=singlepart&channel=<ch>`)
+/// from a private-LAN Dahua DVR/XVR while an admin has unmuted that camera (`~3 KB/s` AAC or `~8 KB/s` G.711, `0% CPU`),
+/// and closes the TCP socket immediately as soon as `keep_going()` or `on_chunk(...)` returns `false`.
+pub fn stream_dahua_audio_live<FKeep, FChunk>(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    channel: u32,
+    mut keep_going: FKeep,
+    mut on_chunk: FChunk,
+) -> Result<(), String>
+where
+    FKeep: FnMut() -> bool,
+    FChunk: FnMut(&str, &[u8]) -> bool,
+{
+    let clean_host = host.trim();
+    if !is_private_lan_dvr_host(clean_host) {
+        return Err("يُسمح فقط بعناوين الشبكة الداخلية للـ DVR".into());
+    }
+    let ch = channel.clamp(1, 64);
+    let pq = format!(
+        "/cgi-bin/audio.cgi?action=getAudio&httptype=singlepart&channel={}",
+        ch
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(2000))
+        .timeout_read(std::time::Duration::from_millis(3500))
+        .build();
+    let url = format!("http://{}:{}{}", clean_host, port.max(1), pq);
+    let cache_key = format!("{}:{}:{}", clean_host, port.max(1), username);
+
+    let open_req = |auth_hdr: Option<&str>| -> Result<Result<ureq::Response, (u16, Option<String>)>, String> {
+        let mut r = agent.get(&url).set("User-Agent", "IT-ELKHAWGA-CCTV/1.1");
+        if let Some(h) = auth_hdr {
+            r = r.set("Authorization", h);
+        }
+        match r.call() {
+            Ok(resp) => Ok(Ok(resp)),
+            Err(ureq::Error::Status(code, resp)) => {
+                let www = resp.header("WWW-Authenticate").map(str::to_string);
+                Ok(Err((code, www)))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Unexpected EOF") {
+                    Err("هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت غير مفعّل لها في إعدادات الـ DVR".into())
+                } else {
+                    Err(format!("تعذر فتح بث الصوت من الـ DVR: {}", msg))
+                }
+            }
+        }
+    };
+
+    let cached_opt = dahua_digest_cache().lock().ok().and_then(|mut map| {
+        map.get_mut(&cache_key).map(|entry| {
+            entry.1 = entry.1.wrapping_add(1).max(1);
+            (entry.0.clone(), entry.1)
+        })
+    });
+
+    let mut live_resp: Option<ureq::Response> = None;
+    if let Some((challenge, nc)) = cached_opt {
+        let hdr = build_digest_authorization("GET", &pq, username, password, &challenge, nc);
+        match open_req(Some(&hdr))? {
+            Ok(resp) => live_resp = Some(resp),
+            Err((401, _)) => {
+                if let Ok(mut map) = dahua_digest_cache().lock() {
+                    map.remove(&cache_key);
+                }
+            }
+            Err((code, _)) => {
+                return Err(format!(
+                    "هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت مغلق في الـ DVR (HTTP {})",
+                    code
+                ));
+            }
+        }
+    }
+
+    if live_resp.is_none() {
+        match open_req(None)? {
+            Ok(resp) => live_resp = Some(resp),
+            Err((401, www_opt)) => {
+                if let Some(ref www) = www_opt {
+                    if let Some(challenge) = parse_digest_header(www) {
+                        if let Ok(mut map) = dahua_digest_cache().lock() {
+                            if map.len() > 64 {
+                                map.clear();
+                            }
+                            map.insert(cache_key, (challenge.clone(), 1));
+                        }
+                        let hdr = build_digest_authorization("GET", &pq, username, password, &challenge, 1);
+                        match open_req(Some(&hdr))? {
+                            Ok(resp) => live_resp = Some(resp),
+                            Err((401, _)) => return Err("بيانات دخول الـ DVR غير صحيحة (HTTP 401)".into()),
+                            Err((code, _)) => {
+                                return Err(format!(
+                                    "هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت مغلق في الـ DVR (HTTP {})",
+                                    code
+                                ))
+                            }
+                        }
+                    }
+                }
+                if live_resp.is_none() {
+                    let basic = base64_encode(format!("{}:{}", username, password).as_bytes());
+                    match open_req(Some(&format!("Basic {}", basic)))? {
+                        Ok(resp) => live_resp = Some(resp),
+                        Err((code, _)) => {
+                            return Err(format!("تعذر فتح بث الصوت من الـ DVR (HTTP {})", code));
+                        }
+                    }
+                }
+            }
+            Err((code, _)) => {
+                return Err(format!(
+                    "هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت مغلق في الـ DVR (HTTP {})",
+                    code
+                ));
+            }
+        }
+    }
+
+    let Some(resp) = live_resp else {
+        return Err("تعذر فتح قناة الصوت المباشر".into());
+    };
+    let ct = resp.header("Content-Type").unwrap_or("Audio/AAC").to_string();
+    let mut reader = resp.into_reader();
+    let mut read_buf = [0u8; 2048];
+    let mut batch: Vec<u8> = Vec::with_capacity(3072);
+    let mut batch_started = std::time::Instant::now();
+    let mut any_bytes = false;
+
+    use std::io::Read;
+    while keep_going() {
+        match reader.read(&mut read_buf) {
+            Ok(0) => {
+                if !batch.is_empty() {
+                    let _ = on_chunk(&ct, &batch);
+                }
+                if !any_bytes {
+                    return Err("هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت غير مفعّل لها في الـ DVR".into());
+                }
+                break;
+            }
+            Ok(n) => {
+                if batch.is_empty() {
+                    batch_started = std::time::Instant::now();
+                }
+                any_bytes = true;
+                batch.extend_from_slice(&read_buf[..n]);
+                if batch.len() >= 1024 || batch_started.elapsed() >= std::time::Duration::from_millis(220) {
+                    if !on_chunk(&ct, &batch) {
+                        break;
+                    }
+                    batch.clear();
+                }
+            }
+            Err(e) => {
+                if !keep_going() {
+                    break;
+                }
+                if !any_bytes {
+                    return Err(format!("انقطع اتصال صوت الكاميرا: {}", e));
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fetches a live JPEG/PNG snapshot from a Dahua DVR/XVR on the local LAN using HTTP Digest/Basic Auth.
+pub fn fetch_dahua_snapshot(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    channel: u32,
+    hd: bool,
+) -> Result<Vec<u8>, String> {
+    let clean_host = host.trim();
+    if clean_host.is_empty() {
+        return Err("عنوان IP للـ DVR فارغ".into());
+    }
+    let ch = channel.clamp(1, 64);
+    let sub = if hd { 0 } else { 1 };
+    let primary = format!("/cgi-bin/snapshot.cgi?channel={}&subtype={}", ch, sub);
+    let (mut code, mut body) = dahua_authed_get(clean_host, port.max(1), &primary, username, password)?;
+    if code == 401 {
+        return Err("اسم المستخدم أو كلمة مرور جهاز الـ DVR غير صحيحة (HTTP 401)".into());
+    }
+    if (code == 400 || code == 404) && !hd {
+        let fallback = format!("/cgi-bin/snapshot.cgi?channel={}", ch);
+        let (c2, b2) = dahua_authed_get(clean_host, port.max(1), &fallback, username, password)?;
+        code = c2;
+        body = b2;
+    }
+    if code != 200 || !is_valid_dvr_image(&body) {
+        return Err(format!("القناة رقم {} غير متصلة أو لا توجد كاميرا عليها (HTTP {})", ch, code));
+    }
+    Ok(body)
+}
+
+/// Scans the local `/24` IPv4 subnet for Dahua DVRs/XVRs/NVRs (TCP signature port `37777` + HTTP `80`/`8080`).
+pub fn scan_local_subnet_for_dahua() -> Vec<serde_json::Value> {
+    let my_ip = local_ip();
+    let parts: Vec<&str> = my_ip.split('.').collect();
+    if parts.len() != 4 || my_ip.starts_with("127.") {
+        return Vec::new();
+    }
+    let prefix = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    let next_host = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(1));
+    let found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut handles = Vec::with_capacity(32);
+
+    for _ in 0..32 {
+        let pref = prefix.clone();
+        let idx_counter = std::sync::Arc::clone(&next_host);
+        let out_arc = std::sync::Arc::clone(&found);
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let host_num = idx_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if host_num > 254 {
+                    break;
+                }
+                let ip = format!("{}.{}", pref, host_num);
+                let Ok(addr_37777) = format!("{}:37777", ip).parse::<std::net::SocketAddr>() else {
+                    continue;
+                };
+                if std::net::TcpStream::connect_timeout(&addr_37777, std::time::Duration::from_millis(480)).is_err() {
+                    continue;
+                }
+                let has_80 = format!("{}:80", ip)
+                    .parse::<std::net::SocketAddr>()
+                    .ok()
+                    .map(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(400)).is_ok())
+                    .unwrap_or(false);
+                let has_8080 = if !has_80 {
+                    format!("{}:8080", ip)
+                        .parse::<std::net::SocketAddr>()
+                        .ok()
+                        .map(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(400)).is_ok())
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let http_port = if has_80 { 80 } else if has_8080 { 8080 } else { 80 };
+                if let Ok(mut g) = out_arc.lock() {
+                    g.push((
+                        host_num,
+                        serde_json::json!({
+                            "host": ip,
+                            "http_port": http_port,
+                            "rtsp_port": 554,
+                            "vendor": "Dahua DVR / XVR (منفذ 37777 مكتشف)"
+                        }),
+                    ));
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let mut vec_out = found.lock().map(|g| g.clone()).unwrap_or_default();
+    vec_out.sort_by_key(|x| x.0);
+    vec_out.into_iter().map(|x| x.1).collect()
+}
+
 // ---------- Blocking state and script execution ----------
 
 pub fn hidden(cmd: &mut Command) -> &mut Command {
@@ -821,43 +1893,149 @@ pub fn hidden(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-pub fn reg_query_dword(key: &str, value: &str) -> Option<u32> {
-    let mut cmd = Command::new("reg");
-    cmd.args(["query", key, "/v", value]);
-    let out = hidden(&mut cmd).output().ok()?;
-    if !out.status.success() {
-        return None;
+#[cfg(windows)]
+fn split_reg_root(key: &str) -> Option<(*mut std::ffi::c_void, String)> {
+    const HKLM: *mut std::ffi::c_void = 0x8000_0002usize as *mut std::ffi::c_void;
+    const HKCU: *mut std::ffi::c_void = 0x8000_0001usize as *mut std::ffi::c_void;
+    if let Some(sub) = key.strip_prefix(r"HKLM\").or_else(|| key.strip_prefix(r"HKEY_LOCAL_MACHINE\")) {
+        return Some((HKLM, sub.to_string()));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace()
-        .last()
-        .and_then(|v| v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")))
-        .and_then(|v| u32::from_str_radix(v, 16).ok())
+    if let Some(sub) = key.strip_prefix(r"HKCU\").or_else(|| key.strip_prefix(r"HKEY_CURRENT_USER\")) {
+        return Some((HKCU, sub.to_string()));
+    }
+    None
+}
+
+#[cfg(windows)]
+pub fn reg_query_dword(key: &str, value: &str) -> Option<u32> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hKey: *mut std::ffi::c_void,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: *mut std::ffi::c_void,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hKey: *mut std::ffi::c_void) -> i32;
+    }
+    const KEY_READ: u32 = 0x20019;
+    const REG_DWORD: u32 = 4;
+    let (root, sub) = split_reg_root(key)?;
+    let wsub: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
+    let wval: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut hkey: *mut std::ffi::c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(root, wsub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 || hkey.is_null() {
+            return None;
+        }
+        let mut data: u32 = 0;
+        let mut cb: u32 = 4;
+        let mut vtype: u32 = 0;
+        let rc = RegQueryValueExW(
+            hkey,
+            wval.as_ptr(),
+            std::ptr::null_mut(),
+            &mut vtype,
+            (&mut data as *mut u32) as *mut u8,
+            &mut cb,
+        );
+        RegCloseKey(hkey);
+        if rc == 0 && vtype == REG_DWORD {
+            Some(data)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn reg_query_dword(_key: &str, _value: &str) -> Option<u32> {
+    None
 }
 
 pub fn reg_value_exists(key: &str, value: &str) -> bool {
-    let mut cmd = Command::new("reg");
-    cmd.args(["query", key, "/v", value]);
-    hidden(&mut cmd).output().map(|o| o.status.success()).unwrap_or(false)
+    reg_query_dword(key, value).is_some() || reg_query_string(key, value).is_some()
 }
 
+#[cfg(windows)]
 pub fn reg_query_string(key: &str, value: &str) -> Option<String> {
-    let mut cmd = Command::new("reg");
-    cmd.args(["query", key, "/v", value]);
-    let out = hidden(&mut cmd).output().ok()?;
-    if !out.status.success() {
-        return None;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hKey: *mut std::ffi::c_void,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: *mut std::ffi::c_void,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hKey: *mut std::ffi::c_void) -> i32;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(pos) = trimmed.find("REG_SZ").or_else(|| trimmed.find("REG_EXPAND_SZ")) {
-            let after = trimmed[pos..].split_once(char::is_whitespace).map(|x| x.1.trim()).unwrap_or("");
-            if !after.is_empty() {
-                return Some(after.to_string());
-            }
+    const KEY_READ: u32 = 0x20019;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    let (root, sub) = split_reg_root(key)?;
+    let wsub: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
+    let wval: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut hkey: *mut std::ffi::c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(root, wsub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 || hkey.is_null() {
+            return None;
         }
+        let mut cb: u32 = 0;
+        let mut vtype: u32 = 0;
+        if RegQueryValueExW(
+            hkey,
+            wval.as_ptr(),
+            std::ptr::null_mut(),
+            &mut vtype,
+            std::ptr::null_mut(),
+            &mut cb,
+        ) != 0
+            || cb < 2
+            || cb > 16384
+            || (vtype != REG_SZ && vtype != REG_EXPAND_SZ)
+        {
+            RegCloseKey(hkey);
+            return None;
+        }
+        let mut buf = vec![0u16; (cb as usize + 1) / 2];
+        let rc = RegQueryValueExW(
+            hkey,
+            wval.as_ptr(),
+            std::ptr::null_mut(),
+            &mut vtype,
+            buf.as_mut_ptr() as *mut u8,
+            &mut cb,
+        );
+        RegCloseKey(hkey);
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
     }
+}
+
+#[cfg(not(windows))]
+pub fn reg_query_string(_key: &str, _value: &str) -> Option<String> {
     None
 }
 
@@ -925,31 +2103,164 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 /// Reads the RustDesk ID from the user's RustDesk config, if installed.
 /// Writes the self-hosted RustDesk server settings to RustDesk2.toml so the
 /// client never contacts the public relay server. No-op if not configured.
+pub fn sync_rustdesk_custom_server_toml(existing: &str, server_raw: &str, key_raw: &str) -> String {
+    let srv_trim = server_raw.trim();
+    let host_only = srv_trim
+        .strip_suffix(":21116")
+        .or_else(|| srv_trim.strip_suffix(":21117"))
+        .unwrap_or(srv_trim)
+        .trim();
+    let key_trim = key_raw.trim();
+
+    let mut top_lines: Vec<String> = Vec::new();
+    let mut opt_order: Vec<String> = Vec::new();
+    let mut opt_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut other_sections: Vec<String> = Vec::new();
+    let mut current_section = String::new();
+
+    for raw in existing.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+            if current_section != "options" {
+                other_sections.push(raw.to_string());
+            }
+            continue;
+        }
+        if current_section.is_empty() {
+            if let Some((k, _)) = trimmed.split_once('=') {
+                let kn = k.trim();
+                if kn == "rendezvous_server" || kn == "key" {
+                    continue;
+                }
+            }
+            top_lines.push(raw.to_string());
+        } else if current_section == "options" {
+            if let Some((k, v)) = trimmed.split_once('=') {
+                let key = k.trim().to_string();
+                if !key.is_empty() {
+                    if !opt_map.contains_key(&key) {
+                        opt_order.push(key.clone());
+                    }
+                    opt_map.insert(key, v.trim().to_string());
+                }
+            }
+        } else {
+            other_sections.push(raw.to_string());
+        }
+    }
+
+    if host_only.is_empty() {
+        for k in ["custom-rendezvous-server", "relay-server", "key"] {
+            opt_map.remove(k);
+            opt_order.retain(|x| x != k);
+        }
+    } else {
+        let relay_host = host_only.split(':').next().unwrap_or(host_only).trim();
+        for (k, val) in [
+            ("custom-rendezvous-server", format!("'{}'", host_only)),
+            ("relay-server", format!("'{}'", relay_host)),
+        ] {
+            let ks = k.to_string();
+            if !opt_map.contains_key(&ks) {
+                opt_order.push(ks.clone());
+            }
+            opt_map.insert(ks, val);
+        }
+        if !key_trim.is_empty() {
+            let ks = "key".to_string();
+            if !opt_map.contains_key(&ks) {
+                opt_order.push(ks.clone());
+            }
+            opt_map.insert(ks, format!("'{}'", key_trim));
+        } else {
+            opt_map.remove("key");
+            opt_order.retain(|x| x != "key");
+        }
+    }
+
+    while top_lines.last().map_or(false, |l| l.trim().is_empty()) {
+        top_lines.pop();
+    }
+
+    let mut out = String::new();
+    for line in &top_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !top_lines.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("[options]\n");
+    for k in &opt_order {
+        if let Some(v) = opt_map.get(k) {
+            out.push_str(&format!("{} = {}\n", k, v));
+        }
+    }
+    for line in &other_sections {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn rustdesk2_toml_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.trim().is_empty() {
+            paths.push(PathBuf::from(appdata).join("RustDesk").join("config").join("RustDesk2.toml"));
+        }
+    }
+    paths.push(PathBuf::from(
+        r"C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk2.toml",
+    ));
+    paths.push(PathBuf::from(
+        r"C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config\RustDesk2.toml",
+    ));
+    paths
+}
+
+/// Writes (or clears) the self-hosted RustDesk server settings in `RustDesk2.toml` `[options]`
+/// across user and service profiles while preserving all existing options and IDs.
 pub fn configure_rustdesk_server() {
     ensure_rustdesk_stealth_config();
     let link = read_client();
-    if link.rustdesk_server.trim().is_empty() {
-        return;
+    for path in rustdesk2_toml_paths() {
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        if existing.is_empty() && link.rustdesk_server.trim().is_empty() {
+            continue;
+        }
+        let updated = sync_rustdesk_custom_server_toml(&existing, &link.rustdesk_server, &link.rustdesk_key);
+        if updated != existing {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&path, updated);
+        }
     }
-    let base = match std::env::var("APPDATA") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
-    let dir = std::path::PathBuf::from(&base).join("RustDesk").join("config");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join("RustDesk2.toml");
-    let mut content = format!("rendezvous_server = '{}'
-", link.rustdesk_server.trim());
-    if !link.rustdesk_key.trim().is_empty() {
-        content.push_str(&format!("key = '{}'
-", link.rustdesk_key.trim()));
-    }
-    let _ = fs::write(path, content);
     ensure_rustdesk_stealth_config();
 }
 
+/// Syncs the Admin machine's own `RustDesk2.toml` `[options]` with `cfg.rustdesk_server` and `cfg.rustdesk_key`.
+pub fn configure_admin_rustdesk_server() {
+    let cfg = read_config();
+    for path in rustdesk2_toml_paths() {
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        if existing.is_empty() && cfg.rustdesk_server.trim().is_empty() {
+            continue;
+        }
+        let updated = sync_rustdesk_custom_server_toml(&existing, &cfg.rustdesk_server, &cfg.rustdesk_key);
+        if updated != existing {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&path, updated);
+        }
+    }
+}
+
 fn upsert_rustdesk2_options(existing: &str) -> String {
-    const STEALTH_OPTS: [(&str, &str); 7] = [
+    const STEALTH_OPTS: [(&str, &str); 11] = [
         ("approve-mode", "'password'"),
         ("verification-method", "'use-permanent-password'"),
         ("access-mode", "'full'"),
@@ -957,6 +2268,10 @@ fn upsert_rustdesk2_options(existing: &str) -> String {
         ("allow-remove-wallpaper", "'N'"),
         ("enable-lan-discovery", "'Y'"),
         ("direct-server", "'Y'"),
+        ("hide-cm", "'Y'"),
+        ("allow-hide-cm", "'Y'"),
+        ("hide-tray", "'Y'"),
+        ("stop-service", "'N'"),
     ];
 
     let mut top_lines: Vec<String> = Vec::new();
@@ -1042,6 +2357,30 @@ pub fn ensure_rustdesk_stealth_config() {
     paths.push(PathBuf::from(
         r"C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config\RustDesk2.toml",
     ));
+    if let Ok(users_dir) = fs::read_dir(r"C:\Users") {
+        for entry in users_dir.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let cfg_dir = p.join("AppData").join("Roaming").join("RustDesk").join("config");
+                if cfg_dir.exists() || p.join("Desktop").exists() {
+                    paths.push(cfg_dir.join("RustDesk2.toml"));
+                }
+                // Remove employee Desktop & Start Menu shortcuts so employees cannot open RustDesk GUI
+                let _ = fs::remove_file(p.join("Desktop").join("RustDesk.lnk"));
+                let _ = fs::remove_dir_all(
+                    p.join("AppData")
+                        .join("Roaming")
+                        .join("Microsoft")
+                        .join("Windows")
+                        .join("Start Menu")
+                        .join("Programs")
+                        .join("RustDesk"),
+                );
+            }
+        }
+    }
+    let _ = fs::remove_file(r"C:\Users\Public\Desktop\RustDesk.lnk");
+    let _ = fs::remove_dir_all(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\RustDesk");
 
     for path in paths {
         let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -1051,6 +2390,98 @@ pub fn ensure_rustdesk_stealth_config() {
                 let _ = fs::create_dir_all(parent);
             }
             let _ = fs::write(&path, updated);
+        }
+    }
+}
+
+/// Elevated SYSTEM watchdog for Client PCs: keeps the RustDesk Windows service running,
+/// heals the unattended permanent password if tampered with, and locks NTFS ACLs on
+/// RustDesk config directories so regular employees have Read-Only access (cannot alter
+/// password, ID server, or stealth options).
+pub fn enforce_rustdesk_employee_lockdown(expected_password: &str) {
+    if is_admin_mode() {
+        return;
+    }
+    let has_rd = rustdesk_candidates().into_iter().any(|p| p.is_file());
+    if !has_rd {
+        return;
+    }
+
+    ensure_rustdesk_stealth_config();
+    configure_rustdesk_server();
+
+    // Ensure RustDesk service is set to auto-start and running
+    let mut sc_cfg = Command::new("sc.exe");
+    sc_cfg.args(["config", "RustDesk", "start=", "auto"]);
+    let _ = hidden(&mut sc_cfg)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let mut sc_start = Command::new("sc.exe");
+    sc_start.args(["start", "RustDesk"]);
+    let _ = hidden(&mut sc_start)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    // Verify LocalService RustDesk.toml still holds a non-empty permanent password hash; re-apply if cleared
+    let svc_toml = PathBuf::from(
+        r"C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml",
+    );
+    let pw = expected_password.trim();
+    if !pw.is_empty() {
+        let raw = fs::read_to_string(&svc_toml).unwrap_or_default();
+        let has_pw = raw.lines().any(|l| {
+            let t = l.trim();
+            if let Some(rest) = t.strip_prefix("password") {
+                let val = rest
+                    .trim_start_matches(|c: char| c == ' ' || c == '=' || c == '\t')
+                    .trim_matches(|c: char| c == '\'' || c == '"');
+                !val.is_empty()
+            } else {
+                false
+            }
+        });
+        if !has_pw {
+            let _ = apply_rustdesk_permanent_password(pw);
+        }
+    }
+
+    // Lock NTFS write permissions on RustDesk config directories so SYSTEM, LOCAL SERVICE,
+    // and Administrators have Full Control while standard Users only have Read & Execute (RX).
+    let mut cfg_dirs: Vec<PathBuf> = vec![
+        PathBuf::from(r"C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config"),
+        PathBuf::from(r"C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config"),
+    ];
+    if let Ok(users_dir) = fs::read_dir(r"C:\Users") {
+        for entry in users_dir.flatten() {
+            let d = entry
+                .path()
+                .join("AppData")
+                .join("Roaming")
+                .join("RustDesk")
+                .join("config");
+            if d.is_dir() {
+                cfg_dirs.push(d);
+            }
+        }
+    }
+    for dir in cfg_dirs {
+        if dir.is_dir() {
+            let mut ic = Command::new("icacls");
+            ic.arg(&dir)
+                .args([
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(OI)(CI)F",
+                    "*S-1-5-19:(OI)(CI)F",
+                    "*S-1-5-32-544:(OI)(CI)F",
+                    "*S-1-5-32-545:(OI)(CI)RX",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let _ = hidden(&mut ic).status();
         }
     }
 }
@@ -1123,6 +2554,7 @@ pub fn upsert_peer_view_only_toml(existing: &str, view_only: bool) -> String {
 /// Configures the local Admin RustDesk peer profile (`%APPDATA%\RustDesk\config\peers\<id>.toml`)
 /// before launching a session so View-Only screen/camera watch modes never send input events.
 pub fn configure_admin_rustdesk_peer(peer_id: &str, view_only: bool) {
+    configure_admin_rustdesk_server();
     let clean: String = peer_id
         .trim()
         .chars()
@@ -1221,6 +2653,9 @@ pub fn start_rustdesk_stealth_guard() {
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
     }
 
+    static NON_RUSTDESK_PIDS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+    static RUSTDESK_PIDS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+
     unsafe extern "system" fn hide_rustdesk_window(
         hwnd: *mut std::ffi::c_void,
         _lparam: isize,
@@ -1246,23 +2681,55 @@ pub fn start_rustdesk_stealth_guard() {
         if pid == 0 {
             return 1;
         }
-        let hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if hproc.is_null() {
-            return 1;
+        if let Ok(g) = NON_RUSTDESK_PIDS.lock() {
+            if g.as_ref().map_or(false, |v| v.contains(&pid)) {
+                return 1;
+            }
         }
-        let mut buf = [0u16; 260];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(hproc, 0, buf.as_mut_ptr(), &mut len);
-        CloseHandle(hproc);
-        if ok == 0 || len == 0 {
-            return 1;
-        }
-        let exe = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
-        let is_rustdesk = Path::new(&exe)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == "rustdesk.exe")
+        let known_rd = RUSTDESK_PIDS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|v| v.contains(&pid)))
             .unwrap_or(false);
+
+        let is_rustdesk = if known_rd {
+            true
+        } else {
+            let hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if hproc.is_null() {
+                return 1;
+            }
+            let mut buf = [0u16; 260];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(hproc, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(hproc);
+            if ok == 0 || len == 0 {
+                return 1;
+            }
+            let exe = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
+            let rd = Path::new(&exe)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == "rustdesk.exe")
+                .unwrap_or(false);
+            if rd {
+                if let Ok(mut g) = RUSTDESK_PIDS.lock() {
+                    let v = g.get_or_insert_with(Vec::new);
+                    if v.len() >= 16 {
+                        v.remove(0);
+                    }
+                    v.push(pid);
+                }
+            } else if let Ok(mut g) = NON_RUSTDESK_PIDS.lock() {
+                let v = g.get_or_insert_with(Vec::new);
+                if v.len() >= 256 {
+                    v.drain(0..64);
+                }
+                v.push(pid);
+            }
+            rd
+        };
+
         if !is_rustdesk {
             return 1;
         }
@@ -1291,11 +2758,28 @@ pub fn start_rustdesk_stealth_guard() {
         1
     }
 
-    std::thread::spawn(move || loop {
-        unsafe {
-            EnumWindows(hide_rustdesk_window, 0);
+    std::thread::spawn(move || {
+        let mut ticks: u32 = 0;
+        loop {
+            unsafe {
+                EnumWindows(hide_rustdesk_window, 0);
+            }
+            ticks = ticks.wrapping_add(1);
+            // Periodically flush PID caches every ~5 minutes in case Windows recycles a PID
+            if ticks % 340 == 0 {
+                if let Ok(mut g) = NON_RUSTDESK_PIDS.lock() {
+                    if let Some(v) = g.as_mut() {
+                        v.clear();
+                    }
+                }
+                if let Ok(mut g) = RUSTDESK_PIDS.lock() {
+                    if let Some(v) = g.as_mut() {
+                        v.clear();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(850));
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     });
 }
 
@@ -1616,7 +3100,7 @@ pub fn capture_window_base64(hwnd_raw: isize, max_w: i32) -> Option<String> {
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
         ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
-        BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, SRCCOPY,
+        BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
 
@@ -1716,7 +3200,8 @@ pub fn capture_window_base64(hwnd_raw: isize, max_w: i32) -> Option<String> {
             return None;
         }
         let old_dst = SelectObject(dst_dc, dst_bmp);
-        SetStretchBltMode(dst_dc, COLORONCOLOR as i32);
+        const HALFTONE_MODE: i32 = 4;
+        SetStretchBltMode(dst_dc, HALFTONE_MODE);
         let blt_ok = StretchBlt(
             dst_dc, 0, 0, dst_w, dst_h, src_dc, 0, 0, src_w, src_h, SRCCOPY,
         );
@@ -1982,8 +3467,16 @@ fn preserved_company_cookie_patterns() -> Vec<String> {
         "x.com",
         "telegram.org",
     ];
+    let mut raw_entries = read_list(&allowed_path());
+    // Always preserve the company's primary ERP system domains even in Blacklist mode
+    // or before the first group policy sync completes.
+    raw_entries.push(DEFAULT_ERP_DOMAIN.to_string());
+    for d in read_config().erp_domains {
+        raw_entries.push(d);
+    }
+
     let mut patterns = Vec::new();
-    for entry in read_list(&allowed_path()) {
+    for entry in raw_entries {
         let Some(cleaned) = clean_domain(&entry) else { continue };
         let (host_only, port_opt) = match cleaned.split_once(':') {
             Some((h, p)) => (h.trim_start_matches("www.").to_lowercase(), Some(p)),
@@ -2004,6 +3497,7 @@ fn preserved_company_cookie_patterns() -> Vec<String> {
             patterns.push(format!("https://{}{}", host_only, suffix));
             patterns.push(format!("http://{}{}", host_only, suffix));
         } else {
+            patterns.push(format!("[*.]{}{}", host_only, suffix));
             patterns.push(format!("https://[*.]{}{}", host_only, suffix));
             patterns.push(format!("http://[*.]{}{}", host_only, suffix));
         }
@@ -2013,38 +3507,99 @@ fn preserved_company_cookie_patterns() -> Vec<String> {
     patterns
 }
 
+fn list_loaded_hku_policy_roots() -> Vec<String> {
+    let mut roots = vec![
+        r"HKLM\SOFTWARE\Policies\Google\Chrome".to_string(),
+        r"HKLM\SOFTWARE\Policies\Microsoft\Edge".to_string(),
+        r"HKCU\SOFTWARE\Policies\Google\Chrome".to_string(),
+        r"HKCU\SOFTWARE\Policies\Microsoft\Edge".to_string(),
+    ];
+    let mut q = Command::new("reg");
+    q.args(["query", "HKU"]);
+    if let Ok(out) = hidden(&mut q).output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let t = line.trim();
+            if t.starts_with(r"HKEY_USERS\S-1-5-21-") && !t.ends_with("_Classes") {
+                let sid_root = t.replacen("HKEY_USERS\\", "HKU\\", 1);
+                roots.push(format!(r"{}\SOFTWARE\Policies\Google\Chrome", sid_root));
+                roots.push(format!(r"{}\SOFTWARE\Policies\Microsoft\Edge", sid_root));
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// Applies or removes Chrome and Edge clean-browser policies that wipe browsing history,
-/// saved passwords, autofill, caches, and open tabs on exit while keeping persistent
-/// site cookies/tokens for allowed company systems so device-bound logins survive restarts.
+/// saved passwords, autofill, bookmarks, caches, and open tabs on exit (plus disabling F12 DevTools),
+/// while NEVER setting `DefaultCookiesSetting = 4` so company ERP device-binding tokens
+/// (`elkhawaga_did` HttpOnly cookie, `elkhawaga_device_token` LocalStorage, `ElkhawagaDeviceDB`)
+/// survive permanently across browser restarts.
 pub fn apply_ephemeral_browser_policy(enable: bool) {
     if is_admin_mode() {
         return;
     }
-    const ROOTS: [&str; 4] = [
+    const MACHINE_ROOTS: [&str; 2] = [
         r"HKLM\SOFTWARE\Policies\Google\Chrome",
-        r"HKCU\SOFTWARE\Policies\Google\Chrome",
         r"HKLM\SOFTWARE\Policies\Microsoft\Edge",
-        r"HKCU\SOFTWARE\Policies\Microsoft\Edge",
     ];
-    const DWORD_SETTINGS: [(&str, &str); 10] = [
+    const COMMON_DWORDS: [(&str, &str); 21] = [
         ("SavingBrowserHistoryDisabled", "1"),
+        ("SearchSuggestEnabled", "0"),
+        ("UrlKeyedAnonymizedDataCollectionEnabled", "0"),
+        ("BrowserSignin", "0"),
+        ("SyncDisabled", "1"),
         ("PasswordManagerEnabled", "0"),
         ("AutofillAddressEnabled", "0"),
         ("AutofillCreditCardEnabled", "0"),
-        ("SyncDisabled", "1"),
-        ("RestoreOnStartup", "5"),
+        ("HomepageIsNewTabPage", "0"),
+        ("ShowHomeButton", "0"),
         ("BackgroundModeEnabled", "0"),
         ("StartupBoostEnabled", "0"),
-        ("DefaultCookiesSetting", "4"),
-        ("ClearBrowsingDataOnExit", "1"),
+        ("EditBookmarksEnabled", "0"),
+        ("BookmarkBarEnabled", "0"),
+        ("DeveloperToolsAvailability", "2"),
+        ("NTPCardsVisible", "0"),
+        ("NTPMiddleSlotAnnouncementVisible", "0"),
+        ("PromotionalTabsEnabled", "0"),
+        ("AIModeSettings", "1"),
+        ("GenAILocalFoundationalModelSettings", "1"),
+        ("HistorySearchSettings", "2"),
     ];
-    const CLEAR_ON_EXIT_ITEMS: [&str; 6] = [
+    const EDGE_NTP_DWORDS: [(&str, &str); 7] = [
+        ("NewTabPageQuickLinksEnabled", "0"),
+        ("NewTabPageHideDefaultTopSites", "1"),
+        ("NewTabPageContentEnabled", "0"),
+        ("NewTabPageFeedsEnabled", "0"),
+        ("SpotlightExperiencesAndRecommendationsEnabled", "0"),
+        ("EdgeCollectionsEnabled", "0"),
+        ("HubsSidebarEnabled", "0"),
+    ];
+    const EDGE_STRING_SETTINGS: [(&str, &str); 2] = [
+        ("NewTabPageLocation", "about:blank"),
+        ("HomepageLocation", "about:blank"),
+    ];
+    const CLEAR_ON_EXIT_ITEMS: [&str; 5] = [
         "browsing_history",
         "download_history",
         "cached_images_and_files",
         "password_signin",
         "autofill",
-        "hosted_app_data",
+    ];
+    const SESSION_ONLY_SOCIAL_URLS: [&str; 12] = [
+        "https://[*.]whatsapp.com",
+        "https://[*.]whatsapp.net",
+        "https://[*.]facebook.com",
+        "https://[*.]messenger.com",
+        "https://[*.]instagram.com",
+        "https://[*.]tiktok.com",
+        "https://[*.]youtube.com",
+        "https://[*.]google.com",
+        "https://[*.]live.com",
+        "https://[*.]telegram.org",
+        "https://[*.]x.com",
+        "https://[*.]twitter.com",
     ];
 
     let cookie_patterns = if enable {
@@ -2053,138 +3608,542 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
         Vec::new()
     };
 
-    for root in ROOTS {
+    // Clean any stale or conflicting keys across HKLM, HKCU, and all loaded user SIDs in HKU
+    for root in list_loaded_hku_policy_roots() {
+        for legacy_val in [
+            "ForceEphemeralProfiles",
+            "ClearBrowsingDataOnExit",
+            "DefaultCookiesSetting",
+            "RestoreOnStartup",
+            "NewTabPageLocation",
+            "HomepageLocation",
+        ] {
+            let mut del_legacy = Command::new("reg");
+            del_legacy.args(["delete", &root, "/v", legacy_val, "/f"]);
+            let _ = hidden(&mut del_legacy).output();
+        }
+        for sub in [
+            "ClearBrowsingDataOnExitList",
+            "CookiesAllowedForUrls",
+            "SaveCookiesOnExit",
+            "CookiesSessionOnlyForUrls",
+            "RestoreOnStartupURLs",
+        ] {
+            let subkey = format!(r"{}\{}", root, sub);
+            let mut del_sub = Command::new("reg");
+            del_sub.args(["delete", &subkey, "/f"]);
+            let _ = hidden(&mut del_sub).output();
+        }
+        if !enable || !root.starts_with(r"HKLM\") {
+            for (name, _) in COMMON_DWORDS.iter().chain(EDGE_NTP_DWORDS.iter()).chain(EDGE_STRING_SETTINGS.iter()) {
+                let mut cmd = Command::new("reg");
+                cmd.args(["delete", &root, "/v", name, "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+        }
+    }
+
+    if !enable {
+        return;
+    }
+
+    for root in MACHINE_ROOTS {
+        let is_edge = root.contains("Microsoft\\Edge");
         let list_key = format!(r"{}\ClearBrowsingDataOnExitList", root);
         let cookies_key = format!(r"{}\CookiesAllowedForUrls", root);
-        // Always purge ForceEphemeralProfiles so Chrome/Edge never wipes the company
-        // ERP/system device-binding token stored in cookies/localStorage/IndexedDB.
-        let mut del_ephem = Command::new("reg");
-        del_ephem.args(["delete", root, "/v", "ForceEphemeralProfiles", "/f"]);
-        let _ = hidden(&mut del_ephem).output();
+        let save_cookies_key = format!(r"{}\SaveCookiesOnExit", root);
+        let session_only_key = format!(r"{}\CookiesSessionOnlyForUrls", root);
+        let startup_urls_key = format!(r"{}\RestoreOnStartupURLs", root);
 
-        let mut del_list = Command::new("reg");
-        del_list.args(["delete", &list_key, "/f"]);
-        let _ = hidden(&mut del_list).output();
-
-        let mut del_cookies = Command::new("reg");
-        del_cookies.args(["delete", &cookies_key, "/f"]);
-        let _ = hidden(&mut del_cookies).output();
-
-        if enable {
-            for (name, val) in DWORD_SETTINGS {
+        for (name, val) in COMMON_DWORDS {
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", root, "/v", name, "/t", "REG_DWORD", "/d", val, "/f"]);
+            let _ = hidden(&mut cmd).output();
+        }
+        // Chrome on non-domain Windows honors RestoreOnStartup=5 (New Tab) and ignores 4,
+        // while Edge honors RestoreOnStartup=4 + about:blank on all Windows editions.
+        {
+            let mut cmd = Command::new("reg");
+            cmd.args([
+                "add",
+                root,
+                "/v",
+                "RestoreOnStartup",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                if is_edge { "4" } else { "5" },
+                "/f",
+            ]);
+            let _ = hidden(&mut cmd).output();
+        }
+        if is_edge {
+            for (name, val) in EDGE_STRING_SETTINGS {
+                let mut cmd = Command::new("reg");
+                cmd.args(["add", root, "/v", name, "/t", "REG_SZ", "/d", val, "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+            {
+                let mut cmd = Command::new("reg");
+                cmd.args(["add", &startup_urls_key, "/v", "1", "/t", "REG_SZ", "/d", "about:blank", "/f"]);
+                let _ = hidden(&mut cmd).output();
+            }
+            for (name, val) in EDGE_NTP_DWORDS {
                 let mut cmd = Command::new("reg");
                 cmd.args(["add", root, "/v", name, "/t", "REG_DWORD", "/d", val, "/f"]);
                 let _ = hidden(&mut cmd).output();
             }
-            for (idx, item) in CLEAR_ON_EXIT_ITEMS.iter().enumerate() {
-                let name = (idx + 1).to_string();
-                let mut cmd = Command::new("reg");
-                cmd.args(["add", &list_key, "/v", &name, "/t", "REG_SZ", "/d", item, "/f"]);
-                let _ = hidden(&mut cmd).output();
-            }
-            for (idx, pat) in cookie_patterns.iter().enumerate() {
-                let name = (idx + 1).to_string();
-                let mut cmd = Command::new("reg");
-                cmd.args(["add", &cookies_key, "/v", &name, "/t", "REG_SZ", "/d", pat, "/f"]);
-                let _ = hidden(&mut cmd).output();
-            }
-        } else {
-            for (name, _) in DWORD_SETTINGS {
-                let mut cmd = Command::new("reg");
-                cmd.args(["delete", root, "/v", name, "/f"]);
-                let _ = hidden(&mut cmd).output();
+        }
+        for (idx, item) in CLEAR_ON_EXIT_ITEMS.iter().enumerate() {
+            let name = (idx + 1).to_string();
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", &list_key, "/v", &name, "/t", "REG_SZ", "/d", item, "/f"]);
+            let _ = hidden(&mut cmd).output();
+        }
+        for (idx, pat) in SESSION_ONLY_SOCIAL_URLS.iter().enumerate() {
+            let name = (idx + 1).to_string();
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", &session_only_key, "/v", &name, "/t", "REG_SZ", "/d", pat, "/f"]);
+            let _ = hidden(&mut cmd).output();
+        }
+        for (idx, pat) in cookie_patterns.iter().enumerate() {
+            let name = (idx + 1).to_string();
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", &cookies_key, "/v", &name, "/t", "REG_SZ", "/d", pat, "/f"]);
+            let _ = hidden(&mut cmd).output();
+            if is_edge {
+                let mut edge_cmd = Command::new("reg");
+                edge_cmd.args(["add", &save_cookies_key, "/v", &name, "/t", "REG_SZ", "/d", pat, "/f"]);
+                let _ = hidden(&mut edge_cmd).output();
             }
         }
     }
 }
 
-fn is_process_running(exe_name: &str) -> bool {
-    let mut cmd = Command::new("tasklist");
-    cmd.args(["/FI", &format!("IMAGENAME eq {}", exe_name), "/NH"]);
-    match hidden(&mut cmd).output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .to_ascii_lowercase()
-            .contains(&exe_name.to_ascii_lowercase()),
-        Err(_) => false,
+#[cfg(windows)]
+pub fn is_process_running(exe_name: &str) -> bool {
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
+        fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    let invalid = (-1isize) as *mut std::ffi::c_void;
+    let target = exe_name.trim().to_ascii_lowercase();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap == invalid {
+            return false;
+        }
+        let mut entry = ProcessEntry32W {
+            dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            cnt_usage: 0,
+            th32_process_id: 0,
+            th32_default_heap_id: 0,
+            th32_module_id: 0,
+            cnt_threads: 0,
+            th32_parent_process_id: 0,
+            pc_pri_class_base: 0,
+            dw_flags: 0,
+            sz_exe_file: [0u16; 260],
+        };
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .sz_exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..end]);
+                if name.eq_ignore_ascii_case(&target) {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found
     }
 }
 
-/// Removes local Chrome/Edge browsing history, caches, open sessions/tabs, and saved passwords
-/// once the browser process has closed while preserving cookies and site storage (device tokens)
-/// for allowed company systems.
-pub fn wipe_browser_data_if_closed(force_close_once: bool) {
+#[cfg(not(windows))]
+pub fn is_process_running(_exe_name: &str) -> bool {
+    false
+}
+
+fn write_empty_chromium_bookmarks(profile_path: &Path) {
+    const EMPTY_BOOKMARKS_JSON: &str = r#"{"checksum":"","roots":{"bookmark_bar":{"children":[],"name":"Bookmarks bar","type":"folder"},"other":{"children":[],"name":"Other bookmarks","type":"folder"},"synced":{"children":[],"name":"Mobile bookmarks","type":"folder"}},"version":1}"#;
+    for bak in [
+        "Bookmarks.bak",
+        "AccountBookmarks.bak",
+        "BookmarkMergedSurfaceOrdering",
+        "EncryptedAccountBookmarks2",
+    ] {
+        let _ = fs::remove_file(profile_path.join(bak));
+    }
+    for bm in ["Bookmarks", "AccountBookmarks"] {
+        let p = profile_path.join(bm);
+        let _ = fs::write(p, EMPTY_BOOKMARKS_JSON);
+    }
+}
+
+fn scrub_profile_ntp_preferences(profile_path: &Path) {
+    let _ = fs::remove_file(profile_path.join("Secure Preferences"));
+    let pref_path = profile_path.join("Preferences");
+    let Ok(raw) = fs::read_to_string(&pref_path) else { return };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let mut changed = false;
+    if let Some(obj) = val.as_object_mut() {
+        let desired_ntp = serde_json::json!({
+            "custom_links_initialized": true,
+            "custom_links_list": [],
+            "num_personal_suggestions": 0,
+            "shortcuts_visible": false,
+            "use_most_visited": false
+        });
+        if obj.get("ntp") != Some(&desired_ntp) {
+            obj.insert("ntp".to_string(), desired_ntp);
+            changed = true;
+        }
+        for k in [
+            "NewTabPage",
+            "pinned_tabs",
+            "zero_suggest_list_data",
+            "zerosuggest",
+            "omnibox",
+            "saved_tab_groups",
+            "bookmark",
+            "account_info",
+            "account_values",
+            "sync",
+        ] {
+            if obj.remove(k).is_some() {
+                changed = true;
+            }
+        }
+        if let Some(edge_ntp) = obj.get_mut("edge").and_then(|v| v.as_object_mut()) {
+            let empty_arr = serde_json::json!([]);
+            if edge_ntp.get("ntp_quick_links") != Some(&empty_arr) {
+                edge_ntp.insert("ntp_quick_links".to_string(), empty_arr);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Ok(out) = serde_json::to_string(&val) {
+            let _ = fs::write(&pref_path, out);
+        }
+    }
+}
+
+fn all_user_local_appdata_dirs() -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let users_root = PathBuf::from(format!(r"{}\Users", sys_drive));
+    if let Ok(entries) = fs::read_dir(&users_root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let uname = entry.file_name().to_string_lossy().to_string();
+            let lower = uname.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "public" | "default" | "default user" | "all users" | "wdagutilityaccount"
+            ) {
+                continue;
+            }
+            let local_dir = p.join("AppData").join("Local");
+            if local_dir.is_dir() {
+                out.push((uname, local_dir));
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            let pb = PathBuf::from(trimmed);
+            if pb.is_dir() && !out.iter().any(|(_, existing)| existing == &pb) {
+                out.push(("current".to_string(), pb));
+            }
+        }
+    }
+    out
+}
+
+fn dir_has_leveldb_payload(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    let mut has_data = false;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if let Ok(meta) = p.metadata() {
+            if meta.is_file() && meta.len() > 0 {
+                let fname = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if fname.ends_with(".ldb") || fname.ends_with(".log") || fname.starts_with("manifest-") {
+                    has_data = true;
+                    break;
+                }
+            }
+        }
+    }
+    has_data
+}
+
+fn copy_dir_flat(src: &Path, dst: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(src) else { return false };
+    if fs::create_dir_all(dst).is_err() {
+        return false;
+    }
+    let mut copied_any = false;
+    for entry in entries.flatten() {
+        let sp = entry.path();
+        let dp = dst.join(entry.file_name());
+        if sp.is_file() {
+            let fname = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if fname == "lock" {
+                continue;
+            }
+            if fs::copy(&sp, &dp).is_ok() {
+                copied_any = true;
+            }
+        }
+    }
+    copied_any
+}
+
+fn sync_erp_indexeddb_for_profile(profile_path: &Path, user_tag: &str, browser_tag: &str, erp_hosts: &[String]) {
+    let idb_root = profile_path.join("IndexedDB");
+    let profile_name = profile_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Default".to_string());
+    let safe_slot: String = format!("{}__{}__{}", user_tag, browser_tag, profile_name)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let vault_root = data_dir().join("erp-vault").join(safe_slot);
+
+    for host in erp_hosts {
+        let clean_h = host.trim().trim_start_matches("www.").to_ascii_lowercase();
+        if clean_h.is_empty() || clean_h.contains(':') || clean_h.contains('/') {
+            continue;
+        }
+        let folder_name = format!("https_{}_0.indexeddb.leveldb", clean_h);
+        let live_dir = idb_root.join(&folder_name);
+        let backup_dir = vault_root.join(&folder_name);
+
+        if dir_has_leveldb_payload(&live_dir) {
+            let tmp_dir = vault_root.join(format!("{}.tmp", folder_name));
+            let _ = fs::remove_dir_all(&tmp_dir);
+            if copy_dir_flat(&live_dir, &tmp_dir) {
+                let _ = fs::remove_dir_all(&backup_dir);
+                let _ = fs::rename(&tmp_dir, &backup_dir);
+            }
+        } else if dir_has_leveldb_payload(&backup_dir) {
+            let _ = copy_dir_flat(&backup_dir, &live_dir);
+        }
+    }
+}
+
+/// Snapshots and self-heals the company ERP IndexedDB (`ElkhawagaDeviceDB`) across all
+/// local user profiles whenever Chrome or Edge is closed so accidental browser clears recover.
+pub fn protect_erp_browser_vault_if_closed() {
     if is_admin_mode() {
         return;
     }
-    let local_app_data = match std::env::var("LOCALAPPDATA") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => return,
-    };
-    const BROWSERS: [(&str, &str); 2] = [
-        ("chrome.exe", r"Google\Chrome\User Data"),
-        ("msedge.exe", r"Microsoft\Edge\User Data"),
+    let mut erp_hosts = read_config().erp_domains;
+    if !erp_hosts.iter().any(|d| d.eq_ignore_ascii_case(DEFAULT_ERP_DOMAIN)) {
+        erp_hosts.push(DEFAULT_ERP_DOMAIN.to_string());
+    }
+    const BROWSERS: [(&str, &str, &str); 2] = [
+        ("chrome.exe", "chrome", r"Google\Chrome\User Data"),
+        ("msedge.exe", "edge", r"Microsoft\Edge\User Data"),
     ];
-    const TRACE_FILES: [&str; 20] = [
+    let user_dirs = all_user_local_appdata_dirs();
+    for (exe, tag, rel_dir) in BROWSERS {
+        if is_process_running(exe) {
+            continue;
+        }
+        for (uname, local_app_data) in &user_dirs {
+            let user_data = local_app_data.join(rel_dir);
+            let Ok(entries) = fs::read_dir(&user_data) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name_str = entry.file_name().to_string_lossy().to_string();
+                if name_str != "Default" && !name_str.starts_with("Profile ") {
+                    continue;
+                }
+                sync_erp_indexeddb_for_profile(&path, uname, tag, &erp_hosts);
+            }
+        }
+    }
+}
+
+/// Removes local Chrome/Edge browsing history, Omnibox predictors, bookmarks, caches,
+/// open sessions/tabs, and saved passwords once the browser process has closed naturally,
+/// while preserving persistent cookies, LocalStorage, and IndexedDB device tokens
+/// (`elkhawaga_did`, `elkhawaga_device_token`, `ElkhawagaDeviceDB`) for company systems.
+pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
+    if is_admin_mode() {
+        return;
+    }
+    let user_dirs = all_user_local_appdata_dirs();
+    if user_dirs.is_empty() {
+        return;
+    }
+    let mut erp_hosts = read_config().erp_domains;
+    if !erp_hosts.iter().any(|d| d.eq_ignore_ascii_case(DEFAULT_ERP_DOMAIN)) {
+        erp_hosts.push(DEFAULT_ERP_DOMAIN.to_string());
+    }
+    const BROWSERS: [(&str, &str, &str); 2] = [
+        ("chrome.exe", "chrome", r"Google\Chrome\User Data"),
+        ("msedge.exe", "edge", r"Microsoft\Edge\User Data"),
+    ];
+    const TRACE_FILES: &[&str] = &[
         "History",
         "History-journal",
+        "History-wal",
+        "History-shm",
+        "History Provider Cache",
+        "HistoryEmbeddings",
+        "HistoryEmbeddings-journal",
+        "HistoryClustersCache",
         "Visited Links",
         "Top Sites",
         "Top Sites-journal",
+        "Top Sites-wal",
         "Shortcuts",
         "Shortcuts-journal",
+        "Shortcuts-wal",
+        "Network Action Predictor",
+        "Network Action Predictor-journal",
+        "Network Action Predictor-wal",
+        "WebAssistDatabase",
+        "WebAssistDatabase-journal",
         "Favicons",
         "Favicons-journal",
+        "Favicons-wal",
+        "Bookmarks",
+        "Bookmarks.bak",
+        "AccountBookmarks",
+        "AccountBookmarks.bak",
+        "EncryptedAccountBookmarks2",
+        "BookmarkMergedSurfaceOrdering",
         "Login Data",
         "Login Data-journal",
+        "Login Data-wal",
         "Login Data For Account",
         "Login Data For Account-journal",
+        "Login Data For Account-wal",
         "Web Data",
         "Web Data-journal",
+        "Web Data-wal",
+        "Account Web Data",
+        "Account Web Data-journal",
+        "Account Web Data-wal",
         "Current Session",
         "Current Tabs",
         "Last Session",
         "Last Tabs",
         "Media History",
+        "Media History-journal",
+        "DownloadMetadata",
+        "DIPS",
+        "DIPS-wal",
     ];
-    const TRACE_DIRS: [&str; 4] = [
+    const TRACE_DIRS: &[&str] = &[
+        "Sync Data",
+        "Accounts",
+        "shared_proto_db",
+        "Segmentation Platform",
+        "Collaboration",
+        "DataSharing",
+        "chrome_cart_db",
+        "commerce_subscription_db",
+        "discounts_db",
+        "discount_infos_db",
+        "parcel_tracking_db",
+        "optimization_guide_hint_cache_store",
         "Sessions",
+        "Sessions_Encrypted",
+        "Session Storage",
+        "EdgeSessions",
+        "EdgeJourneys",
+        "Collections",
+        "Workspaces",
+        "JumpListIcons",
+        "JumpListIconsOld",
+        "JumpListIconsMostVisited",
+        "JumpListIconsRecentClosed",
         "Cache",
         "Code Cache",
         "GPUCache",
     ];
 
-    for (exe, rel_dir) in BROWSERS {
-        if force_close_once {
-            let mut kill = Command::new("taskkill");
-            kill.args(["/F", "/IM", exe]);
-            let _ = hidden(&mut kill).output();
-        }
-        if is_process_running(exe) {
-            continue;
-        }
-        let user_data = local_app_data.join(rel_dir);
-        let Ok(entries) = fs::read_dir(&user_data) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str != "Default" && !name_str.starts_with("Profile ") {
-                continue;
-            }
-            for f in TRACE_FILES {
-                let _ = fs::remove_file(path.join(f));
-            }
-            for d in TRACE_DIRS {
-                let _ = fs::remove_dir_all(path.join(d));
-            }
-            if let Ok(idb_entries) = fs::read_dir(path.join("IndexedDB")) {
-                for idb in idb_entries.flatten() {
-                    let iname = idb.file_name().to_string_lossy().to_ascii_lowercase();
-                    if iname.contains("whatsapp") {
-                        let _ = fs::remove_dir_all(idb.path());
+    for (exe, tag, rel_dir) in BROWSERS {
+        let running = is_process_running(exe);
+        for (uname, local_app_data) in &user_dirs {
+            let user_data = local_app_data.join(rel_dir);
+            let Ok(entries) = fs::read_dir(&user_data) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let is_profile = name_str == "Default"
+                    || name_str.starts_with("Profile ")
+                    || (name_str != "System Profile"
+                        && (path.join("Preferences").is_file() || path.join("Bookmarks").is_file()));
+                if !is_profile {
+                    continue;
+                }
+                // Even if browser is currently open on update, empty out Bookmarks JSON files
+                // so they cannot survive on disk; full SQLite/LevelDB wipe runs as soon as it closes.
+                if running {
+                    write_empty_chromium_bookmarks(&path);
+                    continue;
+                }
+                sync_erp_indexeddb_for_profile(&path, uname, tag, &erp_hosts);
+                scrub_profile_ntp_preferences(&path);
+                for f in TRACE_FILES {
+                    let _ = fs::remove_file(path.join(f));
+                }
+                let _ = fs::remove_file(path.join("DIPS-wal"));
+                for d in TRACE_DIRS {
+                    let _ = fs::remove_dir_all(path.join(d));
+                }
+                write_empty_chromium_bookmarks(&path);
+                if let Ok(idb_entries) = fs::read_dir(path.join("IndexedDB")) {
+                    for idb in idb_entries.flatten() {
+                        let iname = idb.file_name().to_string_lossy().to_ascii_lowercase();
+                        if iname.contains("whatsapp") {
+                            let _ = fs::remove_dir_all(idb.path());
+                        }
                     }
                 }
             }
@@ -2850,6 +4809,7 @@ $res = @{
   phone = ''
   title = ''
   site = ''
+  in_preview = $false
   explorer = @()
 }
 
@@ -2957,7 +4917,8 @@ function Extract-PhoneFromText([string]$txt) {
   return ('+' + $digits)
 }
 
-$noiseRx = '^(WhatsApp|WhatsApp Web|واتساب|web\.whatsapp\.com|بحث|Search|Search or start new chat|Chats|دردشات|الكل|All|غير مقروءة|Unread|المفضلة|Favorites|المجموعات|Groups|online|متصل|متصل الآن|typing|يكتب|يكتب الآن|recording|يسجل|last seen.*|آخر ظهور.*|click here.*|اضغط هنا.*|انقر هنا.*|Get WhatsApp.*|تنزيل واتساب.*|End-to-end encrypted|تشفير تام.*|Select chats|تحديد الدردشات|Meta AI|Archive|الأرشيف|Locked chats|Archived|Send|إرسال|Add a caption.*|إضافة شرح.*)$'
+$noiseRx = '^(HTML5|Web Area|RootWebArea|WhatsApp|WhatsApp Web|واتساب|web\.whatsapp\.com|New tab|New Tab|تبويب جديد|علامة تبويب جديدة|Google Chrome|Microsoft Edge|Brave|Open|فتح|Choose File|اختر ملف|بحث|Search|Search or start new chat|البحث أو بدء دردشة جديدة|Chats|دردشات|الكل|All|غير مقروءة|Unread|المفضلة|Favorites|المجموعات|Groups|Status|الحالة|Channels|القنوات|Communities|المجتمعات|Settings|الإعدادات|Profile|الملف الشخصي|Attach|إرفاق|Menu|القائمة|online|متصل|متصل الآن|typing.*|يكتب.*|recording.*|يسجل.*|last seen.*|آخر ظهور.*|click here.*|اضغط هنا.*|انقر هنا.*|Get WhatsApp.*|تنزيل واتساب.*|End-to-end encrypted|تشفير تام.*|Select chats|تحديد الدردشات|Meta AI|Archive|الأرشيف|Locked chats|Archived|Send|إرسال|Close|إغلاق|Cancel|إلغاء|Type a message.*|اكتب رسالة.*|Add a caption.*|إضافة شرح.*|اكتب تعليق.*|موقع محظور.*)$'
+$previewHintRx = '^(Add a caption.*|إضافة شرح.*|اكتب تعليق.*|معاينة.*| Crop | اقتصاص )$'
 
 $fg = [WinProbe]::GetForegroundWindow()
 $wins = [WinProbe]::ListVisible()
@@ -3042,30 +5003,40 @@ if ($targetHwnd -ne [IntPtr]::Zero) {
         }
         if ($docs.Count -gt 0 -and $hasRect) {
           $doc = $docs[0]
+          $winW = [Math]::Max(1, ($winRc.Right - $winRc.Left))
           $cText = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
           $cBtn  = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
           $cHead = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Heading)
           $cLink = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Hyperlink)
-          $orCond = New-Object System.Windows.Automation.OrCondition($cText, $cBtn, $cHead, $cLink)
+          $cEdit = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
+          $orCond = New-Object System.Windows.Automation.OrCondition($cText, $cBtn, $cHead, $cLink, $cEdit)
           $nodes = $doc.FindAll([System.Windows.Automation.TreeScope]::Descendants, $orCond)
-          $limit = [Math]::Min($nodes.Count, 220)
+          $limit = [Math]::Min($nodes.Count, 260)
+          $headerCandidate = ''
           for ($i = 0; $i -lt $limit; $i++) {
             $el = $nodes[$i]
             $nm = ([string]$el.Current.Name).Trim()
             if (-not $nm -or $nm.Length -gt 120) { continue }
+            if ($nm -match $previewHintRx) {
+              $res.in_preview = $true
+              continue
+            }
             $rect = $el.Current.BoundingRectangle
-            $inTopBand = ($rect.Top -ge ($winRc.Top + 55)) -and ($rect.Top -le ($winRc.Top + 215))
+            if ($rect.Width -gt ($winW * 0.85)) { continue }
+            $inTopBand = ($rect.Top -ge ($winRc.Top + 62)) -and ($rect.Top -le ($winRc.Top + 195))
             $inPreviewBottom = ($rect.Top -ge ($winRc.Top + [int](($winRc.Bottom - $winRc.Top) * 0.72)))
             $ep = Extract-PhoneFromText $nm
             if ($ep -and (-not $res.phone) -and ($inTopBand -or $inPreviewBottom)) {
               $res.phone = $ep
             }
-            if (($inTopBand -or $inPreviewBottom) -and (-not $res.recipient) -and $nm.Length -ge 2 -and $nm -notmatch $noiseRx) {
-              if ($nm -notmatch '^\d{1,2}:\d{2}(\s*(AM|PM|ص|م))?$') {
-                $res.recipient = $nm
+            if ($inTopBand -and (-not $headerCandidate) -and $nm.Length -ge 2 -and $nm -notmatch $noiseRx) {
+              if ($nm -notmatch '^\d{1,2}:\d{2}(\s*(AM|PM|ص|م))?$' -and $nm -notmatch '^\d{1,4}$') {
+                $headerCandidate = $nm
               }
             }
-            if ($res.recipient -and $res.phone) { break }
+          }
+          if ($headerCandidate) {
+            $res.recipient = $headerCandidate
           }
         }
       }
@@ -3149,9 +5120,8 @@ $res | ConvertTo-Json -Compress
     p
 }
 
-/// Extracts active recipient name, phone number, site/title, and selected File Explorer items.
 #[cfg(windows)]
-pub fn query_active_upload_context(need_ocr: bool) -> (String, String, String, Vec<PathBuf>) {
+pub fn query_active_upload_context_ext(need_ocr: bool) -> (String, String, String, Vec<PathBuf>, bool) {
     let script_path = ensure_upload_context_script();
     let mut cmd = Command::new("powershell");
     cmd.args([
@@ -3166,11 +5136,11 @@ pub fn query_active_upload_context(need_ocr: bool) -> (String, String, String, V
         if need_ocr { "1" } else { "0" },
     ]);
     let Ok(out) = hidden(&mut cmd).output() else {
-        return (String::new(), String::new(), String::new(), Vec::new());
+        return (String::new(), String::new(), String::new(), Vec::new(), false);
     };
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (String::new(), String::new(), String::new(), Vec::new());
+        return (String::new(), String::new(), String::new(), Vec::new(), false);
     };
     let recip = v["recipient"].as_str().unwrap_or("").trim().to_string();
     let mut phone = v["phone"].as_str().unwrap_or("").trim().to_string();
@@ -3180,6 +5150,7 @@ pub fn query_active_upload_context(need_ocr: bool) -> (String, String, String, V
     let site = v["site"].as_str().unwrap_or("").trim().to_string();
     let title = v["title"].as_str().unwrap_or("").trim().to_string();
     let site_or_title = if !site.is_empty() { site } else { title };
+    let in_preview = v["in_preview"].as_bool().unwrap_or(false);
     let explorer = v["explorer"]
         .as_array()
         .map(|a| {
@@ -3190,12 +5161,138 @@ pub fn query_active_upload_context(need_ocr: bool) -> (String, String, String, V
                 .collect()
         })
         .unwrap_or_default();
-    (recip, phone, site_or_title, explorer)
+    (recip, phone, site_or_title, explorer, in_preview)
+}
+
+/// Extracts active recipient name, phone number, site/title, and selected File Explorer items.
+#[cfg(windows)]
+pub fn query_active_upload_context(need_ocr: bool) -> (String, String, String, Vec<PathBuf>) {
+    let (r, p, s, e, _) = query_active_upload_context_ext(need_ocr);
+    (r, p, s, e)
+}
+
+#[cfg(not(windows))]
+pub fn query_active_upload_context_ext(_need_ocr: bool) -> (String, String, String, Vec<PathBuf>, bool) {
+    (String::new(), String::new(), String::new(), Vec::new(), false)
 }
 
 #[cfg(not(windows))]
 pub fn query_active_upload_context(_need_ocr: bool) -> (String, String, String, Vec<PathBuf>) {
     (String::new(), String::new(), String::new(), Vec::new())
+}
+
+/// Fast Win32 check: returns true if the user's foreground window is File Explorer or Desktop
+/// (used to stage selected files right before Drag & Drop into a browser/WhatsApp).
+#[cfg(windows)]
+pub fn is_explorer_foreground() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> *mut std::ffi::c_void;
+    }
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_null() {
+            return false;
+        }
+        let mut cls_buf = [0u16; 64];
+        let len = GetClassNameW(fg as _, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
+        if len <= 0 {
+            return false;
+        }
+        let cls = String::from_utf16_lossy(&cls_buf[..len as usize]);
+        matches!(
+            cls.as_str(),
+            "CabinetWClass" | "ExploreWClass" | "Progman" | "WorkerW"
+        )
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_explorer_foreground() -> bool {
+    false
+}
+
+/// Queries currently selected file paths across open File Explorer windows (`Shell.Application`).
+#[cfg(windows)]
+pub fn query_selected_explorer_files() -> Vec<PathBuf> {
+    let ps = r#"$ErrorActionPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $out=@(); $sh=New-Object -ComObject Shell.Application; foreach($w in $sh.Windows()){ try { foreach($it in $w.Document.SelectedItems()){ $p=[string]$it.Path; if($p -and (Test-Path -LiteralPath $p -PathType Leaf)){ $out+=$p } } } catch {} }; $out | Select-Object -First 5 | ConvertTo-Json -Compress"#;
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps]);
+    let Ok(out) = hidden(&mut cmd).output() else {
+        return Vec::new();
+    };
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+        if let Some(arr) = v.as_array() {
+            return arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(PathBuf::from)
+                .filter(|p| p.is_file())
+                .collect();
+        }
+        if let Some(single) = v.as_str() {
+            let p = PathBuf::from(single);
+            if p.is_file() {
+                return vec![p];
+            }
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn query_selected_explorer_files() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Fallback safety net: scans common user folders (`Downloads`, `Desktop`, `Pictures\Screenshots`,
+/// `Documents`) for the most recently written non-temp file within `within_secs` seconds.
+pub fn find_recent_user_file(within_secs: u64) -> Option<PathBuf> {
+    let profile = std::env::var("USERPROFILE").ok()?;
+    let base = PathBuf::from(profile);
+    let dirs = [
+        base.join("Downloads"),
+        base.join("Desktop"),
+        base.join("Pictures").join("Screenshots"),
+        base.join("Documents"),
+    ];
+    let max_age = std::time::Duration::from_secs(within_secs);
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in &dirs {
+        let Ok(rd) = fs::read_dir(dir) else { continue };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            let lc = name.to_ascii_lowercase();
+            if lc.starts_with('.')
+                || lc.starts_with("~$")
+                || lc.ends_with(".tmp")
+                || lc.ends_with(".crdownload")
+                || lc.ends_with(".part")
+                || lc.ends_with(".lnk")
+                || lc.ends_with(".ini")
+            {
+                continue;
+            }
+            let Ok(meta) = ent.metadata() else { continue };
+            if !meta.is_file() || meta.len() == 0 || meta.len() > 64 * 1024 * 1024 {
+                continue;
+            }
+            let mtime = meta.modified().or_else(|_| meta.created()).ok()?;
+            let Ok(age) = mtime.elapsed() else { continue };
+            if age <= max_age {
+                if best.as_ref().map_or(true, |(bt, _)| mtime > *bt) {
+                    best = Some((mtime, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Normalizes a candidate phone string to `+<digits>` (rejecting short/long non-phone runs).
@@ -4279,7 +6376,7 @@ pub fn ensure_whatsapp_web_extension() {
     let manifest = r#"{
   "manifest_version": 3,
   "name": "IT ELKHAWGA DLP Monitor",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "permissions": [],
   "host_permissions": ["http://127.0.0.1:8788/*"],
   "background": { "service_worker": "background.js" },
@@ -4454,6 +6551,49 @@ pub fn ensure_whatsapp_web_extension() {
       }).catch(() => {});
     }
   }
+  const pendingWaPayloads = [];
+  let waFlushTimer = null;
+
+  function flushPendingWaPayloads() {
+    if (waFlushTimer) { clearTimeout(waFlushTimer); waFlushTimer = null; }
+    if (!pendingWaPayloads.length) return;
+    const batch = pendingWaPayloads.splice(0, pendingWaPayloads.length);
+    setTimeout(() => {
+      const fresh = getContext();
+      for (const item of batch) {
+        if (fresh.recipient_name) item.recipient_name = fresh.recipient_name;
+        if (fresh.recipient_phone) item.recipient_phone = fresh.recipient_phone;
+        if (fresh.page_url) item.page_url = fresh.page_url;
+        if (fresh.page_title) item.page_title = fresh.page_title;
+        sendPayload(item);
+      }
+    }, 1350);
+  }
+
+  function queueOrSendPayload(payload) {
+    if (location.hostname.includes('whatsapp.com')) {
+      pendingWaPayloads.push(payload);
+      if (waFlushTimer) clearTimeout(waFlushTimer);
+      waFlushTimer = setTimeout(flushPendingWaPayloads, 18000);
+    } else {
+      sendPayload(payload);
+    }
+  }
+
+  document.addEventListener('click', (e) => {
+    if (!pendingWaPayloads.length || !location.hostname.includes('whatsapp.com')) return;
+    const el = e.target && e.target.closest ? e.target.closest('[data-testid="send"], [aria-label="Send"], [aria-label="إرسال"], button, [role="button"]') : null;
+    if (!el) return;
+    const icon = el.querySelector ? el.querySelector('span[data-icon*="send"]') : null;
+    const lbl = cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || '');
+    if (icon || lbl === 'Send' || lbl === 'إرسال' || el.getAttribute('data-testid') === 'send') {
+      flushPendingWaPayloads();
+    } else if (/^(Close|إغلاق|Cancel|إلغاء)$/i.test(lbl) || (el.querySelector && el.querySelector('span[data-icon="x"], span[data-icon="x-viewer"]'))) {
+      pendingWaPayloads.length = 0;
+      if (waFlushTimer) { clearTimeout(waFlushTimer); waFlushTimer = null; }
+    }
+  }, true);
+
   function reportFiles(fileList, source) {
     if (!fileList || !fileList.length) return;
     const ctx = getContext();
@@ -4471,7 +6611,7 @@ pub fn ensure_whatsapp_web_extension() {
         recipient_phone: ctx.recipient_phone,
         page_url: ctx.page_url,
         page_title: ctx.page_title,
-        detection_source: source
+        detection_source: location.hostname.includes('whatsapp.com') ? (source + '_whatsapp') : source
       };
       if (f.size > 0 && f.size <= 50 * 1024 * 1024 && typeof FileReader !== 'undefined') {
         const reader = new FileReader();
@@ -4479,12 +6619,12 @@ pub fn ensure_whatsapp_web_extension() {
           const dataUrl = String(reader.result || '');
           const idx = dataUrl.indexOf(';base64,');
           basePayload.file_base64 = idx !== -1 ? dataUrl.slice(idx + 8) : '';
-          sendPayload(basePayload);
+          queueOrSendPayload(basePayload);
         };
-        reader.onerror = () => sendPayload(basePayload);
+        reader.onerror = () => queueOrSendPayload(basePayload);
         reader.readAsDataURL(f);
       } else {
-        sendPayload(basePayload);
+        queueOrSendPayload(basePayload);
       }
     }
   }

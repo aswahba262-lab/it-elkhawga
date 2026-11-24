@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-const POLL_SECONDS: u64 = 1;
+const POLL_SECONDS: u64 = 2;
 
 static SCREEN_WANTED: AtomicBool = AtomicBool::new(false);
 static STREAM_MODE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -18,6 +18,7 @@ static CAPTURE_STREAM_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static EVIDENCE_WANTED: AtomicBool = AtomicBool::new(false);
 static LAST_CAPTURE_POLL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_TAMPER_CHECK_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_TAMPER_ALERT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ALERT_QUEUE: std::sync::Mutex<std::collections::VecDeque<Value>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -27,6 +28,75 @@ static LAST_WA_CONTEXT: std::sync::Mutex<Option<(String, String, String, Instant
     std::sync::Mutex::new(None);
 static RECENT_EXT_UPLOADS: std::sync::Mutex<Vec<(String, Instant)>> =
     std::sync::Mutex::new(Vec::new());
+static CCTV_TASKS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+static CCTV_CGI_QUEUE: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+static CCTV_SCAN_WANTED: AtomicBool = AtomicBool::new(false);
+static CCTV_SCAN_BUSY: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug, Default)]
+struct CctvAudioBridgeSpec {
+    dvr_id: String,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    channel: u32,
+    until_ms: u64,
+}
+
+static CCTV_AUDIO_SPEC: std::sync::Mutex<Option<CctvAudioBridgeSpec>> = std::sync::Mutex::new(None);
+
+fn sync_cctv_tasks_from_value(val: Option<&Value>) {
+    let mut g = CCTV_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(arr) = val.and_then(|v| v.as_array()) {
+        *g = arr.clone();
+    } else {
+        g.clear();
+    }
+    let now_t = epoch_ms();
+    let mut next_audio: Option<CctvAudioBridgeSpec> = None;
+    for t in g.iter() {
+        let ch = t["audio_channel"].as_u64().unwrap_or(0) as u32;
+        let a_until = t["audio_until"].as_u64().unwrap_or(0);
+        if ch > 0 && a_until > now_t {
+            let dvr_id = t["dvr_id"].as_str().unwrap_or("").trim().to_string();
+            let host = t["host"].as_str().unwrap_or("").trim().to_string();
+            if !dvr_id.is_empty() && !host.is_empty() {
+                next_audio = Some(CctvAudioBridgeSpec {
+                    dvr_id,
+                    host,
+                    port: t["http_port"].as_u64().unwrap_or(80) as u16,
+                    username: t["username"].as_str().unwrap_or("admin").to_string(),
+                    password: t["password"].as_str().unwrap_or("").to_string(),
+                    channel: ch,
+                    until_ms: a_until,
+                });
+                break;
+            }
+        }
+    }
+    drop(g);
+    let mut ag = CCTV_AUDIO_SPEC.lock().unwrap_or_else(|e| e.into_inner());
+    *ag = next_audio;
+}
+
+fn enqueue_cctv_cgi_jobs(val: Option<&Value>) {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return;
+    };
+    if arr.is_empty() {
+        return;
+    }
+    let mut q = CCTV_CGI_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    for job in arr {
+        let jid = job["job_id"].as_str().unwrap_or("");
+        if !jid.is_empty() && !q.iter().any(|x| x["job_id"].as_str() == Some(jid)) {
+            if q.len() < 24 {
+                q.push(job.clone());
+            }
+        }
+    }
+}
 
 pub fn enqueue_client_alert(alert: Value) {
     if alert.is_null() {
@@ -107,18 +177,56 @@ fn clean_wa_title_recipient(title: &str) -> String {
     let lower = t.to_ascii_lowercase();
     if lower == "whatsapp"
         || lower == "whatsapp web"
+        || lower == "html5"
+        || lower == "web area"
+        || lower == "new tab"
         || lower == "open"
         || lower == "save as"
         || lower == "choose file"
         || lower == "file upload"
+        || lower.contains("it elkhawga")
         || t == "واتساب"
+        || t == "تبويب جديد"
+        || t == "علامة تبويب جديدة"
         || t == "فتح"
         || t == "حفظ باسم"
+        || t.starts_with("موقع محظور")
     {
         String::new()
     } else {
         t
     }
+}
+
+fn is_title_whatsapp(title: &str) -> bool {
+    let lc = title.to_ascii_lowercase();
+    (lc.contains("whatsapp") || title.contains("واتساب")) && !lc.contains("it elkhawga")
+}
+
+fn is_noise_recipient_label(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lc = t.to_ascii_lowercase();
+    matches!(
+        lc.as_str(),
+        "html5"
+            | "web area"
+            | "rootwebarea"
+            | "whatsapp"
+            | "whatsapp web"
+            | "new tab"
+            | "open"
+            | "choose file"
+            | "save as"
+            | "google chrome"
+            | "microsoft edge"
+            | "brave"
+    ) || matches!(
+        t,
+        "واتساب" | "فتح" | "تبويب جديد" | "علامة تبويب جديدة" | "إرسال" | "إغلاق"
+    ) || t.starts_with("موقع محظور")
 }
 
 fn capture_upload_target_screen(
@@ -127,12 +235,12 @@ fn capture_upload_target_screen(
     last_clean_wa_shot: &Option<(String, Instant)>,
 ) -> Option<String> {
     if is_wa && win.wa_hwnd != 0 {
-        if let Some(img) = crate::common::capture_window_base64(win.wa_hwnd, 1280) {
+        if let Some(img) = crate::common::capture_window_base64(win.wa_hwnd, 1366) {
             return Some(img);
         }
     }
     if win.browser_hwnd != 0 && (win.fg_is_browser || !is_wa) {
-        if let Some(img) = crate::common::capture_window_base64(win.browser_hwnd, 1280) {
+        if let Some(img) = crate::common::capture_window_base64(win.browser_hwnd, 1366) {
             return Some(img);
         }
     }
@@ -143,7 +251,7 @@ fn capture_upload_target_screen(
             }
         }
     }
-    capture_screen_base64()
+    crate::common::capture_screen_scaled_base64(1366).or_else(capture_screen_base64)
 }
 
 fn request_agent_evidence(timeout_ms: u64) -> Option<(Option<String>, Option<String>, String, String, String)> {
@@ -251,6 +359,8 @@ fn save_and_upload_dlp_file(
             .or_else(|| read_exact_file_bytes(file_path, MAX_FILE_BYTES as u64))?
     } else if !file_path.trim().is_empty() {
         read_exact_file_bytes(file_path, MAX_FILE_BYTES as u64)?
+    } else if let Some(recent_p) = crate::common::find_recent_user_file(25) {
+        read_exact_file_bytes(&recent_p.to_string_lossy(), MAX_FILE_BYTES as u64)?
     } else {
         return None;
     };
@@ -436,14 +546,14 @@ pub fn run_capture_agent() {
     // installed after the agent started), and re-enforced every 10 minutes in case it
     // was changed locally on the device.
     let mut last_pw = String::new();
+    let mut last_rd_srv = read_client().rustdesk_server;
+    let mut last_rd_key = read_client().rustdesk_key;
     let mut last_try: Option<std::time::Instant> = None;
     let mut last_ok: Option<std::time::Instant> = None;
     let mut cached_rd_id = String::new();
     let mut last_rd_check: Option<std::time::Instant> = None;
     let mut last_rd_report: Option<std::time::Instant> = None;
     let mut last_agent_wake: Option<std::time::Instant> = None;
-    let mut last_ephem = false;
-    let mut last_wipe: Option<std::time::Instant> = None;
     let mut last_mru_map: HashMap<String, (u64, std::path::PathBuf)> =
         crate::common::scan_comdlg_mru_entries()
             .into_iter()
@@ -460,22 +570,33 @@ pub fn run_capture_agent() {
     let mut last_clean_wa_shot: Option<(String, Instant)> = None;
     let mut cached_ctx: (String, String, String, Instant) =
         (String::new(), String::new(), String::new(), Instant::now());
+    let mut cached_wa_ctx: (String, String, Instant) =
+        (String::new(), String::new(), Instant::now());
+    let mut last_explorer_poll: Option<Instant> = None;
+    // Pending WhatsApp File-Dialog attachment waiting for the employee to press Send:
+    // (orig_path, staged_path, file_size, pre_recipient, pre_phone, attached_at, saw_preview, last_uia_poll, send_ready_at)
+    let mut pending_wa_dialog: Option<(
+        std::path::PathBuf,
+        Option<std::path::PathBuf>,
+        u64,
+        String,
+        String,
+        Instant,
+        bool,
+        Instant,
+        Option<Instant>,
+    )> = None;
     let local_http = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
     let mut last_clean_shot_at: Option<Instant> = None;
     let mut prev_dialog_seen = false;
     loop {
         let link = read_client();
-        let ephem = link.ephemeral_browser || read_config().ephemeral_browser;
-        if ephem != last_ephem {
-            crate::common::apply_ephemeral_browser_policy(ephem);
-            if ephem {
-                crate::common::wipe_browser_data_if_closed(true);
-                last_wipe = Some(std::time::Instant::now());
-            }
-            last_ephem = ephem;
-        } else if ephem && last_wipe.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
-            last_wipe = Some(std::time::Instant::now());
-            crate::common::wipe_browser_data_if_closed(false);
+        if link.rustdesk_server != last_rd_srv || link.rustdesk_key != last_rd_key {
+            last_rd_srv = link.rustdesk_server.clone();
+            last_rd_key = link.rustdesk_key.clone();
+            configure_rustdesk_server();
+            cached_rd_id.clear();
+            last_rd_check = None;
         }
         let pw = link.rustdesk_password.trim().to_string();
         if !pw.is_empty() {
@@ -642,41 +763,51 @@ pub fn run_capture_agent() {
                 was_browser_dialog_open = false;
             }
 
+            let _ = &mut last_explorer_poll;
             // Lightweight zero-PowerShell context tracking during normal browsing:
-            // read window title natively + lookup phone in local DB; only snapshot active
-            // foreground WhatsApp once every 12s, and only run PowerShell UIA (without OCR)
-            // at the moment an Open File dialog first appears.
             if (win.browser_open || win.wa_open)
-                && last_ctx_poll.map_or(true, |t| t.elapsed() >= Duration::from_millis(3000))
+                && last_ctx_poll.map_or(true, |t| t.elapsed() >= Duration::from_millis(3500))
             {
                 last_ctx_poll = Some(Instant::now());
                 let unobstructed_wa =
                     win.wa_open && !win.browser_open_dialog && !win.any_open_dialog && !win.save_dialog;
                 if unobstructed_wa
                     && win.fg_is_wa
-                    && last_clean_shot_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(12))
+                    && pending_wa_dialog.is_none()
+                    && last_clean_shot_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(15))
                 {
                     last_clean_shot_at = Some(Instant::now());
                     if let Some(clean_img) = if win.wa_hwnd != 0 {
-                        crate::common::capture_window_base64(win.wa_hwnd, 1024)
-                            .or_else(|| crate::common::capture_screen_scaled_base64(1024))
+                        crate::common::capture_window_base64(win.wa_hwnd, 1366)
+                            .or_else(|| crate::common::capture_screen_scaled_base64(1366))
                     } else {
-                        crate::common::capture_screen_scaled_base64(1024)
+                        crate::common::capture_screen_scaled_base64(1366)
                     } {
                         last_clean_wa_shot = Some((clean_img, Instant::now()));
                     }
                 }
                 let rc = clean_wa_title_recipient(&win.best_title);
                 let mut ph = normalize_extracted_phone(&rc);
-                if ph.is_empty() && !rc.is_empty() && win.wa_open {
+                let title_is_wa = is_title_whatsapp(&win.best_title);
+                if ph.is_empty() && !rc.is_empty() && (win.fg_is_wa || title_is_wa) {
                     if let Some(p) = crate::common::lookup_whatsapp_phone_by_name(&rc) {
                         ph = p;
                     }
                 }
+                if (win.fg_is_wa || title_is_wa) && !is_noise_recipient_label(&rc) {
+                    cached_wa_ctx = (
+                        rc.clone(),
+                        if !ph.is_empty() { ph.clone() } else { cached_wa_ctx.1.clone() },
+                        Instant::now(),
+                    );
+                }
                 let st = win.best_title.trim().to_string();
-                if !rc.is_empty() || !ph.is_empty() || !st.is_empty() {
+                if (!is_noise_recipient_label(&rc) || !ph.is_empty() || !st.is_empty())
+                    && st != "Open"
+                    && st != "فتح"
+                {
                     cached_ctx = (
-                        if !rc.is_empty() { rc } else { cached_ctx.0.clone() },
+                        if !is_noise_recipient_label(&rc) { rc } else { cached_ctx.0.clone() },
                         if !ph.is_empty() { ph } else { cached_ctx.1.clone() },
                         if !st.is_empty() { st } else { cached_ctx.2.clone() },
                         Instant::now(),
@@ -685,11 +816,19 @@ pub fn run_capture_agent() {
             }
 
             if dialog_just_opened {
-                let (rc, mut ph, st, exp_files) = crate::common::query_active_upload_context(false);
-                if ph.is_empty() && !rc.is_empty() && win.wa_open {
+                let (rc, mut ph, st, exp_files, _) = crate::common::query_active_upload_context_ext(false);
+                let dialog_for_wa = win.wa_open && (win.fg_is_wa || is_title_whatsapp(&st) || st.to_ascii_lowercase().contains("whatsapp"));
+                if ph.is_empty() && !rc.is_empty() && dialog_for_wa {
                     if let Some(p) = crate::common::lookup_whatsapp_phone_by_name(&rc) {
                         ph = p;
                     }
+                }
+                if dialog_for_wa && !is_noise_recipient_label(&rc) {
+                    cached_wa_ctx = (
+                        rc.clone(),
+                        if !ph.is_empty() { ph.clone() } else { cached_wa_ctx.1.clone() },
+                        Instant::now(),
+                    );
                 }
                 if let Some(p) = exp_files.into_iter().next() {
                     if last_explorer_path.as_ref() != Some(&p) {
@@ -700,9 +839,12 @@ pub fn run_capture_agent() {
                         last_explorer_path = Some(p);
                     }
                 }
-                if !rc.is_empty() || !ph.is_empty() || !st.is_empty() {
+                if (!is_noise_recipient_label(&rc) || !ph.is_empty() || !st.is_empty())
+                    && st != "Open"
+                    && st != "فتح"
+                {
                     cached_ctx = (
-                        if !rc.is_empty() { rc } else { cached_ctx.0.clone() },
+                        if !is_noise_recipient_label(&rc) { rc } else { cached_ctx.0.clone() },
                         if !ph.is_empty() { ph } else { cached_ctx.1.clone() },
                         if !st.is_empty() { st } else { cached_ctx.2.clone() },
                         Instant::now(),
@@ -710,17 +852,19 @@ pub fn run_capture_agent() {
                 }
             }
 
-            let mru_entries = crate::common::scan_comdlg_mru_entries();
             let mut updated_mru: Option<(String, u64, std::path::PathBuf)> = None;
-            for (subk, wt, pb) in mru_entries {
-                let changed = match last_mru_map.get(&subk) {
-                    Some((prev_wt, prev_pb)) => wt > *prev_wt || *prev_pb != pb,
-                    None => true,
-                };
-                if changed {
-                    last_mru_map.insert(subk.clone(), (wt, pb.clone()));
-                    if updated_mru.as_ref().map_or(true, |(_, best_wt, _)| wt >= *best_wt) {
-                        updated_mru = Some((subk, wt, pb));
+            if win.browser_open_dialog || win.any_open_dialog || prev_browser_dialog || was_browser_dialog_open {
+                let mru_entries = crate::common::scan_comdlg_mru_entries();
+                for (subk, wt, pb) in mru_entries {
+                    let changed = match last_mru_map.get(&subk) {
+                        Some((prev_wt, prev_pb)) => wt > *prev_wt || *prev_pb != pb,
+                        None => true,
+                    };
+                    if changed {
+                        last_mru_map.insert(subk.clone(), (wt, pb.clone()));
+                        if updated_mru.as_ref().map_or(true, |(_, best_wt, _)| wt >= *best_wt) {
+                            updated_mru = Some((subk, wt, pb));
+                        }
                     }
                 }
             }
@@ -758,8 +902,6 @@ pub fn run_capture_agent() {
                         .map_or(false, |(prev, t)| prev == &flc && t.elapsed() < Duration::from_secs(9))
                         || (!recent_ext_file.is_empty() && recent_ext_file.eq_ignore_ascii_case(&fname));
                     if !dup {
-                        // Wait until #32770 File Open closes completely, then settle 850ms so
-                        // WhatsApp Web's attachment preview / chat window renders cleanly.
                         let wait_start = Instant::now();
                         while wait_start.elapsed() < Duration::from_millis(2200) {
                             let w = crate::common::inspect_upload_windows_ext();
@@ -768,61 +910,70 @@ pub fn run_capture_agent() {
                             }
                             std::thread::sleep(Duration::from_millis(150));
                         }
-                        std::thread::sleep(Duration::from_millis(850));
+                        std::thread::sleep(Duration::from_millis(650));
 
                         let win_now = crate::common::inspect_upload_windows_ext();
-                        let is_wa_ctx = win_now.wa_open || wa_active || win_now.fg_is_wa;
-                        let (mut r_name, mut r_phone, mut page_site, _) =
-                            crate::common::query_active_upload_context(true);
-                        if r_name.is_empty() && cached_ctx.3.elapsed() <= Duration::from_secs(120) {
-                            r_name = cached_ctx.0.clone();
-                        }
-                        if r_phone.is_empty()
-                            && cached_ctx.3.elapsed() <= Duration::from_secs(120)
-                            && (r_name.is_empty() || r_name == cached_ctx.0)
-                        {
-                            r_phone = cached_ctx.1.clone();
-                        }
-                        if r_name.is_empty() {
-                            r_name = clean_wa_title_recipient(&win_now.best_title);
-                        }
-                        if r_phone.is_empty() && !r_name.is_empty() && is_wa_ctx {
-                            if let Some(ph) = crate::common::lookup_whatsapp_phone_by_name(&r_name) {
-                                r_phone = ph;
+                        let (mut r_name, mut r_phone, mut page_site, _, in_wa_prev) =
+                            crate::common::query_active_upload_context_ext(false);
+                        let is_wa_target = win_now.wa_open
+                            && (win_now.fg_is_wa
+                                || is_title_whatsapp(&win_now.best_title)
+                                || is_title_whatsapp(&page_site)
+                                || page_site.to_ascii_lowercase().contains("whatsapp"));
+
+                        if is_wa_target {
+                            // Stage & defer screenshot until the employee actually presses Send
+                            // and WhatsApp closes the attachment preview back into the chat view!
+                            if is_noise_recipient_label(&r_name) && cached_wa_ctx.2.elapsed() <= Duration::from_secs(180) {
+                                r_name = cached_wa_ctx.0.clone();
                             }
+                            if r_phone.is_empty() && cached_wa_ctx.2.elapsed() <= Duration::from_secs(180) {
+                                r_phone = cached_wa_ctx.1.clone();
+                            }
+                            pending_wa_dialog = Some((
+                                p.clone(),
+                                staged.clone(),
+                                fsize,
+                                r_name,
+                                r_phone,
+                                Instant::now(),
+                                in_wa_prev,
+                                Instant::now(),
+                                None,
+                            ));
+                        } else {
+                            if is_noise_recipient_label(&r_name) && cached_ctx.3.elapsed() <= Duration::from_secs(120) {
+                                r_name = cached_ctx.0.clone();
+                            }
+                            if page_site.is_empty() || page_site == "Open" || page_site == "فتح" {
+                                page_site = if !cached_ctx.2.is_empty() && cached_ctx.2 != "Open" && cached_ctx.2 != "فتح" {
+                                    cached_ctx.2.clone()
+                                } else {
+                                    win_now.best_title.clone()
+                                };
+                            }
+                            std::thread::sleep(Duration::from_millis(500));
+                            let win_web = crate::common::inspect_upload_windows_ext();
+                            let shot = capture_upload_target_screen(&win_web, false, &last_clean_wa_shot)
+                                .or_else(|| captured_now.clone());
+                            let cam = crate::common::capture_webcam_base64();
+                            let fpath_str = p.to_string_lossy().to_string();
+                            let staged_str = staged.as_ref().map(|s| s.to_string_lossy().to_string());
+                            send_whatsapp_upload_report(
+                                &fname,
+                                fsize,
+                                &fpath_str,
+                                staged_str.as_deref(),
+                                &r_name,
+                                &r_phone,
+                                &page_site,
+                                "capture_web_dialog",
+                                shot.as_deref(),
+                                cam.as_deref(),
+                                None,
+                            );
+                            last_wa_alert = Some((flc, Instant::now()));
                         }
-                        if page_site.is_empty() {
-                            page_site = if !cached_ctx.2.is_empty() {
-                                cached_ctx.2.clone()
-                            } else {
-                                win_now.best_title.clone()
-                            };
-                        }
-                        let shot = capture_upload_target_screen(&win_now, is_wa_ctx, &last_clean_wa_shot)
-                            .or_else(|| captured_now.clone());
-                        let cam = crate::common::capture_webcam_base64();
-                        if let Some(ref img) = shot {
-                            let upload_agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
-                            let _ = upload_agent
-                                .post(&format!("http://{}/local/screenshot", LOCAL_API_ADDR))
-                                .send_json(json!({"image": img}));
-                        }
-                        let fpath_str = p.to_string_lossy().to_string();
-                        let staged_str = staged.as_ref().map(|s| s.to_string_lossy().to_string());
-                        send_whatsapp_upload_report(
-                            &fname,
-                            fsize,
-                            &fpath_str,
-                            staged_str.as_deref(),
-                            &r_name,
-                            &r_phone,
-                            &page_site,
-                            "capture_file_dialog",
-                            shot.as_deref(),
-                            cam.as_deref(),
-                            None,
-                        );
-                        last_wa_alert = Some((flc, Instant::now()));
                     }
                 }
             }
@@ -851,81 +1002,83 @@ pub fn run_capture_agent() {
             }
             last_clip_seq = cur_clip_seq;
 
-            if let Some((proxy_host, proxy_bytes)) = wa_proxy_upload {
-                if win.wa_open || win.fg_is_wa || wa_active {
-                    let candidate = recent_candidate_file
-                        .as_ref()
-                        .filter(|(_, _, _, _, t)| t.elapsed() <= Duration::from_secs(90))
-                        .cloned();
-                    let (fname, fsize, fpath, staged_str, src) = match candidate {
-                        Some((p, stg, sz, src_tag, _)) => (
-                            p.file_name().and_then(|n| n.to_str()).unwrap_or("ملف").to_string(),
-                            if sz > 0 { sz } else { proxy_bytes },
-                            p.to_string_lossy().to_string(),
-                            stg.map(|s| s.to_string_lossy().to_string()),
-                            format!("capture_{}_and_proxy", src_tag),
-                        ),
-                        None => (
-                            format!("محتوى/صورة مرفوعة على واتساب ({})", proxy_host),
-                            proxy_bytes,
-                            String::new(),
-                            None,
-                            "capture_proxy_media_upload".to_string(),
-                        ),
-                    };
+            // Advance pending WhatsApp File-Dialog send watcher so screenshot happens
+            // right AFTER Send closes the attachment preview and returns to the chat thread!
+            let mut wa_proxy_consumed = false;
+            if let Some(ref mut pend) = pending_wa_dialog {
+                fast_dialog_poll = true;
+                if wa_proxy_upload.is_some() && pend.8.is_none() {
+                    pend.8 = Some(Instant::now());
+                    wa_proxy_consumed = true;
+                } else if pend.8.is_none() && pend.7.elapsed() >= Duration::from_millis(900) {
+                    pend.7 = Instant::now();
+                    let (rc_chk, ph_chk, _, _, now_preview) =
+                        crate::common::query_active_upload_context_ext(false);
+                    if !is_noise_recipient_label(&rc_chk) {
+                        pend.3 = rc_chk;
+                    }
+                    if !ph_chk.is_empty() {
+                        pend.4 = ph_chk;
+                    }
+                    if now_preview {
+                        pend.6 = true;
+                    } else if pend.6 || pend.5.elapsed() >= Duration::from_secs(8) {
+                        pend.8 = Some(Instant::now());
+                    }
+                }
+                if pend.5.elapsed() >= Duration::from_secs(35) && pend.8.is_none() {
+                    pend.8 = Some(Instant::now());
+                }
+            }
+            if pending_wa_dialog
+                .as_ref()
+                .and_then(|p| p.8)
+                .map_or(false, |t| t.elapsed() >= Duration::from_millis(1150))
+            {
+                if let Some((p_path, stg_opt, p_sz, pre_rc, pre_ph, _, _, _, _)) = pending_wa_dialog.take() {
+                    let fname = p_path.file_name().and_then(|n| n.to_str()).unwrap_or("ملف").to_string();
                     let flc = fname.to_ascii_lowercase();
-                    let dup = last_wa_alert
-                        .as_ref()
-                        .map_or(false, |(prev, t)| prev == &flc && t.elapsed() < Duration::from_secs(9))
-                        || (!recent_ext_file.is_empty() && recent_ext_file.eq_ignore_ascii_case(&fname));
+                    let dup = (!recent_ext_file.is_empty() && recent_ext_file.eq_ignore_ascii_case(&fname))
+                        || last_wa_alert.as_ref().map_or(false, |(prev, t)| prev == &flc && t.elapsed() < Duration::from_secs(8));
                     if !dup {
-                        // Allow WhatsApp Web to transition from attachment preview back to the chat thread.
-                        std::thread::sleep(Duration::from_millis(950));
                         let win_now = crate::common::inspect_upload_windows_ext();
-                        let (mut r_name, mut r_phone, mut page_site, _) =
-                            crate::common::query_active_upload_context(true);
-                        if r_name.is_empty() && cached_ctx.3.elapsed() <= Duration::from_secs(120) {
-                            r_name = cached_ctx.0.clone();
-                        }
-                        if r_phone.is_empty()
-                            && cached_ctx.3.elapsed() <= Duration::from_secs(120)
-                            && (r_name.is_empty() || r_name == cached_ctx.0)
-                        {
-                            r_phone = cached_ctx.1.clone();
-                        }
-                        if r_name.is_empty() {
-                            r_name = clean_wa_title_recipient(&win_now.best_title);
-                        }
-                        if r_phone.is_empty() && !r_name.is_empty() {
-                            if let Some(ph) = crate::common::lookup_whatsapp_phone_by_name(&r_name) {
-                                r_phone = ph;
-                            }
-                        }
-                        if page_site.is_empty() {
-                            page_site = if !cached_ctx.2.is_empty() {
-                                cached_ctx.2.clone()
+                        let (mut r_name, mut r_phone, mut page_site, _, _) =
+                            crate::common::query_active_upload_context_ext(true);
+                        if is_noise_recipient_label(&r_name) {
+                            r_name = if !is_noise_recipient_label(&pre_rc) {
+                                pre_rc
+                            } else if cached_wa_ctx.2.elapsed() <= Duration::from_secs(180) {
+                                cached_wa_ctx.0.clone()
                             } else {
-                                win_now.best_title.clone()
+                                clean_wa_title_recipient(&win_now.best_title)
                             };
                         }
-                        let shot = capture_upload_target_screen(&win_now, true, &last_clean_wa_shot)
-                            .or(captured_now);
-                        let cam = crate::common::capture_webcam_base64();
-                        if let Some(ref img) = shot {
-                            let upload_agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
-                            let _ = upload_agent
-                                .post(&format!("http://{}/local/screenshot", LOCAL_API_ADDR))
-                                .send_json(json!({"image": img}));
+                        if r_phone.is_empty() {
+                            r_phone = if !pre_ph.is_empty() {
+                                pre_ph
+                            } else if !r_name.is_empty() {
+                                crate::common::lookup_whatsapp_phone_by_name(&r_name).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
                         }
+                        if page_site.is_empty() || page_site == "Open" || page_site == "فتح" {
+                            page_site = "https://web.whatsapp.com".to_string();
+                        }
+                        let shot = capture_upload_target_screen(&win_now, true, &last_clean_wa_shot)
+                            .or_else(|| captured_now.clone());
+                        let cam = crate::common::capture_webcam_base64();
+                        let fpath_str = p_path.to_string_lossy().to_string();
+                        let staged_str = stg_opt.as_ref().map(|s| s.to_string_lossy().to_string());
                         send_whatsapp_upload_report(
                             &fname,
-                            fsize,
-                            &fpath,
+                            p_sz,
+                            &fpath_str,
                             staged_str.as_deref(),
                             &r_name,
                             &r_phone,
                             &page_site,
-                            &src,
+                            "capture_whatsapp_dialog_sent",
                             shot.as_deref(),
                             cam.as_deref(),
                             None,
@@ -934,8 +1087,91 @@ pub fn run_capture_agent() {
                     }
                 }
             }
+
+            if !wa_proxy_consumed {
+                if let Some((_proxy_host, proxy_bytes)) = wa_proxy_upload {
+                    if win.wa_open || win.fg_is_wa {
+                        let candidate = recent_candidate_file
+                            .as_ref()
+                            .filter(|(_, _, _, _, t)| t.elapsed() <= Duration::from_secs(120))
+                            .cloned()
+                            .or_else(|| {
+                                crate::common::find_recent_user_file(25).map(|rp| {
+                                    let sz = std::fs::metadata(&rp).map(|m| m.len()).unwrap_or(proxy_bytes);
+                                    let stg = stage_user_session_file(&rp);
+                                    (rp, stg, sz, "recent_folder".to_string(), Instant::now())
+                                })
+                            });
+                        // Require either a real staged file OR active foreground WhatsApp upload >= 32 KB
+                        if candidate.is_some() || (win.fg_is_wa && proxy_bytes >= 32 * 1024) {
+                            let (fname, fsize, fpath, staged_str, src) = match candidate {
+                                Some((p, stg, sz, src_tag, _)) => (
+                                    p.file_name().and_then(|n| n.to_str()).unwrap_or("ملف").to_string(),
+                                    if sz > 0 { sz } else { proxy_bytes },
+                                    p.to_string_lossy().to_string(),
+                                    stg.map(|s| s.to_string_lossy().to_string()),
+                                    format!("capture_whatsapp_{}", src_tag),
+                                ),
+                                None => (
+                                    "رسالة وسائط مباشرة عبر واتساب".to_string(),
+                                    proxy_bytes,
+                                    String::new(),
+                                    None,
+                                    "capture_whatsapp_direct_media".to_string(),
+                                ),
+                            };
+                            let flc = fname.to_ascii_lowercase();
+                            let dup = last_wa_alert
+                                .as_ref()
+                                .map_or(false, |(prev, t)| prev == &flc && t.elapsed() < Duration::from_secs(9))
+                                || (!recent_ext_file.is_empty() && recent_ext_file.eq_ignore_ascii_case(&fname));
+                            if !dup {
+                                // Settle 1.15s after mmg.whatsapp.net upload finishes so preview closes back to chat
+                                std::thread::sleep(Duration::from_millis(1150));
+                                let win_now = crate::common::inspect_upload_windows_ext();
+                                let (mut r_name, mut r_phone, mut page_site, _, _) =
+                                    crate::common::query_active_upload_context_ext(true);
+                                if is_noise_recipient_label(&r_name) && cached_wa_ctx.2.elapsed() <= Duration::from_secs(180) {
+                                    r_name = cached_wa_ctx.0.clone();
+                                }
+                                if is_noise_recipient_label(&r_name) {
+                                    r_name = clean_wa_title_recipient(&win_now.best_title);
+                                }
+                                if r_phone.is_empty() && !r_name.is_empty() {
+                                    if let Some(ph) = crate::common::lookup_whatsapp_phone_by_name(&r_name) {
+                                        r_phone = ph;
+                                    }
+                                }
+                                if r_phone.is_empty() && cached_wa_ctx.2.elapsed() <= Duration::from_secs(180) {
+                                    r_phone = cached_wa_ctx.1.clone();
+                                }
+                                if page_site.is_empty() || page_site == "Open" || page_site == "فتح" {
+                                    page_site = "https://web.whatsapp.com".to_string();
+                                }
+                                let shot = capture_upload_target_screen(&win_now, true, &last_clean_wa_shot)
+                                    .or(captured_now);
+                                let cam = crate::common::capture_webcam_base64();
+                                send_whatsapp_upload_report(
+                                    &fname,
+                                    fsize,
+                                    &fpath,
+                                    staged_str.as_deref(),
+                                    &r_name,
+                                    &r_phone,
+                                    &page_site,
+                                    &src,
+                                    shot.as_deref(),
+                                    cam.as_deref(),
+                                    None,
+                                );
+                                last_wa_alert = Some((flc, Instant::now()));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        std::thread::sleep(Duration::from_millis(if fast_dialog_poll { 350 } else { 650 }));
+        std::thread::sleep(Duration::from_millis(if fast_dialog_poll { 350 } else { 1000 }));
     }
 }
 
@@ -963,20 +1199,10 @@ fn start_usb_monitor() {
                     });
                     enqueue_client_alert(alert);
 
-                    if read_config().usb_block {
-                        let mut reg = std::process::Command::new("reg");
-                        reg.args([
-                            "add",
-                            r"HKLM\SYSTEM\CurrentControlSet\Services\USBSTOR",
-                            "/v",
-                            "Start",
-                            "/t",
-                            "REG_DWORD",
-                            "/d",
-                            "4",
-                            "/f",
-                        ]);
-                        let _ = crate::common::hidden(&mut reg).output();
+                    let cur_cfg = read_config();
+                    let cur_link = read_client();
+                    if crate::common::is_usb_effectively_blocked(&cur_cfg, &cur_link) {
+                        crate::common::apply_usb_storage_policy(true);
                     }
                 }
             }
@@ -1022,10 +1248,284 @@ pub fn run() {
         let _ = apply_block("startup sync");
     }
 
-    let http = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).build();
+    // Run Clean Browser HKLM policy enforcement & post-close trace cleanup inside the
+    // elevated SYSTEM `--agent` process so Registry updates never hit Access Denied.
+    if !is_admin_mode() {
+        std::thread::spawn(|| {
+            let init_ephem = read_client().ephemeral_browser || read_config().ephemeral_browser;
+            crate::common::apply_ephemeral_browser_policy(init_ephem);
+            crate::common::enforce_rustdesk_employee_lockdown(&read_client().rustdesk_password);
+            if init_ephem {
+                crate::common::wipe_browser_data_if_closed(false);
+            } else {
+                crate::common::protect_erp_browser_vault_if_closed();
+            }
+            let mut last_ephem = init_ephem;
+            let mut was_chrome_open = crate::common::is_process_running("chrome.exe");
+            let mut was_edge_open = crate::common::is_process_running("msedge.exe");
+            let mut last_rd_lock_tick = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let link_now = read_client();
+                let ephem = link_now.ephemeral_browser || read_config().ephemeral_browser;
+                if ephem != last_ephem {
+                    crate::common::apply_ephemeral_browser_policy(ephem);
+                    if ephem {
+                        crate::common::wipe_browser_data_if_closed(false);
+                    }
+                    last_ephem = ephem;
+                }
+                let chrome_open = crate::common::is_process_running("chrome.exe");
+                let edge_open = crate::common::is_process_running("msedge.exe");
+                let browser_just_closed = (was_chrome_open && !chrome_open) || (was_edge_open && !edge_open);
+                was_chrome_open = chrome_open;
+                was_edge_open = edge_open;
+
+                if browser_just_closed {
+                    // Wait 1.2s so Chrome/Edge finishes flushing persistent ERP cookies/storage on exit
+                    std::thread::sleep(Duration::from_millis(1200));
+                    if ephem {
+                        crate::common::wipe_browser_data_if_closed(false);
+                    } else {
+                        crate::common::protect_erp_browser_vault_if_closed();
+                    }
+                }
+                if last_rd_lock_tick.elapsed() >= Duration::from_secs(600) {
+                    last_rd_lock_tick = Instant::now();
+                    crate::common::enforce_rustdesk_employee_lockdown(&link_now.rustdesk_password);
+                }
+            }
+        });
+
+        // On-demand Dahua DVR Branch Bridge worker: strictly 0% CPU and 0 B/s when idle;
+        // streams lightweight JPEG snapshots to the Relay only while an admin has an active lease.
+        std::thread::spawn(|| {
+            let bridge_relay = RelayClient::new();
+            loop {
+                if CCTV_SCAN_WANTED.swap(false, Ordering::SeqCst)
+                    && !CCTV_SCAN_BUSY.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::spawn(|| {
+                        let found = crate::common::scan_local_subnet_for_dahua();
+                        let link = read_client();
+                        if !link.relay_url.trim().is_empty() && !link.device_token.trim().is_empty() {
+                            let _ = RelayClient::new().upload_cctv_scan(&link.relay_url, &link.device_token, &found);
+                        }
+                        CCTV_SCAN_BUSY.store(false, Ordering::SeqCst);
+                    });
+                }
+
+                let pending_cgi: Vec<Value> = {
+                    let mut q = CCTV_CGI_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    std::mem::take(&mut *q)
+                };
+                if !pending_cgi.is_empty() {
+                    for job in pending_cgi {
+                        std::thread::spawn(move || {
+                            let jid = job["job_id"].as_str().unwrap_or("").to_string();
+                            let host = job["host"].as_str().unwrap_or("").to_string();
+                            let port = job["http_port"].as_u64().unwrap_or(80) as u16;
+                            let user = job["username"].as_str().unwrap_or("admin").to_string();
+                            let pass = job["password"].as_str().unwrap_or("").to_string();
+                            let path = job["path"].as_str().unwrap_or("").to_string();
+                            let max_b = job["max_bytes"].as_u64().unwrap_or(262_144);
+                            let t_ms = job["timeout_ms"].as_u64().unwrap_or(8_000);
+                            if jid.is_empty() {
+                                return;
+                            }
+                            let payload = match crate::common::execute_dahua_cgi(&host, port, &path, &user, &pass, max_b, t_ms) {
+                                Ok((code, ct, bytes)) => json!({
+                                    "job_id": jid,
+                                    "status": code,
+                                    "content_type": ct,
+                                    "body_b64": crate::common::base64_encode(&bytes),
+                                    "error": "",
+                                }),
+                                Err(e) => json!({
+                                    "job_id": jid,
+                                    "status": 0,
+                                    "content_type": "",
+                                    "body_b64": "",
+                                    "error": e,
+                                }),
+                            };
+                            let link = read_client();
+                            if !link.relay_url.trim().is_empty() && !link.device_token.trim().is_empty() {
+                                let _ = RelayClient::new().upload_cctv_cgi(&link.relay_url, &link.device_token, &payload);
+                            }
+                        });
+                    }
+                }
+
+                let now_t = epoch_ms();
+                let active_tasks: Vec<Value> = {
+                    let mut g = CCTV_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+                    g.retain(|t| t["until"].as_u64().unwrap_or(0) > now_t);
+                    g.clone()
+                };
+
+                if active_tasks.is_empty() {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+
+                let link = read_client();
+                if link.relay_url.trim().is_empty() || link.device_token.trim().is_empty() {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
+                let mut total_channels = 0usize;
+                for task in &active_tasks {
+                    let dvr_id = task["dvr_id"].as_str().unwrap_or("").trim().to_string();
+                    let host = task["host"].as_str().unwrap_or("").trim().to_string();
+                    let port = task["http_port"].as_u64().unwrap_or(80) as u16;
+                    let username = task["username"].as_str().unwrap_or("admin").to_string();
+                    let password = task["password"].as_str().unwrap_or("").to_string();
+                    let hd = task["hd"].as_bool().unwrap_or(false);
+                    let channels: Vec<u32> = task["channels"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
+                        .unwrap_or_else(|| vec![1]);
+                    if dvr_id.is_empty() || host.is_empty() || channels.is_empty() {
+                        continue;
+                    }
+                    total_channels += channels.len();
+                    for chunk in channels.chunks(4) {
+                        std::thread::scope(|s| {
+                            for &ch in chunk {
+                                let dvr_id_ref = &dvr_id;
+                                let host_ref = &host;
+                                let user_ref = &username;
+                                let pass_ref = &password;
+                                let relay_ref = &bridge_relay;
+                                let r_url = &link.relay_url;
+                                let d_tok = &link.device_token;
+                                s.spawn(move || {
+                                    let payload = match crate::common::fetch_dahua_snapshot(host_ref, port, user_ref, pass_ref, ch, hd) {
+                                        Ok(bytes) => json!({
+                                            "dvr_id": dvr_id_ref,
+                                            "channel": ch,
+                                            "hd": hd,
+                                            "image": crate::common::base64_encode(&bytes),
+                                            "error": "",
+                                        }),
+                                        Err(err) => json!({
+                                            "dvr_id": dvr_id_ref,
+                                            "channel": ch,
+                                            "hd": hd,
+                                            "image": "",
+                                            "error": err,
+                                        }),
+                                    };
+                                    if let Some(resp) = relay_ref.upload_cctv_frame(r_url, d_tok, &payload) {
+                                        if let Some(updated) = resp.get("cctv_tasks") {
+                                            sync_cctv_tasks_from_value(if updated.is_null() { None } else { Some(updated) });
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+
+                let pace_ms = if total_channels <= 1 { 180 } else { 240 };
+                std::thread::sleep(Duration::from_millis(pace_ms));
+            }
+        });
+
+        // Dedicated zero-CPU on-demand Dahua Live Audio reader: sleeps 100% idle when muted,
+        // opens a single ~3 KB/s local socket when an admin clicks `🔊`, and closes immediately on mute.
+        std::thread::spawn(move || {
+            let audio_relay = RelayClient::new();
+            loop {
+                let spec_opt = {
+                    let g = CCTV_AUDIO_SPEC.lock().unwrap_or_else(|e| e.into_inner());
+                    g.clone()
+                };
+                let now_t = epoch_ms();
+                let Some(spec) = spec_opt.filter(|s| s.channel > 0 && s.until_ms > now_t) else {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                let link = read_client();
+                if link.relay_url.trim().is_empty() || link.device_token.trim().is_empty() {
+                    std::thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
+                let target_dvr = spec.dvr_id.clone();
+                let target_ch = spec.channel;
+                let r_url = link.relay_url.clone();
+                let d_tok = link.device_token.clone();
+
+                let res = crate::common::stream_dahua_audio_live(
+                    &spec.host,
+                    spec.port,
+                    &spec.username,
+                    &spec.password,
+                    spec.channel,
+                    || {
+                        let g = CCTV_AUDIO_SPEC.lock().unwrap_or_else(|e| e.into_inner());
+                        match g.as_ref() {
+                            Some(cur) => {
+                                cur.dvr_id == target_dvr
+                                    && cur.channel == target_ch
+                                    && cur.until_ms > epoch_ms()
+                            }
+                            None => false,
+                        }
+                    },
+                    |ct, bytes| {
+                        let payload = json!({
+                            "dvr_id": target_dvr,
+                            "channel": target_ch,
+                            "content_type": ct,
+                            "data_b64": crate::common::base64_encode(bytes),
+                            "error": "",
+                        });
+                        match audio_relay.upload_cctv_audio(&r_url, &d_tok, &payload) {
+                            Some(resp) => {
+                                if let Some(updated) = resp.get("cctv_tasks") {
+                                    sync_cctv_tasks_from_value(if updated.is_null() { None } else { Some(updated) });
+                                }
+                                resp["active"].as_bool().unwrap_or(true)
+                            }
+                            None => false,
+                        }
+                    },
+                );
+
+                if let Err(err_msg) = res {
+                    let payload = json!({
+                        "dvr_id": spec.dvr_id,
+                        "channel": spec.channel,
+                        "content_type": "",
+                        "data_b64": "",
+                        "error": err_msg,
+                    });
+                    if let Some(resp) = audio_relay.upload_cctv_audio(&r_url, &d_tok, &payload) {
+                        if let Some(updated) = resp.get("cctv_tasks") {
+                            sync_cctv_tasks_from_value(if updated.is_null() { None } else { Some(updated) });
+                        }
+                    }
+                    // Prevent rapid reconnect spin if channel has no microphone
+                    {
+                        let mut g = CCTV_AUDIO_SPEC.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.as_ref().map_or(false, |c| c.dvr_id == spec.dvr_id && c.channel == spec.channel) {
+                            *g = None;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(800));
+                }
+            }
+        });
+    }
+
+    let http = tls_agent(6);
+    let relay_client = RelayClient::new();
     let mut last_screen_wake: u64 = 0;
     loop {
-        poll_once(&http, &linked);
+        poll_once(&http, &relay_client, &linked);
         // Keep the user-session capture/DLP helper alive proactively and wake it
         // immediately whenever live screen/camera streaming is active.
         if !is_admin_mode() {
@@ -1258,10 +1758,15 @@ fn check_tamper() -> Option<(&'static str, &'static str, String)> {
         return Some(("tamper", "high", "تم تعديل أو حذف سياسات البروكسي للمتصفح أثناء الحجب".to_string()));
     }
 
+    let sys_tasks = std::path::Path::new(r"C:\Windows\System32\Tasks");
     for (task_name, err_msg) in [
         ("IT ELKHAWGA Agent", "تم حذف مهمة الـ Agent (IT ELKHAWGA Agent)"),
         ("IT ELKHAWGA Screen", "تم حذف مهمة المراقبة والحماية (IT ELKHAWGA Screen)"),
     ] {
+        // Zero-process fast path: scheduled tasks live as files under System32\Tasks (readable by SYSTEM)
+        if sys_tasks.join(task_name).is_file() {
+            continue;
+        }
         let mut sc = std::process::Command::new("schtasks");
         sc.args(["/Query", "/TN", task_name]);
         let task_ok = crate::common::hidden(&mut sc)
@@ -1275,17 +1780,20 @@ fn check_tamper() -> Option<(&'static str, &'static str, String)> {
     None
 }
 
-fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
+fn poll_once(http: &ureq::Agent, relay: &RelayClient, linked: &AtomicBool) {
     if is_admin_mode() {
         return;
     }
     let cfg = read_config();
-    // Tamper check (at most once every 120s) + automatic self-healing re-block with visual evidence
+    // Tamper check (strictly once every 90s using zero-process Win32 Registry & file checks)
     let now_s = epoch_secs();
-    let last_tamper = LAST_TAMPER_ALERT_SECS.load(Ordering::Relaxed);
-    if now_s.saturating_sub(last_tamper) >= 30 {
-        if let Some((t, sev, msg)) = check_tamper() {
-            LAST_TAMPER_ALERT_SECS.store(now_s + 60, Ordering::Relaxed);
+    let last_chk = LAST_TAMPER_CHECK_SECS.load(Ordering::Relaxed);
+    if now_s.saturating_sub(last_chk) >= 90 {
+        LAST_TAMPER_CHECK_SECS.store(now_s, Ordering::Relaxed);
+        let last_tamper = LAST_TAMPER_ALERT_SECS.load(Ordering::Relaxed);
+        if now_s >= last_tamper {
+            if let Some((t, sev, msg)) = check_tamper() {
+                LAST_TAMPER_ALERT_SECS.store(now_s + 120, Ordering::Relaxed);
             let win_user = std::env::var("USERNAME").unwrap_or_default();
             let mut meta = json!({ "windows_user": win_user });
             if let Some((sc, cam, _rn, _rp, pu)) = request_agent_evidence(2200) {
@@ -1302,6 +1810,7 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
             let alert = json!({"type": t, "severity": sev, "message": msg, "meta": meta});
             enqueue_client_alert(alert);
             let _ = apply_block("tamper auto-heal");
+            }
         }
     }
     // Suspicious upload/exfiltration attempts captured by the local proxy
@@ -1350,6 +1859,7 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
         "device_id": link.device_id,
         "hostname": hostname(),
         "blocked": is_blocked(),
+        "usb_blocked": crate::common::is_usb_effectively_blocked(&cfg, &link),
         "mode": cfg.mode,
         "policy_version": link.policy_version,
         "app_version": APP_VERSION,
@@ -1368,7 +1878,6 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
     let mut alert_delivered = true;
     let reply: Value = match transport {
         Transport::Relay => {
-            let relay = RelayClient::new();
             // Pairing token is reusable: one token links this client to the admin
             // forever and re-enrollment is always possible (survives reinstalls /
             // stale tokens). We never consume (clear) the pairing token.
@@ -1400,8 +1909,13 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
                 }
             }
             match relay.poll_status(&link.relay_url, &link.device_token, &state, ack.as_deref()) {
-                RelayPollOutcome::Ok(command, policy, screen, stream_mode) => {
+                RelayPollOutcome::Ok(command, policy, screen, stream_mode, cctv_tasks, cctv_scan, cctv_cgi) => {
                     SCREEN_WANTED.store(screen, Ordering::Relaxed);
+                    sync_cctv_tasks_from_value(cctv_tasks.as_ref());
+                    enqueue_cctv_cgi_jobs(cctv_cgi.as_ref());
+                    if cctv_scan {
+                        CCTV_SCAN_WANTED.store(true, Ordering::SeqCst);
+                    }
                     json!({"command": command, "policy": policy, "screen": screen, "stream_mode": stream_mode})
                 }
                 RelayPollOutcome::Unauthorized => {
@@ -1552,6 +2066,28 @@ fn poll_once(http: &ureq::Agent, linked: &AtomicBool) {
                 apply_power_command(cmd)
             } else if cmd == "update_client" {
                 apply_client_self_update()
+            } else if cmd == "usb_block" {
+                let mut l = read_client();
+                l.usb_override = "block".to_string();
+                let _ = write_client(&l);
+                crate::common::apply_usb_storage_policy(true);
+                log_action("USB mass storage blocked (remote command)");
+                Ok(())
+            } else if cmd == "usb_unblock" {
+                let mut l = read_client();
+                l.usb_override = "unblock".to_string();
+                let _ = write_client(&l);
+                crate::common::apply_usb_storage_policy(false);
+                log_action("USB mass storage unblocked (remote command)");
+                Ok(())
+            } else if cmd == "usb_inherit" {
+                let mut l = read_client();
+                l.usb_override.clear();
+                let _ = write_client(&l);
+                let c = read_config();
+                crate::common::apply_usb_storage_policy(c.usb_block);
+                log_action("USB mass storage reset to group/global policy");
+                Ok(())
             } else {
                 Ok(())
             };
@@ -1601,26 +2137,48 @@ fn apply_policy(policy: &Value) {
     if let Some(arr) = policy["exfil_suspicious"].as_array() {
         cfg.exfil_suspicious = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
     }
+    let prev_usb = cfg.usb_block;
     if let Some(b) = policy["usb_block"].as_bool() {
         cfg.usb_block = b;
+    }
+    if let Some(arr) = policy["erp_domains"].as_array() {
+        let mut doms: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().and_then(clean_domain))
+            .collect();
+        if !doms.iter().any(|d| d.eq_ignore_ascii_case(DEFAULT_ERP_DOMAIN)) {
+            doms.insert(0, DEFAULT_ERP_DOMAIN.to_string());
+        }
+        doms.dedup();
+        cfg.erp_domains = doms;
     }
     let prev_ephem = cfg.ephemeral_browser || read_client().ephemeral_browser;
     let ephem = policy["ephemeral_browser"].as_bool().unwrap_or(false);
     cfg.ephemeral_browser = ephem;
+    let mut rd_changed = false;
     if let Some(s) = policy["rustdesk_server"].as_str() {
         let mut l = read_client();
-        l.rustdesk_server = s.to_string();
-        let _ = write_client(&l);
+        if l.rustdesk_server != s {
+            l.rustdesk_server = s.to_string();
+            let _ = write_client(&l);
+            rd_changed = true;
+        }
     }
     if let Some(k) = policy["rustdesk_key"].as_str() {
         let mut l = read_client();
-        l.rustdesk_key = k.to_string();
-        let _ = write_client(&l);
+        if l.rustdesk_key != k {
+            l.rustdesk_key = k.to_string();
+            let _ = write_client(&l);
+            rd_changed = true;
+        }
     }
     if let Some(pw) = policy["rustdesk_password"].as_str() {
         let mut l = read_client();
         l.rustdesk_password = pw.to_string();
         let _ = write_client(&l);
+    }
+    if rd_changed {
+        configure_rustdesk_server();
     }
     let _ = write_config(&cfg);
     let _ = write_list(&allowed_path(), "Allowed sites (synced from admin)", &strings(&policy["allowed"]));
@@ -1630,6 +2188,11 @@ fn apply_policy(policy: &Value) {
     }
 
     let mut link = read_client();
+    if prev_usb != cfg.usb_block {
+        // Group or global USB policy explicitly flipped by admin: adopt the new policy across the group.
+        link.usb_override.clear();
+    }
+    crate::common::apply_usb_storage_policy(crate::common::is_usb_effectively_blocked(&cfg, &link));
     link.ephemeral_browser = ephem;
     link.policy_version = policy["version"].as_str().unwrap_or("").to_string();
     let _ = write_client(&link);
@@ -1860,10 +2423,17 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
                 }
             }
 
+            if is_noise_recipient_label(&recipient_name) {
+                recipient_name.clear();
+            }
+            if page_url == "Open" || page_url == "فتح" {
+                page_url.clear();
+            }
             let is_whatsapp = detection_source.contains("whatsapp")
                 || page_url.to_ascii_lowercase().contains("whatsapp")
+                || page_url.contains("واتساب")
                 || page_title.to_ascii_lowercase().contains("whatsapp")
-                || crate::proxy::was_whatsapp_recently_active(120);
+                || page_title.contains("واتساب");
             if recipient_phone.is_empty() && !recipient_name.is_empty() && is_whatsapp {
                 if let Some(ph) = crate::common::lookup_whatsapp_phone_by_name(&recipient_name) {
                     recipient_phone = ph;
@@ -1884,9 +2454,6 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
             );
             let uploaded_file_id = uploaded_file.as_ref().map(|(id, _)| id.clone());
             let file_sha256 = uploaded_file.as_ref().map(|(_, h)| h.clone());
-            if !staged_path.trim().is_empty() {
-                let _ = std::fs::remove_file(staged_path.trim());
-            }
 
             let (category_ar, severity, ext) = classify_dlp_file(&file_name, size_bytes);
             let final_ext = if ext.is_empty() {
@@ -1957,7 +2524,7 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
                             .is_some()
                     }
                     Transport::Lan => {
-                        let http = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+                        let http = tls_agent(30);
                         lan_upload_screen_frame(&http, &link, img, kind, err_str).is_some()
                     }
                 };
@@ -2078,7 +2645,7 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
                 match write_client(&link) {
                     Ok(_) => {
                         log_action("Server link updated");
-                        let quick_http = ureq::AgentBuilder::new().timeout(Duration::from_secs(4)).build();
+                        let quick_http = tls_agent(4);
                         if lan_poll(&quick_http, &link, None).is_some() {
                             linked.store(true, Ordering::Relaxed);
                             log_action("LAN poll succeeded");

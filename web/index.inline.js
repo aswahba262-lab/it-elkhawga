@@ -85,13 +85,49 @@
     }
   }
 
-  function syncSessionIdentity(username, role, token) {
+  const LATEST_CLIENT_VERSION = '1.1.0';
+  const SAVED_LOGIN_KEY = 'ibp_saved_admin_creds_v1';
+
+  function loadRememberedLogin() {
+    try {
+      const raw = localStorage.getItem(SAVED_LOGIN_KEY);
+      if (!raw) return null;
+      const obj = JSON.parse(decodeURIComponent(escape(atob(raw))));
+      if (obj && typeof obj.u === 'string') return obj;
+    } catch (e) {}
+    return null;
+  }
+
+  function persistRememberedLogin(username, password, remember) {
+    try {
+      if (remember && username) {
+        const enc = btoa(unescape(encodeURIComponent(JSON.stringify({ u: username, p: password || '' }))));
+        localStorage.setItem(SAVED_LOGIN_KEY, enc);
+      } else {
+        localStorage.removeItem(SAVED_LOGIN_KEY);
+      }
+    } catch (e) {}
+  }
+
+  function applyRememberedLoginFields() {
+    const saved = loadRememberedLogin();
+    const uEl = $('loginUser');
+    const pEl = $('loginPass');
+    const rEl = $('loginRemember');
+    if (saved) {
+      if (uEl && !uEl.value) uEl.value = saved.u || '';
+      if (pEl && !pEl.value) pEl.value = saved.p || '';
+      if (rEl) rEl.checked = true;
+    }
+  }
+
+  function syncSessionIdentity(username, role, token, remember) {
     authToken = token || '';
     currentAdminUser = username || '';
     currentAdminRole = role || '';
     window.currentAdminUser = currentAdminUser;
     window.currentAdminRole = currentAdminRole;
-    if (api && api.setAuthToken) api.setAuthToken(authToken);
+    if (api && api.setAuthToken) api.setAuthToken(authToken, remember);
     updateAdminUi();
   }
 
@@ -103,11 +139,14 @@
       errEl.textContent = errMsg;
       errEl.style.display = errMsg ? 'block' : 'none';
     }
+    applyRememberedLoginFields();
     modal.classList.add('show');
     document.body.classList.add('auth-locked');
     setTimeout(() => {
       const u = $('loginUser');
-      if (u) u.focus();
+      const p = $('loginPass');
+      if (u && !u.value) u.focus();
+      else if (p && !p.value) p.focus();
     }, 60);
   }
 
@@ -125,6 +164,7 @@
   async function submitModalLogin() {
     const username = ($('loginUser') && $('loginUser').value || '').trim();
     const password = ($('loginPass') && $('loginPass').value) || '';
+    const remember = $('loginRemember') ? Boolean($('loginRemember').checked) : true;
     if (!username || !password) {
       showLoginModal('أدخل اسم المستخدم وكلمة المرور');
       return;
@@ -136,10 +176,11 @@
       btn.innerHTML = '<span class="spinner"></span> جاري التحقق...';
     }
     try {
-      const res = await api.adminLogin(username, password);
+      const res = await api.adminLogin(username, password, remember);
       if (res && res.success) {
-        syncSessionIdentity(res.username || username, res.role || 'admin', res.token || '');
-        if ($('loginPass')) $('loginPass').value = '';
+        persistRememberedLogin(username, password, remember);
+        syncSessionIdentity(res.username || username, res.role || 'admin', res.token || '', remember);
+        if (!remember && $('loginPass')) $('loginPass').value = '';
         hideLoginModal();
         toast('مرحباً ' + (res.username || username));
         await bootDashboardData();
@@ -174,20 +215,22 @@
     });
   }
 
-  async function updateAuthServerStatus() {
+  if ($('loginRemember')) {
+    $('loginRemember').addEventListener('change', (e) => {
+      if (!e.target.checked) {
+        persistRememberedLogin('', '', false);
+      }
+    });
+  }
+
+  // لا نعرض عنوان IP الداخلي للسيرفر في شاشة الدخول قبل المصادقة حفاظاً على سرية الشبكة الداخلية.
+  function updateAuthServerStatus() {
     const el = $('authServerStatus');
     if (!el) return;
-    let ok = false;
-    let text = 'السيرفر المحلي غير متاح';
-    try {
-      const info = api.getServerInfo ? await api.getServerInfo() : null;
-      if (info && Number(info.port) > 0) {
-        ok = true;
-        text = 'السيرفر المحلي يعمل · ' + (info.ip || '') + ':' + info.port;
-      }
-    } catch (e) {}
-    el.classList.toggle('ok', ok);
-    el.lastElementChild.textContent = text;
+    el.classList.add('ok');
+    if (el.lastElementChild) {
+      el.lastElementChild.textContent = '🔒 اتصال مشفّر وآمن — بوابة الإدارة المعتمدة';
+    }
   }
   updateAuthServerStatus();
 
@@ -220,6 +263,10 @@
       else if (item.dataset.view === 'dashboard') { startRelayTimer(); loadKpis(); }
       else if (item.dataset.view !== 'relay') { stopRelayTimer(); }
       if (item.dataset.view === 'groups') { loadGroups(); }
+      if (item.dataset.view === 'wabot') { loadWaBotStatus(false); startWaBotPoll(); }
+      else { stopWaBotPoll(); }
+      if (item.dataset.view === 'cameras') { openCamerasView(); }
+      else { stopCctvWall(); }
     });
   });
 
@@ -396,11 +443,63 @@
     return v.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   }
 
-  async function addTo(inputId, fn) {
-    const v = cleanDomain($(inputId).value);
-    if (!v) { toast('اكتب اسم الموقع', 'error'); return; }
+  const SITE_PRESETS = {
+    allow_ms365: { kind: 'allowed', list: ['office.com', 'microsoftonline.com', 'live.com', 'outlook.com', 'sharepoint.com', 'teams.microsoft.com', 'microsoft.com'] },
+    allow_google: { kind: 'allowed', list: ['google.com', 'mail.google.com', 'drive.google.com', 'docs.google.com', 'gstatic.com', 'googleapis.com', 'accounts.google.com'] },
+    allow_whatsapp: { kind: 'allowed', list: ['web.whatsapp.com', 'whatsapp.com', 'whatsapp.net'] },
+    block_social: { kind: 'blocked', list: ['facebook.com', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'snapchat.com', 'reddit.com'] },
+    block_video: { kind: 'blocked', list: ['youtube.com', 'youtu.be', 'netflix.com', 'shahid.mbc.net', 'twitch.tv', 'dailymotion.com'] },
+    block_fileshare: { kind: 'blocked', list: ['wetransfer.com', 'mega.nz', 'mediafire.com', '4shared.com', 'sendspace.com', 'gofile.io'] },
+    block_ai: { kind: 'blocked', list: ['chatgpt.com', 'openai.com', 'claude.ai', 'gemini.google.com', 'deepseek.com', 'perplexity.ai'] },
+  };
+
+  async function saveDownloadText(content, fileName, mimeType) {
+    if (api.saveTextFile) {
+      const r = await api.saveTextFile(content, fileName);
+      if (r && r.success) {
+        toast('✓ تم حفظ التقرير في مجلد التنزيلات (Downloads)');
+        return true;
+      }
+      toast((r && r.error) || 'تعذر حفظ التقرير', 'error');
+      return false;
+    }
+    const prefix = fileName.toLowerCase().endsWith('.csv') ? '\uFEFF' : '';
+    const blob = new Blob([prefix + content], { type: mimeType || 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast('✓ جارٍ تنزيل التقرير');
+    return true;
+  }
+
+  function csvCell(val) {
+    const s = String(val == null ? '' : val).replace(/"/g, '""');
+    return '"' + s + '"';
+  }
+
+  async function addTo(inputId, fn, kind) {
+    const rawVal = $(inputId).value.trim();
+    if (!rawVal) { toast('اكتب اسم الموقع', 'error'); return; }
+    const parts = rawVal.split(/[\s,;]+/).map(cleanDomain).filter(Boolean);
+    if (!parts.length) { toast('اسم موقع غير صالح', 'error'); return; }
     try {
-      const r = await fn(v);
+      if (parts.length > 1 && api.addSitesBulk) {
+        const r = await api.addSitesBulk(parts, kind || 'allowed');
+        if (r && r.success === false) {
+          toast(r.error || 'فشلت الإضافة', 'error');
+          return;
+        }
+        $(inputId).value = '';
+        await loadSites();
+        toast('تمت إضافة ' + (r.added || parts.length) + ' موقع ومزامنتها');
+        return;
+      }
+      const r = await fn(parts[0]);
       if (r && r.success === false) {
         toast(r.error || 'فشلت الإضافة', 'error');
         return;
@@ -411,8 +510,39 @@
     } catch (err) { toast('حدث خطأ: ' + err.message, 'error'); }
   }
 
-  $('addSiteBtn').addEventListener('click', () => addTo('newSiteInput', (v) => api.addSite(v)));
-  $('addBlockedBtn').addEventListener('click', () => addTo('newBlockedInput', (v) => api.addBlockedSite(v)));
+  $('addSiteBtn').addEventListener('click', () => addTo('newSiteInput', (v) => api.addSite(v), 'allowed'));
+  $('addBlockedBtn').addEventListener('click', () => addTo('newBlockedInput', (v) => api.addBlockedSite(v), 'blocked'));
+  if ($('syncSitesNowBtn')) {
+    $('syncSitesNowBtn').addEventListener('click', async () => {
+      try {
+        const r = await api.syncPolicy();
+        if (r && r.success !== false) toast('✓ تمت مزامنة قوائم المواقع مع كل الأجهزة');
+        else toast((r && r.error) || 'تعذرت المزامنة', 'error');
+      } catch (e) { toast(e.message || 'تعذرت المزامنة', 'error'); }
+    });
+  }
+  document.addEventListener('click', async (e) => {
+    const presetBtn = e.target.closest('[data-site-preset]');
+    if (!presetBtn) return;
+    const preset = SITE_PRESETS[presetBtn.dataset.sitePreset];
+    if (!preset) return;
+    try {
+      if (api.addSitesBulk) {
+        const r = await api.addSitesBulk(preset.list, preset.kind);
+        if (r && r.success !== false) {
+          await loadSites();
+          toast('✓ تمت إضافة القائمة الجاهزة (' + (r.added || 0) + ' نطاق جديد) ومزامنتها');
+        } else toast((r && r.error) || 'فشلت الإضافة', 'error');
+      } else {
+        for (const dom of preset.list) {
+          if (preset.kind === 'blocked') await api.addBlockedSite(dom);
+          else await api.addSite(dom);
+        }
+        await loadSites();
+        toast('✓ تمت إضافة القائمة الجاهزة');
+      }
+    } catch (err) { toast(err.message || 'فشلت الإضافة', 'error'); }
+  });
   $('newSiteInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('addSiteBtn').click(); });
   $('newBlockedInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('addBlockedBtn').click(); });
 
@@ -429,8 +559,491 @@
     const c = await api.getConfig();
     selectedMode = c.mode || 'whitelist';
     $('autostartToggle').checked = !!c.auto_start;
+    if ($('usbBlockToggle')) $('usbBlockToggle').checked = !!c.usb_block;
+    if ($('dlpSuperOnlyToggle')) {
+      $('dlpSuperOnlyToggle').checked = !!c.dlp_super_only;
+      $('dlpSuperOnlyToggle').disabled = !hasSuperAdminAccess();
+    }
+    const archNav = document.querySelector('.nav-item[data-view="archive"]');
+    if (archNav) {
+      archNav.style.display = (c.dlp_super_only && !hasSuperAdminAccess()) ? 'none' : '';
+    }
+    if ($('exfilThresholdInput')) $('exfilThresholdInput').value = c.exfil_threshold_mb || 50;
+    if ($('exfilWindowInput')) $('exfilWindowInput').value = c.exfil_window_secs || 600;
+    if ($('exfilSuspiciousInput')) $('exfilSuspiciousInput').value = Array.isArray(c.exfil_suspicious) ? c.exfil_suspicious.join('\n') : '';
+    if ($('erpDomainsInput')) {
+      const erpList = Array.isArray(c.erp_domains) && c.erp_domains.length ? c.erp_domains : ['elkhawaga.uk'];
+      $('erpDomainsInput').value = erpList.join('\n');
+    }
+    if ($('erpMasterTokenInput') && typeof c.erp_master_token === 'string' && c.erp_master_token) {
+      $('erpMasterTokenInput').value = c.erp_master_token;
+    }
     renderMode();
+    loadBackupsList();
+    loadErpBackupsStatus();
   }
+
+  function renderServerDriveButtons(containerId, targetInputId, subfolderName, drives) {
+    const bar = $(containerId);
+    if (!bar) return;
+    if (!Array.isArray(drives) || !drives.length) {
+      bar.innerHTML = '<span style="font-size:12px;color:var(--muted);">اكتب مسار الهارد الجديد بالأسفل (مثال: D:\\' + subfolderName + ')</span>';
+      return;
+    }
+    bar.innerHTML = drives.map((d) => {
+      const freeGb = ((Number(d.free_bytes || 0)) / (1024 * 1024 * 1024)).toFixed(1);
+      const totGb = ((Number(d.total_bytes || 0)) / (1024 * 1024 * 1024)).toFixed(0);
+      const suggested = String(d.letter || 'D:') + '\\' + subfolderName;
+      return '<button type="button" class="btn btn-ghost btn-sm" data-pick-drive-input="' + esc(targetInputId) + '" data-pick-drive-path="' + esc(suggested) + '">' +
+        '💿 القرص <b class="mono" dir="ltr">' + esc(d.letter) + '</b> (متاح ' + freeGb + ' GB من ' + totGb + ' GB)</button>';
+    }).join('');
+  }
+
+  async function loadBackupsList() {
+    if (!api.getBackupsList || !$('backupsListBox')) return;
+    const isLocalHost = Boolean(window.__TAURI__ && window.__TAURI__.core && location.hostname === 'localhost')
+      && false;
+    if ($('openBackupsDirBtn')) {
+      $('openBackupsDirBtn').style.display = (api.openBackupsFolder && $('adminUpdateStatusBadge') && $('adminUpdateStatusBadge').textContent.includes('الرئيسي')) ? '' : 'none';
+    }
+    if ($('browseBackupDirBtn')) {
+      $('browseBackupDirBtn').style.display = (api.browseBackupFolder && $('adminUpdateStatusBadge') && $('adminUpdateStatusBadge').textContent.includes('الرئيسي')) ? '' : 'none';
+    }
+    if ($('toggleBackupPathBtn')) {
+      $('toggleBackupPathBtn').style.display = hasSuperAdminAccess() ? '' : 'none';
+    }
+    try {
+      const r = await api.getBackupsList();
+      if (r && r.backups_dir) {
+        if ($('backupsDirPathText')) $('backupsDirPathText').textContent = r.backups_dir;
+        if ($('backupDirInput') && document.activeElement !== $('backupDirInput')) {
+          $('backupDirInput').value = r.backups_dir;
+        }
+      }
+      if (r && r.disk_total_bytes) {
+        const bBadge = $('backupDiskSpaceBadge');
+        if (bBadge) {
+          const fGb = (Number(r.disk_free_bytes || 0) / (1024 * 1024 * 1024)).toFixed(1);
+          const tGb = (Number(r.disk_total_bytes || 0) / (1024 * 1024 * 1024)).toFixed(0);
+          bBadge.style.display = 'inline-flex';
+          bBadge.textContent = '💾 متاح بالقرص: ' + fGb + ' GB من ' + tGb + ' GB';
+          bBadge.className = Number(r.disk_free_bytes || 0) < 5 * 1073741824 ? 'badge red'
+            : Number(r.disk_free_bytes || 0) < 15 * 1073741824 ? 'badge gold' : 'badge green';
+        }
+      }
+      if (r && Array.isArray(r.drives)) {
+        renderServerDriveButtons('backupServerDrivesBar', 'backupDirInput', 'IT-ELKHAWGA-Backups', r.drives);
+      }
+      const list = (r && Array.isArray(r.backups)) ? r.backups : [];
+      if (!list.length) {
+        $('backupsListBox').innerHTML = '<div class="empty">جاري تجهيز أول نسخة احتياطية تلقائية... يمكنك أيضاً الضغط على «إنشاء نسخة احتياطية الآن»</div>';
+        return;
+      }
+      const isSuper = hasSuperAdminAccess();
+      $('backupsListBox').innerHTML = list.slice(0, 10).map((b) => {
+        const dtStr = b.created_at ? new Date(b.created_at).toLocaleString('ar-EG') : b.id;
+        const reasonLabel = b.reason === 'auto_daily' ? 'تلقائية يومية'
+          : b.reason === 'pre_restore' ? 'قبل الاستعادة'
+          : 'يدوية فورية';
+        const badgeCls = b.reason === 'auto_daily' ? 'green' : 'violet';
+        const sizeStr = formatArchiveBytes(b.total_bytes || 0);
+        const restoreBtn = isSuper
+          ? '<button class="btn btn-ghost btn-sm" type="button" data-restore-backup="' + esc(b.id) + '">♻ استعادة هذه النسخة</button>'
+          : '';
+        return '<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+          '<div>' +
+          '<b class="mono" dir="ltr">' + esc(b.id) + '</b> ' +
+          '<span class="badge ' + badgeCls + '" style="margin-inline-start:6px;">' + reasonLabel + '</span>' +
+          '<div style="font-size:11.5px;color:var(--muted);margin-top:2px;">التاريخ: ' + esc(dtStr) + ' · الملفات: ' + Number(b.files_count || 0) + ' · الحجم: <span class="mono">' + esc(sizeStr) + '</span></div>' +
+          '</div>' +
+          '<div>' + restoreBtn + '</div>' +
+          '</div>';
+      }).join('');
+    } catch (_) {}
+  }
+
+  if ($('toggleBackupPathBtn')) {
+    $('toggleBackupPathBtn').addEventListener('click', () => {
+      const box = $('backupStorageCard');
+      if (!box) return;
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+      if (box.style.display === 'block') loadBackupsList();
+    });
+  }
+  if ($('browseBackupDirBtn')) {
+    $('browseBackupDirBtn').addEventListener('click', async () => {
+      if (!api.browseBackupFolder) return;
+      try {
+        const r = await api.browseBackupFolder();
+        if (r && r.success && r.path && $('backupDirInput')) $('backupDirInput').value = r.path;
+      } catch (e) { toast(e.message || 'تعذر فتح مستعرض المجلدات', 'error'); }
+    });
+  }
+  async function applyBackupDirChange(pathStr) {
+    if (!api.setBackupDir) return;
+    const moveExisting = Boolean($('moveExistingBackupsChk') && $('moveExistingBackupsChk').checked);
+    const btn = $('saveBackupDirBtn');
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ جارٍ التطبيق...'; }
+    try {
+      const r = await api.setBackupDir(pathStr, moveExisting);
+      if (r && r.success) {
+        const movedMsg = r.moved_files ? (' (تم نقل ' + r.moved_files + ' ملف تلقائياً)') : '';
+        toast('✓ تم تحديث مسار حفظ النسخ الاحتياطية على السيرفر' + movedMsg);
+        if ($('backupStorageCard')) $('backupStorageCard').style.display = 'none';
+        await loadBackupsList();
+      } else {
+        toast((r && r.error) || 'تعذر تغيير مسار النسخ الاحتياطية', 'error');
+      }
+    } catch (e) {
+      toast(e.message || 'تعذر تغيير مسار النسخ الاحتياطية', 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = orig; }
+    }
+  }
+  if ($('saveBackupDirBtn')) {
+    $('saveBackupDirBtn').addEventListener('click', () => {
+      const target = (($('backupDirInput') && $('backupDirInput').value) || '').trim();
+      if (!target) { toast('اختر القرص الجديد أو اكتب المسار أولاً', 'error'); return; }
+      applyBackupDirChange(target);
+    });
+  }
+  if ($('resetBackupDirBtn')) {
+    $('resetBackupDirBtn').addEventListener('click', () => {
+      if (!confirm('إعادة مسار النسخ الاحتياطية ليتبع مجلد الأرشيف تلقائياً؟')) return;
+      applyBackupDirChange('');
+    });
+  }
+  document.addEventListener('click', (e) => {
+    const dp = e.target.closest('[data-pick-drive-input]');
+    if (!dp) return;
+    const inp = $(dp.dataset.pickDriveInput || '');
+    if (inp) {
+      inp.value = dp.dataset.pickDrivePath || '';
+      inp.focus();
+      toast('تم اختيار المسار: ' + inp.value + ' — اضغط «حفظ وتطبيق المسار» للتنفيذ');
+    }
+  });
+
+  if ($('createBackupBtn')) {
+    $('createBackupBtn').addEventListener('click', async () => {
+      if (!api.createSystemBackup) return;
+      const btn = $('createBackupBtn');
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ جارٍ الحفظ...';
+      try {
+        const r = await api.createSystemBackup();
+        if (r && r.success) {
+          toast('✓ تم إنشاء النسخة الاحتياطية بنجاح (' + (r.id || '') + ')');
+          await loadBackupsList();
+        } else {
+          toast((r && r.error) || 'فشل إنشاء النسخة الاحتياطية', 'error');
+        }
+      } catch (e) {
+        toast(e.message || 'فشل إنشاء النسخة الاحتياطية', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+  }
+  if ($('refreshBackupsBtn')) $('refreshBackupsBtn').addEventListener('click', loadBackupsList);
+  if ($('openBackupsDirBtn')) {
+    $('openBackupsDirBtn').addEventListener('click', async () => {
+      if (!api.openBackupsFolder) return;
+      const r = await api.openBackupsFolder();
+      if (!r || r.success === false) toast((r && r.error) || 'تعذر فتح المجلد', 'error');
+    });
+  }
+
+  /* ---------- Automated Hourly ERP Website Backups (elkhawaga.uk) ---------- */
+  let erpBackupPollTimer = null;
+  let lastErpBackupRunning = false;
+
+  async function loadErpBackupsStatus() {
+    if (!api.getErpBackupsStatus || !$('erpBackupsListBox')) return;
+    const isSuper = hasSuperAdminAccess();
+    if ($('openErpBackupsDirBtn')) {
+      $('openErpBackupsDirBtn').style.display = (api.openErpBackupsFolder && $('adminUpdateStatusBadge') && $('adminUpdateStatusBadge').textContent.includes('الرئيسي')) ? '' : 'none';
+    }
+    if ($('browseErpBackupDirBtn')) {
+      $('browseErpBackupDirBtn').style.display = (api.browseErpBackupFolder && $('adminUpdateStatusBadge') && $('adminUpdateStatusBadge').textContent.includes('الرئيسي')) ? '' : 'none';
+    }
+    if ($('toggleErpBackupPathBtn')) $('toggleErpBackupPathBtn').style.display = isSuper ? '' : 'none';
+    if ($('runErpBackupNowBtn')) $('runErpBackupNowBtn').style.display = isSuper ? '' : 'none';
+    if ($('saveErpBackupConfigBtn')) $('saveErpBackupConfigBtn').style.display = isSuper ? '' : 'none';
+    if ($('erpBackupEnabledToggle')) $('erpBackupEnabledToggle').disabled = !isSuper;
+
+    try {
+      const r = await api.getErpBackupsStatus();
+      if (!r) return;
+      if (r.erp_backups_dir) {
+        if ($('erpBackupsDirPathText')) $('erpBackupsDirPathText').textContent = r.erp_backups_dir;
+        if ($('erpBackupDirInput') && document.activeElement !== $('erpBackupDirInput')) {
+          $('erpBackupDirInput').value = r.erp_backups_dir;
+        }
+      }
+      if (r.disk_total_bytes && $('erpBackupDiskSpaceBadge')) {
+        const bBadge = $('erpBackupDiskSpaceBadge');
+        const fGb = (Number(r.disk_free_bytes || 0) / (1024 * 1024 * 1024)).toFixed(1);
+        const tGb = (Number(r.disk_total_bytes || 0) / (1024 * 1024 * 1024)).toFixed(0);
+        bBadge.style.display = 'inline-flex';
+        bBadge.textContent = '💾 متاح بالقرص: ' + fGb + ' GB من ' + tGb + ' GB';
+        bBadge.className = Number(r.disk_free_bytes || 0) < 5 * 1073741824 ? 'badge red'
+          : Number(r.disk_free_bytes || 0) < 15 * 1073741824 ? 'badge gold' : 'badge green';
+      }
+      if (Array.isArray(r.drives)) {
+        renderServerDriveButtons('erpBackupServerDrivesBar', 'erpBackupDirInput', 'Elkhawaga-ERP-Backups', r.drives);
+      }
+
+      const cfg = r.config || {};
+      if ($('erpBackupEnabledToggle') && document.activeElement !== $('erpBackupEnabledToggle')) {
+        $('erpBackupEnabledToggle').checked = Boolean(cfg.enabled);
+      }
+      if ($('erpBackupIntervalSelect') && document.activeElement !== $('erpBackupIntervalSelect')) {
+        $('erpBackupIntervalSelect').value = String(cfg.interval_mins || 60);
+      }
+      if ($('erpBackupUrlInput') && document.activeElement !== $('erpBackupUrlInput') && cfg.url) {
+        $('erpBackupUrlInput').value = cfg.url;
+      }
+      if ($('erpBackupUserInput') && document.activeElement !== $('erpBackupUserInput') && typeof cfg.username === 'string' && !$('erpBackupUserInput').dataset.dirty) {
+        $('erpBackupUserInput').value = cfg.username;
+      }
+      if ($('erpBackupPassSavedBadge')) {
+        $('erpBackupPassSavedBadge').style.display = cfg.has_password ? 'inline-flex' : 'none';
+      }
+
+      const st = r.status || {};
+      const schedBadge = $('erpBackupScheduleBadge');
+      if (schedBadge) {
+        if (st.running) {
+          schedBadge.className = 'badge violet';
+          schedBadge.textContent = '⏳ جاري السحب والفحص الآن...';
+        } else if (cfg.enabled) {
+          const hrs = Math.round((Number(cfg.interval_mins || 60) / 60) * 10) / 10;
+          schedBadge.className = 'badge green';
+          schedBadge.textContent = hrs === 1 ? '✓ يعمل تلقائياً كل ساعة' : ('✓ يعمل تلقائياً كل ' + hrs + ' ساعات');
+        } else {
+          schedBadge.className = 'badge gold';
+          schedBadge.textContent = 'متوقف (يدوي فقط)';
+        }
+      }
+
+      const banner = $('erpBackupLiveBanner');
+      if (banner) {
+        if (st.running) {
+          banner.style.display = 'block';
+          banner.style.background = 'rgba(37,99,235,0.10)';
+          banner.style.border = '1px solid rgba(37,99,235,0.30)';
+          banner.style.color = '#1d4ed8';
+          banner.textContent = '⏳ ' + (st.stage || 'جاري الاتصال بموقع elkhawaga.uk وسحب النسخة الاحتياطية...');
+        } else if (st.last_error) {
+          banner.style.display = 'block';
+          banner.style.background = 'rgba(220,38,38,0.10)';
+          banner.style.border = '1px solid rgba(220,38,38,0.32)';
+          banner.style.color = '#dc2626';
+          banner.textContent = '⚠ آخر محاولة سحب: ' + st.last_error;
+        } else if (st.stage) {
+          banner.style.display = 'block';
+          banner.style.background = 'rgba(16,185,129,0.10)';
+          banner.style.border = '1px solid rgba(16,185,129,0.30)';
+          banner.style.color = '#059669';
+          banner.textContent = st.stage;
+        } else {
+          banner.style.display = 'none';
+        }
+      }
+
+      if (st.running) {
+        lastErpBackupRunning = true;
+        if (!erpBackupPollTimer) {
+          erpBackupPollTimer = setInterval(loadErpBackupsStatus, 2500);
+        }
+      } else {
+        if (lastErpBackupRunning) {
+          lastErpBackupRunning = false;
+          if (!st.last_error) toast('✓ اكتمل سحب وفحص النسخة الاحتياطية لموقع الشركة بنجاح!');
+          else toast(st.last_error, 'error');
+        }
+        if (erpBackupPollTimer) {
+          clearInterval(erpBackupPollTimer);
+          erpBackupPollTimer = null;
+        }
+      }
+
+      const list = Array.isArray(r.backups) ? r.backups : [];
+      if (!list.length) {
+        $('erpBackupsListBox').innerHTML = '<div class="empty">لم يتم سحب أي نسخة من الموقع بعد — أدخل اسم المستخدم وكلمة مرور أدمن الموقع بالأعلى ثم اضغط «⚡ سحب وفحص نسخة من الموقع الآن»</div>';
+        return;
+      }
+      const authTok = (api.getAuthToken && api.getAuthToken()) || '';
+      $('erpBackupsListBox').innerHTML = list.slice(0, 15).map((b) => {
+        const dtStr = b.created_at ? new Date(b.created_at).toLocaleString('ar-EG') : b.file_name;
+        const sizeStr = formatArchiveBytes(b.size_bytes || 0);
+        const durSec = b.duration_ms ? ((Number(b.duration_ms) / 1000).toFixed(1) + ' ث') : '—';
+        const shaShort = b.sha256 ? (String(b.sha256).slice(0, 12) + '…') : '';
+        const isAuto = String(b.reason || '').startsWith('auto');
+        const reasonText = isAuto ? 'تلقائية مجدولة' : 'سحب فوري';
+        const dlUrl = serverHttpBase + '/api/erp-backups/download/' + encodeURIComponent(b.file_name || '') + (authTok ? ('?token=' + encodeURIComponent(authTok)) : '');
+        const dlBtn = isSuper
+          ? '<a class="btn btn-success btn-sm" href="' + esc(dlUrl) + '" target="_blank" rel="noreferrer" download="' + esc(b.file_name || 'backup.zip') + '" style="text-decoration:none;">⬇ تحميل النسخة</a>'
+          : '';
+        return '<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+          '<div>' +
+          '<b class="mono" dir="ltr">' + esc(b.file_name) + '</b> ' +
+          '<span class="badge green" style="margin-inline-start:6px;">' + esc(b.format || '✓ مفحوص') + '</span> ' +
+          '<span class="badge ' + (isAuto ? 'violet' : 'gold') + '" style="margin-inline-start:4px;">' + reasonText + '</span>' +
+          '<div style="font-size:11.5px;color:var(--muted);margin-top:3px;">التاريخ: ' + esc(dtStr) + ' · الحجم: <b class="mono">' + esc(sizeStr) + '</b> · زمن السحب: ' + esc(durSec) + (shaShort ? (' · SHA-256: <span class="mono" dir="ltr">' + esc(shaShort) + '</span>') : '') + '</div>' +
+          '</div>' +
+          '<div>' + dlBtn + '</div>' +
+          '</div>';
+      }).join('');
+    } catch (_) {}
+  }
+
+  if ($('erpBackupUserInput')) {
+    $('erpBackupUserInput').addEventListener('input', () => {
+      $('erpBackupUserInput').dataset.dirty = '1';
+    });
+  }
+  if ($('saveErpBackupConfigBtn')) {
+    $('saveErpBackupConfigBtn').addEventListener('click', async () => {
+      if (!api.saveErpBackupConfig) return;
+      const enabled = Boolean($('erpBackupEnabledToggle') && $('erpBackupEnabledToggle').checked);
+      const mins = parseInt(($('erpBackupIntervalSelect') && $('erpBackupIntervalSelect').value) || '60', 10) || 60;
+      const url = (($('erpBackupUrlInput') && $('erpBackupUrlInput').value) || 'https://elkhawaga.uk').trim();
+      const user = (($('erpBackupUserInput') && $('erpBackupUserInput').value) || '').trim();
+      const pass = ($('erpBackupPassInput') && $('erpBackupPassInput').value) || '';
+      if (!user) {
+        toast('يرجى إدخال اسم مستخدم أدمن الموقع أولاً', 'error');
+        return;
+      }
+      try {
+        const r = await api.saveErpBackupConfig(enabled, mins, url, user, pass || null, null, null);
+        if (r && r.success !== false) {
+          if ($('erpBackupPassInput')) $('erpBackupPassInput').value = '';
+          if ($('erpBackupUserInput')) delete $('erpBackupUserInput').dataset.dirty;
+          toast(enabled ? '✓ تم حفظ الإعدادات وتفعيل السحب التلقائي الدوري للموقع!' : '✓ تم حفظ بيانات الربط بموقع الشركة بنجاح');
+          await loadErpBackupsStatus();
+        } else {
+          toast((r && r.error) || 'تعذر حفظ إعدادات النسخ الاحتياطي للموقع', 'error');
+        }
+      } catch (e) {
+        toast(e.message || 'تعذر حفظ الإعدادات', 'error');
+      }
+    });
+  }
+
+  if ($('runErpBackupNowBtn')) {
+    $('runErpBackupNowBtn').addEventListener('click', async () => {
+      if (!api.runErpBackupNow) return;
+      // Auto-save username/password first if user typed them and clicked Run Now directly!
+      const user = (($('erpBackupUserInput') && $('erpBackupUserInput').value) || '').trim();
+      const pass = ($('erpBackupPassInput') && $('erpBackupPassInput').value) || '';
+      if (user && (pass || ($('erpBackupUserInput') && $('erpBackupUserInput').dataset.dirty))) {
+        const enabled = Boolean($('erpBackupEnabledToggle') && $('erpBackupEnabledToggle').checked);
+        const mins = parseInt(($('erpBackupIntervalSelect') && $('erpBackupIntervalSelect').value) || '60', 10) || 60;
+        const url = (($('erpBackupUrlInput') && $('erpBackupUrlInput').value) || 'https://elkhawaga.uk').trim();
+        await api.saveErpBackupConfig(enabled, mins, url, user, pass || null, null, null).catch(() => {});
+        if ($('erpBackupPassInput')) $('erpBackupPassInput').value = '';
+        if ($('erpBackupUserInput')) delete $('erpBackupUserInput').dataset.dirty;
+      }
+      try {
+        const r = await api.runErpBackupNow();
+        if (r && r.success !== false) {
+          toast('⏳ بدأ الاتصال بموقع elkhawaga.uk لإنشاء وسحب النسخة الاحتياطية...');
+          await loadErpBackupsStatus();
+        } else {
+          toast((r && r.error) || 'تعذر بدء سحب النسخة الاحتياطية', 'error');
+        }
+      } catch (e) {
+        toast(e.message || 'تعذر بدء سحب النسخة الاحتياطية', 'error');
+      }
+    });
+  }
+
+  if ($('refreshErpBackupsBtn')) $('refreshErpBackupsBtn').addEventListener('click', loadErpBackupsStatus);
+  if ($('openErpBackupsDirBtn')) {
+    $('openErpBackupsDirBtn').addEventListener('click', async () => {
+      if (!api.openErpBackupsFolder) return;
+      const r = await api.openErpBackupsFolder();
+      if (!r || r.success === false) toast((r && r.error) || 'تعذر فتح المجلد', 'error');
+    });
+  }
+  if ($('toggleErpBackupPathBtn')) {
+    $('toggleErpBackupPathBtn').addEventListener('click', () => {
+      const box = $('erpBackupStorageCard');
+      if (!box) return;
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+      if (box.style.display === 'block') loadErpBackupsStatus();
+    });
+  }
+  if ($('browseErpBackupDirBtn')) {
+    $('browseErpBackupDirBtn').addEventListener('click', async () => {
+      if (!api.browseErpBackupFolder) return;
+      try {
+        const r = await api.browseErpBackupFolder();
+        if (r && r.success && r.path && $('erpBackupDirInput')) $('erpBackupDirInput').value = r.path;
+      } catch (e) { toast(e.message || 'تعذر فتح مستعرض المجلدات', 'error'); }
+    });
+  }
+  async function applyErpBackupDirChange(pathStr) {
+    if (!api.setErpBackupDir) return;
+    const moveExisting = Boolean($('moveExistingErpBackupsChk') && $('moveExistingErpBackupsChk').checked);
+    const btn = $('saveErpBackupDirBtn');
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ جارٍ التطبيق...'; }
+    try {
+      const r = await api.setErpBackupDir(pathStr, moveExisting);
+      if (r && r.success) {
+        const movedMsg = r.moved_files ? (' (تم نقل ' + r.moved_files + ' ملف تلقائياً)') : '';
+        toast('✓ تم تحديث مسار حفظ نسخ موقع الشركة على السيرفر' + movedMsg);
+        if ($('erpBackupStorageCard')) $('erpBackupStorageCard').style.display = 'none';
+        await loadErpBackupsStatus();
+      } else {
+        toast((r && r.error) || 'تعذر تغيير مسار نسخ الموقع', 'error');
+      }
+    } catch (e) {
+      toast(e.message || 'تعذر تغيير مسار نسخ الموقع', 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = orig; }
+    }
+  }
+  if ($('saveErpBackupDirBtn')) {
+    $('saveErpBackupDirBtn').addEventListener('click', () => {
+      const target = (($('erpBackupDirInput') && $('erpBackupDirInput').value) || '').trim();
+      if (!target) { toast('اختر القرص الجديد أو اكتب المسار أولاً', 'error'); return; }
+      applyErpBackupDirChange(target);
+    });
+  }
+  if ($('resetErpBackupDirBtn')) {
+    $('resetErpBackupDirBtn').addEventListener('click', () => {
+      if (!confirm('إعادة مسار حفظ نسخ الموقع إلى المسار التلقائي؟')) return;
+      applyErpBackupDirChange('');
+    });
+  }
+  document.addEventListener('click', async (e) => {
+    const rb = e.target.closest('[data-restore-backup]');
+    if (!rb || !api.restoreSystemBackup) return;
+    const bid = rb.dataset.restoreBackup || '';
+    if (!bid) return;
+    if (!confirm('استعادة النسخة الاحتياطية (' + bid + ')؟\n\nسيقوم النظام أولاً بأخذ نسخة أمان احتياطية للحالة الحالية، ثم يستعيد إعدادات وقوائم المواقع والمجموعات والأجهزة من النسخة المختارة.')) return;
+    try {
+      const r = await api.restoreSystemBackup(bid);
+      if (r && r.success) {
+        toast('✓ تمت استعادة النسخة الاحتياطية بنجاح ومزامنة الإعدادات');
+        await loadSites();
+        await loadConfig();
+        await loadDevices();
+        await loadRelayDevices();
+      } else {
+        toast((r && r.error) || 'تعذرت الاستعادة', 'error');
+      }
+    } catch (err) {
+      toast(err.message || 'تعذرت الاستعادة', 'error');
+    }
+  });
 
   $('modeWhitelist').addEventListener('click', () => { selectedMode = 'whitelist'; renderMode(); });
   $('modeBlacklist').addEventListener('click', () => { selectedMode = 'blacklist'; renderMode(); });
@@ -456,6 +1069,123 @@
     else toast(r.error || 'فشل الحفظ', 'error');
   });
 
+  if ($('fillSuspiciousBtn')) {
+    $('fillSuspiciousBtn').addEventListener('click', () => {
+      const defaults = ['wetransfer.com', 'mega.nz', 'mediafire.com', 'gofile.io', 'sendspace.com', '4shared.com', 'dropbox.com'];
+      const cur = ($('exfilSuspiciousInput').value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      defaults.forEach((d) => { if (!cur.includes(d)) cur.push(d); });
+      $('exfilSuspiciousInput').value = cur.join('\n');
+      toast('تم إدراج أشهر مواقع رفع الملفات — اضغط حفظ لتطبيقها');
+    });
+  }
+  if ($('copyErpMasterTokenBtn')) {
+    $('copyErpMasterTokenBtn').addEventListener('click', async () => {
+      const v = ($('erpMasterTokenInput') && $('erpMasterTokenInput').value || '').trim();
+      if (!v) return;
+      try {
+        await navigator.clipboard.writeText(v);
+        toast('✓ تم نسخ كود ربط السيستم: ' + v);
+      } catch (_) {
+        toast('تعذر النسخ التلقائي — انسخ الكود يدوياً', 'error');
+      }
+    });
+  }
+  if ($('saveDlpConfigBtn')) {
+    $('saveDlpConfigBtn').addEventListener('click', async () => {
+      if (!api.setDlpConfig) return;
+      const usbBlock = Boolean($('usbBlockToggle') && $('usbBlockToggle').checked);
+      const dlpSuperOnly = Boolean($('dlpSuperOnlyToggle') && $('dlpSuperOnlyToggle').checked);
+      const thresh = parseInt(($('exfilThresholdInput') && $('exfilThresholdInput').value) || '50', 10) || 50;
+      const winSecs = parseInt(($('exfilWindowInput') && $('exfilWindowInput').value) || '600', 10) || 600;
+      const susp = (($('exfilSuspiciousInput') && $('exfilSuspiciousInput').value) || '')
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const erpDomains = (($('erpDomainsInput') && $('erpDomainsInput').value) || 'elkhawaga.uk')
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const erpMasterToken = (($('erpMasterTokenInput') && $('erpMasterTokenInput').value) || '').trim();
+      try {
+        const r = await api.setDlpConfig(usbBlock, thresh, winSecs, susp, dlpSuperOnly, erpDomains, erpMasterToken);
+        if (r && r.success !== false) {
+          toast('✓ تم حفظ سياسات الحماية وربط سيستم الشركة ومزامنتها لكل الأجهزة');
+          await loadConfig();
+        } else toast((r && r.error) || 'فشل الحفظ', 'error');
+      } catch (e) { toast(e.message || 'فشل الحفظ', 'error'); }
+    });
+  }
+
+  let adminUpdateBusy = false;
+  async function refreshAdminUpdateUi(manualToast) {
+    if (!api.checkAdminUpdate) return;
+    try {
+      const info = await api.checkAdminUpdate();
+      const topBtn = $('adminUpdateTopBtn');
+      const badge = $('adminUpdateStatusBadge');
+      const details = $('adminUpdateDetailsText');
+      const runBtn = $('runAdminUpdateBtn');
+      if (!api.applyAdminUpdate) {
+        if (topBtn) topBtn.style.display = 'none';
+        if (badge) { badge.className = 'badge green'; badge.textContent = 'وضع المتصفح (محدّث تلقائياً)'; }
+        if (runBtn) runBtn.textContent = '↻ تحديث واجهة المتصفح';
+        return;
+      }
+      if (info && info.is_host_server) {
+        if (topBtn) topBtn.style.display = 'none';
+        if (badge) { badge.className = 'badge green'; badge.textContent = '✓ السيرفر الرئيسي (أحدث نسخة)'; }
+        if (details && info.remote_mtime_ms) {
+          details.innerHTML = 'أنت تعمل على السيرفر الرئيسي مباشرة. آخر حزمة تحديث للأدمن جاهزة للمهندسين بتاريخ: <b>' + esc(new Date(info.remote_mtime_ms).toLocaleString('ar-EG')) + '</b>.';
+        }
+        if (manualToast) toast('✓ هذا هو السيرفر الرئيسي ويعمل بأحدث إصدار');
+        return;
+      }
+      if (info && info.available) {
+        const dtStr = info.remote_mtime_ms ? new Date(info.remote_mtime_ms).toLocaleString('ar-EG') : '';
+        if (info.update_available) {
+          if (topBtn) topBtn.style.display = '';
+          if (badge) { badge.className = 'badge gold'; badge.textContent = '⬆ يتوفر تحديث جديد على السيرفر'; }
+          if (details) details.innerHTML = 'يتوفر إصدار أحدث من برنامج الأدمن على السيرفر بتاريخ <b>' + esc(dtStr) + '</b> — اضغط «تحديث برنامج الأدمن أونلاين الآن» للتنزيل والتثبيت التلقائي.';
+          if (manualToast) toast('⬆ يتوفر تحديث جديد لبرنامج الأدمن على السيرفر!');
+        } else {
+          if (topBtn) topBtn.style.display = 'none';
+          if (badge) { badge.className = 'badge green'; badge.textContent = '✓ محدّث لآخر إصدار'; }
+          if (details && dtStr) details.innerHTML = 'برنامج الأدمن لديك محدّث لآخر نسخة على السيرفر (<b>' + esc(dtStr) + '</b>). يمكنك أيضاً إعادة التحديث يدوياً في أي وقت.';
+          if (manualToast) toast('✓ برنامج الأدمن محدّث بالفعل لآخر إصدار');
+        }
+      } else if (manualToast) {
+        toast('تعذر الوصول لمعلومات التحديث على السيرفر حالياً', 'error');
+      }
+    } catch (_) {}
+  }
+
+  async function triggerAdminSelfUpdate() {
+    if (!api.applyAdminUpdate) {
+      location.reload();
+      return;
+    }
+    if (adminUpdateBusy) return;
+    if (!confirm('تحديث برنامج IT ELKHAWGA Admin أونلاين من السيرفر الآن؟\n\nسيتم تنزيل أحدث نسخة وتثبيتها ثم إعادة فتح البرنامج تلقائياً خلال ثوانٍ (اضغط "نعم / Yes" عند ظهور نافذة صلاحية التثبيت في Windows).')) return;
+    adminUpdateBusy = true;
+    toast('⬇ جارٍ تنزيل أحدث نسخة من برنامج الأدمن من السيرفر...');
+    try {
+      const r = await api.applyAdminUpdate();
+      if (r && r.success) {
+        toast('✓ اكتمل التنزيل — جارٍ تثبيت التحديث وإعادة تشغيل البرنامج...');
+      } else {
+        toast((r && r.error) || 'تعذر تحديث برنامج الأدمن', 'error');
+        adminUpdateBusy = false;
+      }
+    } catch (e) {
+      toast(e.message || 'تعذر تحديث برنامج الأدمن', 'error');
+      adminUpdateBusy = false;
+    }
+  }
+
+  if ($('checkAdminUpdateBtn')) $('checkAdminUpdateBtn').addEventListener('click', () => refreshAdminUpdateUi(true));
+  if ($('runAdminUpdateBtn')) $('runAdminUpdateBtn').addEventListener('click', triggerAdminSelfUpdate);
+  if ($('adminUpdateTopBtn')) $('adminUpdateTopBtn').addEventListener('click', triggerAdminSelfUpdate);
+
   /* ---------- Admin users ---------- */
   async function loadAdminUsers() {
     if (!api.getAdminUsers) return;
@@ -477,18 +1207,18 @@
       const role = String(u.role || 'admin');
       const state = role === 'super' ? '<span class="badge violet">Super</span>'
         : role === 'support' ? '<span class="badge gold">Support</span>'
-        : role === 'viewer' ? '<span class="badge gray">Viewer</span>'
-        : '<span class="badge green">Admin</span>';
+          : role === 'viewer' ? '<span class="badge gray">Viewer</span>'
+            : '<span class="badge green">Admin</span>';
       const actions = canManage
         ? '<button class="btn btn-ghost btn-sm" data-admin-edit="' + esc(u.username || '') + '" data-admin-role="' + esc(role) + '">تعديل</button> ' +
-          '<button class="btn btn-danger btn-sm" data-admin-remove="' + esc(u.username || '') + '">حذف</button>'
+        '<button class="btn btn-danger btn-sm" data-admin-remove="' + esc(u.username || '') + '">حذف</button>'
         : '<span class="badge gray">للقراءة فقط</span>';
       return '<tr>' +
         '<td><b>' + esc(u.username || '') + '</b></td>' +
         '<td>' + esc(role) + '</td>' +
         '<td>' + state + '</td>' +
         '<td>' + actions + '</td>' +
-      '</tr>';
+        '</tr>';
     }).join('');
     if (!canManage) {
       tbody.insertAdjacentHTML('beforeend', '<tr><td colspan="4"><div class="hint" style="margin:0;">فقط السوبر أدمن يمكنه إنشاء أو تعديل أو حذف حسابات المديرين.</div></td></tr>');
@@ -568,6 +1298,27 @@
   }
 
   const isTauriRuntime = Boolean(window.__TAURI__) || location.hostname === 'tauri.localhost' || (location.protocol !== 'http:' && location.protocol !== 'https:');
+  const isAppleTouch = /iPad|iPhone|iPod/i.test(navigator.userAgent || '')
+    || (navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1);
+  const isStandalonePwa = Boolean(
+    (window.navigator && window.navigator.standalone === true) ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+  );
+  if (isAppleTouch && !isStandalonePwa && !isTauriRuntime && $('iosInstallBanner')) {
+    try {
+      if (localStorage.getItem('itk_hide_ios_banner') !== '1') {
+        $('iosInstallBanner').style.display = 'flex';
+      }
+    } catch (_) {
+      $('iosInstallBanner').style.display = 'flex';
+    }
+    if ($('dismissIosBannerBtn')) {
+      $('dismissIosBannerBtn').addEventListener('click', () => {
+        $('iosInstallBanner').style.display = 'none';
+        try { localStorage.setItem('itk_hide_ios_banner', '1'); } catch (_) {}
+      });
+    }
+  }
   let serverHttpBase = isTauriRuntime ? 'http://127.0.0.1:8787' : '';
 
   async function loadServerInfo() {
@@ -624,13 +1375,17 @@
 
   async function ensureGroupsCache() {
     if (groupsCache.length) return;
-    try { const gr = await api.getRelayGroups(); groupsCache = (gr && gr.groups) || []; } catch (e) {}
+    try { const gr = await api.getRelayGroups(); groupsCache = (gr && gr.groups) || []; } catch (e) { }
   }
 
   function deviceRow(d, prefix) {
     const online = d.online;
+    const usbBlocked = Boolean(d.usb_blocked);
     const state = !online ? '<span class="badge gray">غير متصل</span>'
       : d.blocked ? '<span class="badge red">مقفول</span>' : '<span class="badge green">مفتوح</span>';
+    const usbStateBadge = usbBlocked
+      ? '<span class="badge amber" title="منافذ تخزين USB والفلاشات مقفولة على هذا الجهاز">🔌 USB مقفول</span>'
+      : '';
     let evBadge = '';
     if (d.last_event === 'unblock_password' && d.last_event_at) {
       evBadge = '<span class="badge gold">فتح بكلمة سر · ' + ago(d.last_event_at) + '</span>';
@@ -646,75 +1401,85 @@
       })
     ).join('');
     const groupSel = '<select class="input" style="padding:6px 10px;font-size:12.5px;min-width:130px;" data-dev-group="' + esc(d.device_id) + '" data-transport="' + prefix + '">' + opts + '</select>';
+    const usbBtn = usbBlocked
+      ? '<button class="btn btn-success btn-sm" data-dev-cmd="usb_unblock" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="فتح منافذ الفلاشات ووحدات التخزين USB لهذا الجهاز فقط">🔓 فتح USB</button> '
+      : '<button class="btn btn-ghost btn-sm" style="border-color:rgba(245,158,11,0.45);color:#d97706;" data-dev-cmd="usb_block" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="قفل منافذ الفلاشات ووحدات التخزين USB لهذا الجهاز فقط (دون المساس بالماوس أو الكيبورد)">🔌 قفل USB</button> ';
     const controls =
       (online ? '<button class="btn btn-danger btn-sm" data-dev-cmd="block" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '">قفل</button> ' +
-                '<button class="btn btn-success btn-sm" data-dev-cmd="unblock" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '">فتح</button> ' +
-                '<details class="power-menu"><summary class="btn btn-ghost btn-sm">⏻ الطاقة</summary><div class="power-list">' +
-                  '<button type="button" data-dev-cmd="restart" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">⟳ إعادة تشغيل</button>' +
-                  '<button type="button" class="danger" data-dev-cmd="shutdown" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">⏻ إيقاف التشغيل</button>' +
-                  '<button type="button" data-dev-cmd="cancel_power" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">✕ إلغاء الإيقاف/الريستارت</button>' +
-                '</div></details> ' +
-                '<button class="btn btn-ghost btn-sm" data-dev-cmd="update_client" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="إرسال وتثبيت أحدث إصدار من الكلاينت عن بُعد بصمت">⬆ تحديث</button> ' : '') +
+        '<button class="btn btn-success btn-sm" data-dev-cmd="unblock" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '">فتح</button> ' +
+        usbBtn +
+        '<details class="power-menu"><summary class="btn btn-ghost btn-sm">⏻ الطاقة</summary><div class="power-list">' +
+        '<button type="button" data-dev-cmd="restart" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">⟳ إعادة تشغيل</button>' +
+        '<button type="button" class="danger" data-dev-cmd="shutdown" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">⏻ إيقاف التشغيل</button>' +
+        '<button type="button" data-dev-cmd="cancel_power" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">✕ إلغاء الإيقاف/الريستارت</button>' +
+        '</div></details> ' +
+        '<button class="btn btn-ghost btn-sm" data-dev-cmd="update_client" data-id="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="إرسال وتثبيت أحدث إصدار من الكلاينت عن بُعد بصمت">⬆ تحديث</button> ' : '') +
       '<button class="btn btn-ghost btn-sm" data-rename-device="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-current-name="' + esc(d.label || '') + '">✎ اسم</button> ' +
-      '<button class="btn btn-ghost btn-sm" data-screen-device="' + esc(d.device_id) + '" data-rd-id="' + esc(d.rustdesk_id || '') + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="التقاط صورة للشاشة">🖥 شاشة</button> ' +
-      '<button class="btn btn-ghost btn-sm" data-watch-device="' + esc(d.device_id) + '" data-rd-id="' + esc(d.rustdesk_id || '') + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="مشاهدة سريعة للشاشة في بث حي (مشاهدة فقط بدون تحكم)">👁 مشاهدة</button> ' +
-      '<button class="btn btn-ghost btn-sm" data-camera-device="' + esc(d.device_id) + '" data-rd-id="' + esc(d.rustdesk_id || '') + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="مشاهدة بث الكاميرا الحي من جهاز الموظف (مشاهدة فقط بدون تحكم)">📷 كاميرا</button> ' +
+      '<button class="btn btn-ghost btn-sm" data-screen-device="' + esc(d.device_id) + '" data-rd-id="' + esc(d.rustdesk_id || '') + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-dev-ip="' + esc(d.ip || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="التقاط صورة للشاشة">🖥 شاشة</button> ' +
+      '<button class="btn btn-ghost btn-sm" data-watch-device="' + esc(d.device_id) + '" data-rd-id="' + esc(d.rustdesk_id || '') + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-dev-ip="' + esc(d.ip || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="مشاهدة سريعة للشاشة في بث حي (مشاهدة فقط بدون تحكم)">👁 مشاهدة</button> ' +
+      '<button class="btn btn-ghost btn-sm" data-camera-device="' + esc(d.device_id) + '" data-rd-id="' + esc(d.rustdesk_id || '') + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-dev-ip="' + esc(d.ip || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="مشاهدة بث الكاميرا الحي من جهاز الموظف (مشاهدة فقط بدون تحكم)">📷 كاميرا</button> ' +
       (d.rustdesk_id
-        ? '<button class="btn btn-ghost btn-sm" data-support-device="' + esc(d.rustdesk_id) + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="دعم فني كامل مع التحكم بالماوس والكيبورد">🛠 دعم</button> ' +
-          '<button class="btn btn-ghost btn-sm" data-rdpass-device="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-current-rdpass="' + esc(d.rustdesk_password || '') + '">🔑 كلمة</button> '
+        ? '<button class="btn btn-ghost btn-sm" data-support-device="' + esc(d.rustdesk_id) + '" data-rd-pass="' + esc(d.rustdesk_password || '') + '" data-dev-ip="' + esc(d.ip || '') + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '" title="دعم فني كامل مع التحكم بالماوس والكيبورد">🛠 دعم</button> ' +
+        '<button class="btn btn-ghost btn-sm" data-rdpass-device="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-current-rdpass="' + esc(d.rustdesk_password || '') + '">🔑 كلمة</button> '
         : '<a class="btn btn-ghost btn-sm" href="https://rustdesk.com" target="_blank" rel="noopener" style="text-decoration:none;">⬇ RustDesk</a> ') +
       '<button class="btn btn-ghost btn-sm btn-delete" data-delete-device="' + esc(d.device_id) + '" data-transport="' + prefix + '" data-device-name="' + esc(shown) + '">🗑 حذف</button>';
 
-    const searchText = [shown, d.hostname, d.ip, d.rustdesk_id, d.device_id].filter(Boolean).join(' ').toLowerCase();
+    const verStr = d.app_version || '1.0.0';
+    const isLatestVer = verStr === LATEST_CLIENT_VERSION;
+    const searchText = [shown, d.hostname, d.ip, d.rustdesk_id, d.device_id, 'v' + verStr].filter(Boolean).join(' ').toLowerCase();
     return '<div class="device-card' + (online ? (d.blocked ? ' is-blocked' : ' is-open') : ' is-offline') + '" data-device-id="' + esc(d.device_id) + '"' +
       ' data-online="' + (online ? '1' : '0') + '" data-blocked="' + (d.blocked ? '1' : '0') + '"' +
+      ' data-usb-blocked="' + (usbBlocked ? '1' : '0') + '"' +
+      ' data-outdated="' + (isLatestVer ? '0' : '1') + '"' +
       ' data-group="' + esc(d.group_id || '') + '" data-q="' + esc(searchText) + '">' +
       '<div class="device-card-header">' +
-        '<div class="device-info-main">' +
-          '<div class="device-avatar ' + (online ? 'online' : 'offline') + '">' +
-            '<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>' +
-          '</div>' +
-          '<div class="device-titles">' +
-            '<div class="device-name-row">' +
-              '<span class="device-name">' + esc(shown) + '</span>' +
-              '<span class="device-status-badge">' + state + '</span>' +
-              evBadge +
-            '</div>' +
-            '<div class="device-meta-row">' +
-              '<span class="device-meta-pill" style="background:' + (prefix === 'lan' ? 'rgba(14,165,233,0.12);color:#0284c7;' : 'rgba(139,92,246,0.12);color:#7c3aed;') + 'font-weight:700;">' + (prefix === 'lan' ? 'LAN محلي' : 'Relay سحابي') + '</span>' +
-              (sub ? '<span class="device-hostname-text">' + sub + '</span>' : '') +
-              '<span class="device-meta-pill ip">' + esc(d.ip || '—') + '</span>' +
-              '<span class="device-meta-pill time">' + (d.last_seen ? ago(d.last_seen) : '-') + '</span>' +
-              (rd ? '<span class="device-meta-pill rd">RustDesk: ' + rd + '</span>' : '') +
-            '</div>' +
-          '</div>' +
-        '</div>' +
-        '<div class="device-actions-toolbar">' +
-          controls +
-        '</div>' +
+      '<div class="device-info-main">' +
+      '<div class="device-avatar ' + (online ? 'online' : 'offline') + '">' +
+      '<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>' +
+      '</div>' +
+      '<div class="device-titles">' +
+      '<div class="device-name-row">' +
+      '<span class="device-name">' + esc(shown) + '</span>' +
+      '<span class="device-status-badge">' + state + '</span>' +
+      usbStateBadge +
+      evBadge +
+      '</div>' +
+      '<div class="device-meta-row">' +
+      '<span class="device-meta-pill" style="background:' + (prefix === 'lan' ? 'rgba(14,165,233,0.12);color:#0284c7;' : 'rgba(139,92,246,0.12);color:#7c3aed;') + 'font-weight:700;">' + (prefix === 'lan' ? 'LAN محلي' : 'Relay سحابي') + '</span>' +
+      '<span class="device-meta-pill mono" dir="ltr" style="background:' + (isLatestVer ? 'rgba(16,185,129,0.15);color:#059669;' : 'rgba(245,158,11,0.16);color:#d97706;') + 'font-weight:800;" title="' + (isLatestVer ? 'محدّث على آخر إصدار (v' + LATEST_CLIENT_VERSION + ')' : 'إصدار قديم (v' + esc(verStr) + ') — اضغط ⬆ تحديث للترقية إلى v' + LATEST_CLIENT_VERSION) + '">' + (isLatestVer ? '✓ v' : '⚠ v') + esc(verStr) + '</span>' +
+      (sub ? '<span class="device-hostname-text">' + sub + '</span>' : '') +
+      '<span class="device-meta-pill ip">' + esc(d.ip || '—') + '</span>' +
+      '<span class="device-meta-pill time">' + (d.last_seen ? ago(d.last_seen) : '-') + '</span>' +
+      (rd ? '<span class="device-meta-pill rd">RustDesk: ' + rd + '</span>' : '') +
+      '</div>' +
+      '</div>' +
+      '</div>' +
+      '<div class="device-actions-toolbar">' +
+      controls +
+      '</div>' +
       '</div>' +
       '<div class="device-card-body">' +
-        '<div class="device-config-item">' +
-          '<span class="device-config-label">المجموعة:</span>' +
-          groupSel +
-        '</div>' +
-        '<div class="device-config-item">' +
-          '<span class="device-config-label">السرعة:</span>' +
-          '<div class="device-throttle-wrap">' +
-            '<select class="input" data-throttle-input="' + esc(d.device_id) + '" data-transport="' + prefix + '" style="min-width:115px;padding:6px 10px;font-size:12.5px;">' +
-              speedOptions(d.throttle_kbps) +
-            '</select>' +
-            '<button class="btn btn-primary btn-sm" data-throttle-apply="' + esc(d.device_id) + '" data-transport="' + prefix + '">تعيين</button>' +
-          '</div>' +
-        '</div>' +
-        '<div class="device-config-item device-sites-item">' +
-          '<span class="device-config-label">المواقع:</span>' +
-          '<div class="device-sites-content">' +
-            sitesCell(d.sites, d.denied) +
-          '</div>' +
-        '</div>' +
+      '<div class="device-config-item">' +
+      '<span class="device-config-label">المجموعة:</span>' +
+      groupSel +
       '</div>' +
-    '</div>';
+      '<div class="device-config-item">' +
+      '<span class="device-config-label">السرعة:</span>' +
+      '<div class="device-throttle-wrap">' +
+      '<select class="input" data-throttle-input="' + esc(d.device_id) + '" data-transport="' + prefix + '" style="min-width:115px;padding:6px 10px;font-size:12.5px;">' +
+      speedOptions(d.throttle_kbps) +
+      '</select>' +
+      '<button class="btn btn-primary btn-sm" data-throttle-apply="' + esc(d.device_id) + '" data-transport="' + prefix + '">تعيين</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="device-config-item device-sites-item">' +
+      '<span class="device-config-label">المواقع:</span>' +
+      '<div class="device-sites-content">' +
+      sitesCell(d.sites, d.denied) +
+      '</div>' +
+      '</div>' +
+      '</div>' +
+      '</div>';
   }
 
   let lanTableHover = false;
@@ -725,26 +1490,79 @@
     if (e.target.closest && e.target.closest('#view-devices .devices-card-container')) lanTableHover = false;
   });
 
+  function buildDevicesRenderKey(devices, prefix) {
+    const grpKey = (groupsCache || []).map((g) => g.id + ':' + g.name).join(',');
+    return prefix + '|' + grpKey + '|' + (devices || []).map((d) => [
+      d.device_id || '',
+      d.online ? '1' : '0',
+      d.blocked ? '1' : '0',
+      d.usb_blocked ? '1' : '0',
+      d.app_version || '',
+      d.label || '',
+      d.hostname || '',
+      d.ip || '',
+      d.group_id || '',
+      d.throttle_kbps || 0,
+      d.rustdesk_id || '',
+      d.rustdesk_password || '',
+      d.last_event || '',
+      d.last_event_at || 0,
+      (d.sites || []).join(','),
+      (d.denied || []).join(','),
+    ].join('\x1f')).join('\n');
+  }
+
+  function refreshDeviceTimePills(containerId, devices) {
+    const box = $(containerId);
+    if (!box) return;
+    const byId = {};
+    (devices || []).forEach((d) => { if (d && d.device_id) byId[d.device_id] = d; });
+    box.querySelectorAll('.device-card').forEach((card) => {
+      const d = byId[card.dataset.deviceId];
+      if (!d) return;
+      const tEl = card.querySelector('.device-meta-pill.time');
+      if (tEl) {
+        const nextText = d.last_seen ? ago(d.last_seen) : '-';
+        if (tEl.textContent !== nextText) tEl.textContent = nextText;
+      }
+    });
+  }
+
+  let lanDevicesBusy = false;
+  let lastLanRenderKey = '';
   async function loadDevices() {
-    if (!api.getDevices) return;
+    if (!api.getDevices || lanDevicesBusy) return;
     const ae = document.activeElement;
     if (ae && ae.tagName === 'SELECT' && ae.closest('#view-devices')) return;
+    if (document.querySelector('#view-devices details.power-menu[open]')) return;
     if (lanTableHover) return;
-    await ensureGroupsCache();
-    let devices = [];
-    try { devices = (await api.getDevices()) || []; } catch (e) { devices = []; }
-    const online = devices.filter((d) => d.online).length;
-    if ($('navDeviceCount')) $('navDeviceCount').textContent = devices.length;
-    if ($('kpiLan')) $('kpiLan').textContent = online;
-    $('devicesEmpty').style.display = devices.length ? 'none' : 'block';
-    $('devicesBody').innerHTML = devices.map((d) => deviceRow(d, 'lan')).join('');
-    applyDeviceFilter('devicesBody');
+    lanDevicesBusy = true;
+    try {
+      await ensureGroupsCache();
+      let devices = [];
+      try { devices = (await api.getDevices()) || []; } catch (e) { devices = []; }
+      const online = devices.filter((d) => d.online).length;
+      if ($('navDeviceCount')) $('navDeviceCount').textContent = devices.length;
+      if ($('kpiLan')) $('kpiLan').textContent = online;
+      $('devicesEmpty').style.display = devices.length ? 'none' : 'block';
+      const bodyEl = $('devicesBody');
+      const nextKey = buildDevicesRenderKey(devices, 'lan');
+      if (nextKey !== lastLanRenderKey || bodyEl.querySelectorAll('.device-card').length !== devices.length) {
+        lastLanRenderKey = nextKey;
+        bodyEl.innerHTML = devices.map((d) => deviceRow(d, 'lan')).join('');
+        applyDeviceFilter('devicesBody');
+      } else {
+        refreshDeviceTimePills('devicesBody', devices);
+      }
+    } finally {
+      lanDevicesBusy = false;
+    }
   }
 
   /* ---------- بحث وفلترة الأجهزة (LAN و Relay) ---------- */
   const deviceFilters = {};
   const FILTER_PILLS = [
-    ['all', 'الكل'], ['online', 'متصل'], ['offline', 'غير متصل'], ['blocked', 'مقفول'], ['open', 'مفتوح'],
+    ['all', 'الكل'], ['online', 'متصل'], ['offline', 'غير متصل'], ['blocked', 'مقفول'], ['open', 'مفتوح'], ['usb_locked', 'USB مقفول'], ['outdated', 'يحتاج تحديث'],
   ];
 
   function mountDeviceToolbar(containerId) {
@@ -756,11 +1574,11 @@
     bar.id = containerId + 'Toolbar';
     bar.innerHTML =
       '<div class="dev-search">' +
-        '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>' +
-        '<input type="search" placeholder="بحث بالاسم أو IP أو رقم RustDesk..." data-dev-search>' +
+      '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>' +
+      '<input type="search" placeholder="بحث بالاسم أو IP أو رقم RustDesk..." data-dev-search>' +
       '</div>' +
       '<div class="dev-pills">' +
-        FILTER_PILLS.map((p) => '<button type="button" class="dev-pill' + (p[0] === 'all' ? ' active' : '') + '" data-dev-filter="' + p[0] + '">' + p[1] + ' <b>0</b></button>').join('') +
+      FILTER_PILLS.map((p) => '<button type="button" class="dev-pill' + (p[0] === 'all' ? ' active' : '') + '" data-dev-filter="' + p[0] + '">' + p[1] + ' <b>0</b></button>').join('') +
       '</div>' +
       '<select class="input dev-group-filter" data-dev-group-filter><option value="">كل المجموعات</option></select>';
     box.parentNode.insertBefore(bar, box);
@@ -793,20 +1611,24 @@
     const f = deviceFilters[containerId];
     if (!box || !f) return;
     const cards = Array.from(box.querySelectorAll('.device-card'));
-    const counts = { all: 0, online: 0, offline: 0, blocked: 0, open: 0 };
+    const counts = { all: 0, online: 0, offline: 0, blocked: 0, open: 0, usb_locked: 0, outdated: 0 };
     let visible = 0;
     cards.forEach((c) => {
       const on = c.dataset.online === '1';
       const bl = c.dataset.blocked === '1';
+      const ubl = c.dataset.usbBlocked === '1';
+      const out = c.dataset.outdated === '1';
       const inGroup = !f.group || c.dataset.group === f.group;
       const inSearch = !f.q || (c.dataset.q || '').includes(f.q);
       if (inGroup && inSearch) {
         counts.all++;
         counts[on ? 'online' : 'offline']++;
         if (on) counts[bl ? 'blocked' : 'open']++;
+        if (ubl) counts.usb_locked++;
+        if (out) counts.outdated++;
       }
       const statusOk = f.status === 'all' || (f.status === 'online' && on) || (f.status === 'offline' && !on) ||
-        (f.status === 'blocked' && on && bl) || (f.status === 'open' && on && !bl);
+        (f.status === 'blocked' && on && bl) || (f.status === 'open' && on && !bl) || (f.status === 'usb_locked' && ubl) || (f.status === 'outdated' && out);
       const show = inGroup && inSearch && statusOk;
       c.style.display = show ? '' : 'none';
       if (show) visible++;
@@ -849,14 +1671,17 @@
         : await api.sendDeviceCommand(b.dataset.id, cmd, currentAdminUser, currentAdminRole);
       if (r && r.success === false) { toast(r.error || 'فشل إرسال الأمر', 'error'); return; }
       const DONE = {
+        usb_block: '🔌 تم إرسال أمر قفل منافذ تخزين USB للجهاز',
+        usb_unblock: '🔓 تم إرسال أمر فتح منافذ تخزين USB للجهاز',
         restart: 'تم إرسال أمر إعادة التشغيل — يُنفَّذ بعد 60 ثانية',
         shutdown: 'تم إرسال أمر إيقاف التشغيل — يُنفَّذ بعد 60 ثانية',
         cancel_power: 'تم إرسال أمر الإلغاء',
         update_client: 'تم إرسال أمر التحديث الصامت — يُثبَّت ويعود للاتصال خلال دقيقة',
       };
       toast(DONE[cmd] || ('تم إرسال الأمر' + (isRelay ? ' للـ Relay' : '، يصل خلال ثوانٍ')));
+      setTimeout(isRelay ? loadRelayDevices : loadDevices, 400);
       if ($('view-groups') && $('view-groups').classList.contains('active')) {
-        setTimeout(loadGroups, 800);
+        setTimeout(loadGroups, 500);
       }
     } catch (err) { toast(err.message || 'فشل إرسال الأمر', 'error'); }
   });
@@ -889,8 +1714,8 @@
 
   // نفس الإجراءات الجماعية لأجهزة الـ Relay (خارج الشبكة المحلية)
   [['relayBlockAllBtn', 'block', 'قفل كل أجهزة الـ Relay؟', 'تم إرسال أمر القفل لكل أجهزة الـ Relay'],
-   ['relayUnblockAllBtn', 'unblock', 'فتح الإنترنت لكل أجهزة الـ Relay؟', 'تم إرسال أمر الفتح لكل أجهزة الـ Relay'],
-   ['relayUpdateAllBtn', 'update_client', 'إرسال وتثبيت أحدث نسخة من الكلاينت بصمت لكل أجهزة الـ Relay؟', 'تم إرسال أمر التحديث الصامت لكل أجهزة الـ Relay']]
+  ['relayUnblockAllBtn', 'unblock', 'فتح الإنترنت لكل أجهزة الـ Relay؟', 'تم إرسال أمر الفتح لكل أجهزة الـ Relay'],
+  ['relayUpdateAllBtn', 'update_client', 'إرسال وتثبيت أحدث نسخة من الكلاينت بصمت لكل أجهزة الـ Relay؟', 'تم إرسال أمر التحديث الصامت لكل أجهزة الـ Relay']]
     .forEach(([id, cmd, ask, done]) => {
       if (!$(id)) return;
       $(id).addEventListener('click', async () => {
@@ -904,6 +1729,45 @@
     });
 
   /* ---------- Relay ---------- */
+  let cachedOssInfo = null;
+  async function loadRustdeskOssStatus() {
+    if (!api.getRustdeskOssStatus) return;
+    try {
+      const st = await api.getRustdeskOssStatus();
+      cachedOssInfo = st;
+      if ($('rdOssLanHost') && st && st.lan_host) $('rdOssLanHost').textContent = st.lan_host;
+      if ($('rdOssPubKey')) $('rdOssPubKey').textContent = (st && st.public_key) || '—';
+      const badge = $('rdOssStatusBadge');
+      const usingOss = Boolean(st && st.active_server);
+      const localBtn = $('applyLocalRdOssBtn');
+      const hybridBtn = $('clearRdOssBtn');
+      if (localBtn && hybridBtn) {
+        if (usingOss) {
+          localBtn.className = 'btn btn-success btn-sm';
+          localBtn.textContent = '✓ السيرفر المحلي مفعّل (' + st.active_server + ')';
+          hybridBtn.className = 'btn btn-ghost btn-sm';
+          hybridBtn.textContent = '🌐 التبديل إلى الوضع الهجين (موصى به من خارج الشركة)';
+        } else {
+          localBtn.className = 'btn btn-ghost btn-sm';
+          localBtn.textContent = '⚡ تفعيل السيرفر المحلي للشبكة الداخلية فقط';
+          hybridBtn.className = 'btn btn-success btn-sm';
+          hybridBtn.textContent = '✓ الوضع الهجين نشط (سحابي للخارج + LAN مباشر بالداخل)';
+        }
+      }
+      if (badge) {
+        if (st && st.running) {
+          badge.className = usingOss ? 'badge gold' : 'badge green';
+          badge.textContent = usingOss
+            ? ('⚡ وضع السيرفر المحلي فقط (' + st.active_server + ')')
+            : '✓ الوضع الهجين مفعّل (يعمل داخل وخارج الشركة)';
+        } else {
+          badge.className = 'badge gray';
+          badge.textContent = 'الوضع الهجين السحابي نشط';
+        }
+      }
+    } catch (_) { }
+  }
+
   async function loadRelayConfig() {
     if (!api.getRelayConfig) return;
     try {
@@ -913,6 +1777,7 @@
       $('relayKeyInput').placeholder = c.has_admin_key ? 'مفتاح محفوظ (اتركه فارغاً للإبقاء عليه)' : 'مفتاح المدير للـ Relay';
       const su = $('relayStatusUrl');
       if (su) su.textContent = c.relay_url || '—';
+      if ($('ipadAppUrlText') && c.relay_url) $('ipadAppUrlText').textContent = c.relay_url;
       $('rdServerInput').value = c.rustdesk_server || '';
       $('rdKeyInput').value = c.rustdesk_key || '';
       $('rdPassInput').value = '';
@@ -922,6 +1787,57 @@
         toast('نسخة الـ Relay قديمة (' + c.relay_version + ') — أعِد تشغيل أحدث relay/server.js', 'error');
       }
     } catch (e) { /* ignore */ }
+    await loadRustdeskOssStatus();
+  }
+
+  if ($('applyLocalRdOssBtn')) {
+    $('applyLocalRdOssBtn').addEventListener('click', async () => {
+      if (!cachedOssInfo || !cachedOssInfo.public_key) await loadRustdeskOssStatus();
+      const host = (cachedOssInfo && cachedOssInfo.lan_host) || ($('rdOssLanHost') && $('rdOssLanHost').textContent) || '';
+      const pub = (cachedOssInfo && cachedOssInfo.public_key) || '';
+      if (!host || !pub) {
+        toast('لم يتم العثور على مفتاح خادم RustDesk OSS المحلي', 'error');
+        return;
+      }
+      if (!confirm('تفعيل خادم RustDesk OSS المحلي (' + host + ') لجميع الأجهزة؟\n\nملاحظة: للأجهزة داخل الشركة أو المتصلة عبر Tailscale يعمل بسرعة فائقة فوراً. للمهندسين خارج الشركة بدون VPN يلزم فتح المنافذ 21115–21119 على الراوتر.')) return;
+      $('rdServerInput').value = host;
+      $('rdKeyInput').value = pub;
+      const url = $('relayUrlInput').value.trim();
+      const c = await api.getConfig();
+      let pw = '';
+      if (c.has_password) {
+        pw = prompt('كلمة سر الحماية لتأكيد حفظ إعدادات السيرفر') || '';
+        if (!pw) return;
+      }
+      const r = await api.setRelayConfig(url, null, pw || null, host, pub, null);
+      if (r && r.success) {
+        toast('⚡ تم تفعيل خادم RustDesk OSS المحلي ومزامنته مع كل الأجهزة');
+        await loadRelayConfig();
+      } else {
+        toast((r && r.error) || 'فشل الحفظ', 'error');
+      }
+    });
+  }
+
+  if ($('clearRdOssBtn')) {
+    $('clearRdOssBtn').addEventListener('click', async () => {
+      $('rdServerInput').value = '';
+      $('rdKeyInput').value = '';
+      const url = $('relayUrlInput').value.trim();
+      const c = await api.getConfig();
+      let pw = '';
+      if (c.has_password) {
+        pw = prompt('كلمة سر الحماية لتأكيد تفعيل الوضع الهجين') || '';
+        if (!pw) return;
+      }
+      const r = await api.setRelayConfig(url, null, pw || null, '', '', null);
+      if (r && r.success) {
+        toast('🌐 تم تفعيل الوضع الهجين (اتصال LAN مباشر بالداخل + سحابي للمهندسين بالخارج)');
+        await loadRelayConfig();
+      } else {
+        toast((r && r.error) || 'فشل الحفظ', 'error');
+      }
+    });
   }
 
   $('saveRelayBtn').addEventListener('click', async () => {
@@ -937,8 +1853,8 @@
     const rdServer = $('rdServerInput').value.trim();
     const rdKey = $('rdKeyInput').value.trim();
     const rdPass = $('rdPassInput').value.trim();
-    const r = await api.setRelayConfig(url, key || null, pw || null, rdServer || null, rdKey || null, rdPass || null);
-    if (r.success) { toast('تم حفظ إعدادات الـ Relay'); await loadRelayDevices(); }
+    const r = await api.setRelayConfig(url, key || null, pw || null, rdServer, rdKey, rdPass || null);
+    if (r.success) { toast('تم حفظ إعدادات الـ Relay ومزامنتها'); await loadRelayConfig(); await loadRelayDevices(); }
     else toast(r.error || 'فشل الحفظ', 'error');
   });
 
@@ -954,24 +1870,29 @@
   });
 
   let relayTableHover = false;
+  const isCoarseTouch = Boolean(window.matchMedia && window.matchMedia('(hover: none), (pointer: coarse)').matches);
   document.addEventListener('mouseover', (e) => {
+    if (isCoarseTouch) return;
     if (e.target.closest && e.target.closest('#view-relay .devices-card-container')) relayTableHover = true;
   });
   document.addEventListener('mouseout', (e) => {
+    if (isCoarseTouch) return;
     if (e.target.closest && e.target.closest('#view-relay .devices-card-container')) relayTableHover = false;
   });
 
   let relayDevicesBusy = false;
   let lastRelayDevicesSnapshot = [];
+  let lastRelayRenderKey = '';
   async function loadRelayDevices() {
     if (!api.getRelayDevices || relayDevicesBusy) return;
     const ae = document.activeElement;
     if (ae && ae.tagName === 'SELECT' && ae.closest('#view-relay')) return;
+    if (document.querySelector('#view-relay details.power-menu[open]')) return;
     if (relayTableHover) return;
     relayDevicesBusy = true;
     try {
       if (!groupsCache.length) {
-        try { const gr = await api.getRelayGroups(); groupsCache = (gr && gr.groups) || []; } catch (e) {}
+        try { const gr = await api.getRelayGroups(); groupsCache = (gr && gr.groups) || []; } catch (e) { }
       }
       let devices = [];
       try {
@@ -984,8 +1905,15 @@
       if (rc) rc.textContent = devices.length;
       const rs = $('kpiRelay');
       if (rs) rs.textContent = devices.filter(function (x) { return x.online; }).length;
-      $('relayDevicesBody').innerHTML = devices.map((d) => deviceRow(d, 'relay')).join('');
-      applyDeviceFilter('relayDevicesBody');
+      const bodyEl = $('relayDevicesBody');
+      const nextKey = buildDevicesRenderKey(devices, 'relay');
+      if (nextKey !== lastRelayRenderKey || bodyEl.querySelectorAll('.device-card').length !== devices.length) {
+        lastRelayRenderKey = nextKey;
+        bodyEl.innerHTML = devices.map((d) => deviceRow(d, 'relay')).join('');
+        applyDeviceFilter('relayDevicesBody');
+      } else {
+        refreshDeviceTimePills('relayDevicesBody', devices);
+      }
     } finally {
       relayDevicesBusy = false;
     }
@@ -1022,10 +1950,12 @@
     if (!raw) return null;
     if (typeof raw === 'object') return raw;
     if (typeof raw === 'string' && raw.trim().startsWith('{')) {
-      try { return JSON.parse(raw); } catch (e) {}
+      try { return JSON.parse(raw); } catch (e) { }
     }
     return null;
   }
+
+  let lastLoadedAlerts = [];
 
   async function loadAlerts() {
     if (!api.getRelayAlerts) return;
@@ -1043,8 +1973,42 @@
     if (shotKeys.length > 40) shotKeys.slice(0, shotKeys.length - 40).forEach((k) => { delete alertShotCache[k]; });
     const camKeys = Object.keys(alertCamCache);
     if (camKeys.length > 40) camKeys.slice(0, camKeys.length - 40).forEach((k) => { delete alertCamCache[k]; });
+    lastLoadedAlerts = alerts;
+    renderFilteredAlerts();
+  }
+
+  function renderFilteredAlerts() {
+    const q = (($('alertSearchInput') && $('alertSearchInput').value) || '').trim().toLowerCase();
+    const sevFilter = ($('alertSeverityFilter') && $('alertSeverityFilter').value) || '';
+    const unackedTotal = lastLoadedAlerts.filter((a) => !a.acked).length;
+    const exfilCount = lastLoadedAlerts.filter((a) => a.type === 'exfil').length;
+    const tamperCount = lastLoadedAlerts.filter((a) => a.type === 'tamper' || a.type === 'auth_fail' || a.type === 'bypass').length;
+    if ($('alertsStatUnacked')) $('alertsStatUnacked').textContent = unackedTotal + ' غير مقرّة';
+    if ($('alertsStatExfil')) $('alertsStatExfil').textContent = exfilCount + ' رفع ملفات';
+    if ($('alertsStatTamper')) $('alertsStatTamper').textContent = tamperCount + ' تلاعب / مصادقة';
+
+    const alerts = lastLoadedAlerts.filter((a) => {
+      if (sevFilter && (a.severity || 'medium') !== sevFilter) return false;
+      if (q) {
+        const m = parseAlertMeta(a.meta) || {};
+        const hay = [
+          a.device_name,
+          a.device_id,
+          a.message,
+          a.type,
+          m.file_name,
+          m.recipient_name,
+          m.recipient_phone,
+          m.windows_user,
+          m.page_url,
+        ].join(' ').toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
     if (!alerts.length) {
-      $('alertsList').innerHTML = '<div class="empty">لا توجد تنبيهات.</div>';
+      $('alertsList').innerHTML = '<div class="empty">لا توجد تنبيهات مطابقة.</div>';
       return;
     }
     $('alertsList').innerHTML = alerts.map(function (a) {
@@ -1067,9 +2031,9 @@
       const camMime = (cachedCam && !String(cachedCam).startsWith('iVBOR')) ? 'image/jpeg' : 'image/png';
       const thumbsHtml = (cachedShot || cachedCam)
         ? '<div style="grid-column:1 / -1;display:flex;gap:10px;flex-wrap:wrap;margin-top:4px;">' +
-            (cachedCam ? '<div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:700;color:#fca5a5;">📷 كاميرا الموظف</span><img data-alert-cam="' + esc(a.id) + '" data-device-name="' + esc(devLabel) + '" data-shot-time="' + esc(ago(a.created_at)) + '" src="data:' + camMime + ';base64,' + esc(cachedCam) + '" alt="cam" style="height:88px;width:auto;border-radius:8px;border:2px solid rgba(239,68,68,.55);cursor:pointer;object-fit:cover;"></div>' : '') +
-            (cachedShot ? '<div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:700;color:#93c5fd;">📸 لقطة الشاشة</span><img data-alert-shot="' + esc(a.id) + '" data-device-name="' + esc(devLabel) + '" data-shot-time="' + esc(ago(a.created_at)) + '" src="data:' + (String(cachedShot).startsWith('iVBOR') ? 'image/png' : 'image/jpeg') + ';base64,' + esc(cachedShot) + '" alt="screen" style="height:88px;width:auto;border-radius:8px;border:1px solid rgba(148,163,184,.35);cursor:pointer;object-fit:cover;"></div>' : '') +
-          '</div>'
+        (cachedCam ? '<div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:700;color:#fca5a5;">📷 كاميرا الموظف</span><img data-alert-cam="' + esc(a.id) + '" data-device-name="' + esc(devLabel) + '" data-shot-time="' + esc(ago(a.created_at)) + '" src="data:' + camMime + ';base64,' + esc(cachedCam) + '" alt="cam" style="height:88px;width:auto;border-radius:8px;border:2px solid rgba(239,68,68,.55);cursor:pointer;object-fit:cover;"></div>' : '') +
+        (cachedShot ? '<div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:700;color:#93c5fd;">📸 لقطة الشاشة</span><img data-alert-shot="' + esc(a.id) + '" data-device-name="' + esc(devLabel) + '" data-shot-time="' + esc(ago(a.created_at)) + '" src="data:' + (String(cachedShot).startsWith('iVBOR') ? 'image/png' : 'image/jpeg') + ';base64,' + esc(cachedShot) + '" alt="screen" style="height:88px;width:auto;border-radius:8px;border:1px solid rgba(148,163,184,.35);cursor:pointer;object-fit:cover;"></div>' : '') +
+        '</div>'
         : '';
       const isUploadAlert = !!(meta && (meta.channel === 'whatsapp_web' || meta.channel === 'web_upload' || meta.file_name));
       let detailsHtml = '';
@@ -1087,16 +2051,20 @@
           '<div>💻 <b>مستخدم الجهاز:</b> <span class="mono">' + esc(meta.windows_user || '—') + '</span></div>' +
           (meta.file_path ? ('<div style="grid-column:1 / -1;word-break:break-all;">📂 <b>المسار:</b> <span class="mono">' + esc(meta.file_path) + '</span></div>') : '') +
           thumbsHtml +
-        '</div>';
+          '</div>';
       } else if (meta && (hasShot || hasCam || meta.windows_user || meta.page_url)) {
         detailsHtml = '<div style="margin-top:8px;padding:8px 12px;border-radius:10px;background:rgba(15,23,42,0.06);border:1px solid rgba(148,163,184,0.22);display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:6px 12px;font-size:12px;">' +
           (meta.windows_user ? ('<div>💻 <b>مستخدم الجهاز:</b> <span class="mono">' + esc(meta.windows_user) + '</span></div>') : '') +
           (meta.page_url ? ('<div>🌐 <b>النافذة/الموقع:</b> <span class="mono">' + esc(meta.page_url) + '</span></div>') : '') +
           thumbsHtml +
-        '</div>';
+          '</div>';
       }
-      const dlBtn = (meta && meta.uploaded_file_id)
-        ? '<a class="btn btn-success btn-sm" data-download-upload="' + esc(meta.uploaded_file_id) + '" data-file-name="' + esc((meta && meta.file_name) || 'file') + '" href="' + esc(serverHttpBase + '/api/uploads/' + encodeURIComponent(meta.uploaded_file_id)) + '" target="_blank" download="' + esc((meta && meta.file_name) || 'file') + '" style="text-decoration:none;">⬇ تحميل النسخة طبق الأصل</a>'
+      const dlHref = (meta && meta.uploaded_file_id)
+        ? (serverHttpBase + '/api/uploads/' + encodeURIComponent(meta.uploaded_file_id) + (authToken ? ('?token=' + encodeURIComponent(authToken)) : ''))
+        : '';
+      const hideDlpForNonSuper = Boolean($('dlpSuperOnlyToggle') && $('dlpSuperOnlyToggle').checked && !hasSuperAdminAccess());
+      const dlBtn = (meta && meta.uploaded_file_id && !hideDlpForNonSuper)
+        ? '<a class="btn btn-success btn-sm" data-download-upload="' + esc(meta.uploaded_file_id) + '" data-file-name="' + esc((meta && meta.file_name) || 'file') + '" href="' + esc(dlHref) + '" target="_blank" rel="noreferrer" download="' + esc((meta && meta.file_name) || 'file') + '" style="text-decoration:none;">⬇ تحميل النسخة طبق الأصل</a>'
         : '';
       const camBtn = hasCam
         ? '<button class="btn btn-danger btn-sm" data-alert-cam="' + esc(a.id) + '" data-device-name="' + esc(devLabel) + '" data-shot-time="' + esc(ago(a.created_at)) + '">📷 صورة الكاميرا</button>'
@@ -1110,15 +2078,15 @@
       const ackBtn = ackedFlag ? '' : '<button class="btn btn-ghost btn-sm" data-ack-alert="' + esc(a.id) + '">إقرار</button>';
       return '<div class="card" style="margin-bottom:12px;border-inline-start:4px solid ' + color + ';background:' + bg + ';">' +
         '<div style="display:flex;justify-content:space-between;align-items:start;gap:12px;flex-wrap:wrap;">' +
-          '<div style="flex:1 1 320px;min-width:0;">' +
-            '<div style="font-weight:800;font-size:14px;color:' + color + ';">' + esc(TYPE_LABEL[a.type] || a.type) + ' · ' + esc(sev.toUpperCase()) + '</div>' +
-            '<div style="font-size:12.5px;color:var(--text);margin-top:4px;">' + esc(a.message) + '</div>' +
-            detailsHtml +
-            '<div class="mono" style="font-size:11px;color:#94a3b8;margin-top:6px;">' + esc(devLabel) + ' · ' + ago(a.created_at) + (ackedFlag ? ' · مُقرَّة' : '') + '</div>' +
-          '</div>' +
-          '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">' + dlBtn + camBtn + shotBtn + liveBtn + ackBtn + '</div>' +
+        '<div style="flex:1 1 320px;min-width:0;">' +
+        '<div style="font-weight:800;font-size:14px;color:' + color + ';">' + esc(TYPE_LABEL[a.type] || a.type) + ' · ' + esc(sev.toUpperCase()) + '</div>' +
+        '<div style="font-size:12.5px;color:var(--text);margin-top:4px;">' + esc(a.message) + '</div>' +
+        detailsHtml +
+        '<div class="mono" style="font-size:11px;color:#94a3b8;margin-top:6px;">' + esc(devLabel) + ' · ' + ago(a.created_at) + (ackedFlag ? ' · مُقرَّة' : '') + '</div>' +
         '</div>' +
-      '</div>';
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">' + dlBtn + camBtn + shotBtn + liveBtn + ackBtn + '</div>' +
+        '</div>' +
+        '</div>';
     }).join('');
   }
 
@@ -1145,7 +2113,7 @@
           if (media && media.screenshot) alertShotCache[aid] = media.screenshot;
           if (media && media.camera_photo) alertCamCache[aid] = media.camera_photo;
           b64 = alertCamCache[aid] || '';
-        } catch (_) {}
+        } catch (_) { }
       }
       if (!b64) {
         $('screenModal').classList.remove('show');
@@ -1183,7 +2151,7 @@
           if (media && media.screenshot) alertShotCache[aid] = media.screenshot;
           if (media && media.camera_photo) alertCamCache[aid] = media.camera_photo;
           b64 = alertShotCache[aid] || '';
-        } catch (_) {}
+        } catch (_) { }
       }
       if (!b64) {
         $('screenModal').classList.remove('show');
@@ -1212,6 +2180,50 @@
   $('refreshAlertsBtn').addEventListener('click', loadAlerts);
   $('alertFilter').addEventListener('change', loadAlerts);
   $('alertAckFilter').addEventListener('change', loadAlerts);
+  if ($('alertSeverityFilter')) $('alertSeverityFilter').addEventListener('change', renderFilteredAlerts);
+  if ($('alertSearchInput')) $('alertSearchInput').addEventListener('input', renderFilteredAlerts);
+  if ($('ackAllAlertsBtn')) {
+    $('ackAllAlertsBtn').addEventListener('click', async () => {
+      if (!api.ackAllAlerts) return;
+      const curType = $('alertFilter').value || null;
+      if (!confirm(curType ? 'إقرار جميع التنبيهات غير المقرّة من هذا النوع؟' : 'إقرار جميع التنبيهات غير المقرّة؟')) return;
+      try {
+        const r = await api.ackAllAlerts(curType);
+        if (r && r.success !== false) {
+          toast('✓ تم إقرار التنبيهات بنجاح');
+          await loadAlerts();
+          await loadAudit();
+        } else toast((r && r.error) || 'فشل إقرار التنبيهات', 'error');
+      } catch (e) { toast(e.message || 'فشل إقرار التنبيهات', 'error'); }
+    });
+  }
+  if ($('exportAlertsCsvBtn')) {
+    $('exportAlertsCsvBtn').addEventListener('click', async () => {
+      if (!lastLoadedAlerts.length) {
+        toast('لا توجد تنبيهات لتصديرها حالياً', 'error');
+        return;
+      }
+      const header = ['التاريخ والوقت', 'الجهاز', 'النوع', 'الخطورة', 'التفاصيل', 'الملف', 'المرسل إليه', 'رقم الهاتف', 'مستخدم الويندوز', 'الحالة'].map(csvCell).join(',');
+      const rows = lastLoadedAlerts.map((a) => {
+        const m = parseAlertMeta(a.meta) || {};
+        const dt = a.created_at ? new Date(a.created_at).toLocaleString('ar-EG') : '';
+        return [
+          dt,
+          a.device_name || a.device_id || '',
+          TYPE_LABEL[a.type] || a.type || '',
+          (a.severity || '').toUpperCase(),
+          a.message || '',
+          m.file_name || '',
+          m.recipient_name || '',
+          m.recipient_phone || '',
+          m.windows_user || '',
+          a.acked ? 'مقرّة' : 'غير مقرّة',
+        ].map(csvCell).join(',');
+      });
+      const d = new Date().toISOString().slice(0, 10);
+      await saveDownloadText([header].concat(rows).join('\r\n'), 'IT-ELKHAWGA-Alerts-' + d + '.csv', 'text/csv;charset=utf-8');
+    });
+  }
 
   async function loadAudit() {
     if (!api.getAuditLog) return;
@@ -1241,6 +2253,35 @@
   let liveWatchMode = false;
   let lastScreenAt = 0;
   let screenPolling = false;
+  function openIpadRustdeskSheet(rdId, rdPass, deviceName) {
+    const cleanId = String(rdId || '').replace(/\s+/g, '');
+    if (!cleanId) {
+      toast('لا يوجد RustDesk ID مسجل لهذا الجهاز بعد', 'error');
+      return;
+    }
+    const pw = String(rdPass || '').trim() || 'KH2027kh';
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(pw).catch(() => {});
+      }
+    } catch (_) {}
+    if ($('ipadRdTitle')) $('ipadRdTitle').textContent = '🚀 الاتصال عبر RustDesk — ' + (deviceName || cleanId);
+    if ($('ipadRdIdText')) $('ipadRdIdText').textContent = cleanId;
+    if ($('ipadRdPassText')) $('ipadRdPassText').textContent = pw;
+    if ($('ipadRdLaunchLink')) {
+      $('ipadRdLaunchLink').href = 'rustdesk://connection/new/' + encodeURIComponent(cleanId) + '?password=' + encodeURIComponent(pw);
+    }
+    if ($('ipadRustdeskModal')) $('ipadRustdeskModal').classList.add('show');
+  }
+  if ($('ipadRdCloseBtn')) {
+    $('ipadRdCloseBtn').addEventListener('click', () => $('ipadRustdeskModal').classList.remove('show'));
+  }
+  if ($('ipadRustdeskModal')) {
+    $('ipadRustdeskModal').addEventListener('click', (e) => {
+      if (e.target.id === 'ipadRustdeskModal') $('ipadRustdeskModal').classList.remove('show');
+    });
+  }
+
   function updateLiveToggleUi() {
     const btn = $('screenLiveToggleBtn');
     if (btn) {
@@ -1255,12 +2296,23 @@
         btn.classList.add('btn-ghost');
       }
     }
+    const rdAppBtn = $('screenOpenRdAppBtn');
+    if (rdAppBtn) {
+      rdAppBtn.style.display = (isAppleTouch && currentScreenRdId) ? '' : 'none';
+    }
+  }
+  if ($('screenOpenRdAppBtn')) {
+    $('screenOpenRdAppBtn').addEventListener('click', () => {
+      if (currentScreenRdId) {
+        openIpadRustdeskSheet(currentScreenRdId, currentScreenRdPass, ($('screenTitle').textContent || '').replace(/^.*?—\s*/, ''));
+      }
+    });
   }
   function stopScreenTimer() {
     if (screenTimer) { clearInterval(screenTimer); screenTimer = null; }
     if (streamRenewTimer) { clearInterval(streamRenewTimer); streamRenewTimer = null; }
     if (currentScreenDevice && (currentScreenMode === 'screen' || currentScreenMode === 'camera')) {
-      api.requestScreenshot(currentScreenDevice, currentScreenTransport, 'stop').catch(() => {});
+      api.requestScreenshot(currentScreenDevice, currentScreenTransport, 'stop').catch(() => { });
     }
     screenPolling = false;
     liveWatchMode = false;
@@ -1269,7 +2321,7 @@
   }
   async function requestAndLoadScreen(deviceId, transport, mode) {
     const reqMode = mode || currentScreenMode || 'once';
-    try { await api.requestScreenshot(deviceId, transport, reqMode); } catch (e) {}
+    try { await api.requestScreenshot(deviceId, transport, reqMode); } catch (e) { }
     await pollScreen(deviceId, transport);
   }
   async function pollScreen(deviceId, transport) {
@@ -1345,19 +2397,19 @@
     $('screenTitle').textContent = normMode === 'camera'
       ? ('📷 كاميرا الموظف (مشاهدة فقط) — ' + name)
       : normMode === 'screen'
-      ? ('👁 مشاهدة الشاشة بث حي (بدون تحكم) — ' + name)
-      : ('شاشة ' + name);
+        ? ('👁 مشاهدة الشاشة بث حي (بدون تحكم) — ' + name)
+        : ('شاشة ' + name);
     $('screenStatus').textContent = normMode === 'camera'
       ? '📷 جارٍ فتح البث الحي للكاميرا...'
       : normMode === 'screen'
-      ? '👁 جارٍ فتح البث الحي السريع...'
-      : 'جارٍ طلب لقطة شاشة...';
+        ? '👁 جارٍ فتح البث الحي السريع...'
+        : 'جارٍ طلب لقطة شاشة...';
     $('screenModal').classList.add('show');
     requestAndLoadScreen(deviceId, currentScreenTransport, currentScreenMode);
     if (liveWatchMode) {
       streamRenewTimer = setInterval(() => {
         if (currentScreenDevice === deviceId && liveWatchMode) {
-          api.requestScreenshot(deviceId, currentScreenTransport, currentScreenMode).catch(() => {});
+          api.requestScreenshot(deviceId, currentScreenTransport, currentScreenMode).catch(() => { });
         }
       }, 4000);
       screenTimer = setInterval(() => pollScreen(deviceId, currentScreenTransport), 250);
@@ -1423,7 +2475,7 @@
     $('screenLiveToggleBtn').addEventListener('click', () => {
       if (!currentScreenDevice) return;
       if (liveWatchMode) {
-        api.requestScreenshot(currentScreenDevice, currentScreenTransport, 'stop').catch(() => {});
+        api.requestScreenshot(currentScreenDevice, currentScreenTransport, 'stop').catch(() => { });
         if (streamRenewTimer) { clearInterval(streamRenewTimer); streamRenewTimer = null; }
         if (screenTimer) { clearInterval(screenTimer); screenTimer = null; }
         liveWatchMode = false;
@@ -1437,7 +2489,9 @@
 
   function startRelayTimer() {
     stopRelayTimer();
-    relayTimer = setInterval(loadRelayDevices, 3000);
+    relayTimer = setInterval(() => {
+      if (!document.hidden) loadRelayDevices();
+    }, 3000);
   }
   function stopRelayTimer() {
     if (relayTimer) { clearInterval(relayTimer); relayTimer = null; }
@@ -1469,8 +2523,8 @@
         if (key === 'engagement') {
           const pct = list.length ? Math.round((online.length / list.length) * 100) : 0;
           html = '<div class="list-item"><span>المتصلون الآن</span><b>' + online.length + '</b></div>' +
-                 '<div class="list-item"><span>إجمالي الأجهزة</span><b>' + list.length + '</b></div>' +
-                 '<div class="list-item"><span>النسبة</span><b>' + pct + '%</b></div>';
+            '<div class="list-item"><span>إجمالي الأجهزة</span><b>' + list.length + '</b></div>' +
+            '<div class="list-item"><span>النسبة</span><b>' + pct + '%</b></div>';
         } else if (!list.length) {
           html = '<div class="empty">لا توجد أجهزة مربوطة</div>';
         } else {
@@ -1484,7 +2538,7 @@
         const statsObj = (r && (r.stats || r.kpis)) || {};
         const n = statsObj.orders ? statsObj.orders.value : 0;
         html = '<div class="list-item"><span>أوامر معلّقة غير مؤكَّدة</span><b>' + n + '</b></div>' +
-               '<div class="hint">أوامر القفل/الفتح التي لم يؤكّدها الجهاز بعد.</div>';
+          '<div class="hint">أوامر القفل/الفتح التي لم يؤكّدها الجهاز بعد.</div>';
       } else if (key === 'allowed' || key === 'blocked') {
         const sites = key === 'allowed' ? await api.getAllowedSites() : await api.getBlockedSites();
         html = sites.length
@@ -1494,9 +2548,9 @@
         const devices = (await api.getDevices()) || [];
         html = devices.length
           ? devices.map((d) =>
-              '<div class="list-item"><span>' + esc(d.hostname || d.device_id) + '</span>' +
-              '<span class="badge ' + (d.online ? 'green' : 'gray') + '">' + (d.online ? 'متصل' : 'غير متصل') + '</span></div>'
-            ).join('')
+            '<div class="list-item"><span>' + esc(d.hostname || d.device_id) + '</span>' +
+            '<span class="badge ' + (d.online ? 'green' : 'gray') + '">' + (d.online ? 'متصل' : 'غير متصل') + '</span></div>'
+          ).join('')
           : '<div class="empty">لا توجد أجهزة محلية</div>';
       }
     } catch (e) {
@@ -1576,11 +2630,13 @@
     const allowed = (g.allowed || []).join('\n');
     const blocked = (g.blocked || []).join('\n');
     const ephem = Boolean(g.ephemeral_browser);
+    const usbGrp = Boolean(g.usb_block);
     const list = Array.isArray(groupDevices) ? groupDevices : [];
     const others = Array.isArray(otherDevices) ? otherDevices : [];
     const isOpen = !collapsedGroups.has(g.id);
     const onlineCount = list.filter((d) => d.online).length;
     const blockedCount = list.filter((d) => d.online && d.blocked).length;
+    const usbBlockedCount = list.filter((d) => d.usb_blocked).length;
     const addOpts = ['<option value="">' + (others.length ? '— اختر جهازاً لضمه لهذه المجموعة —' : '— لا توجد أجهزة أخرى خارج المجموعة —') + '</option>'].concat(
       others.map((d) => {
         const dName = d.label || d.hostname || d.device_id;
@@ -1597,49 +2653,59 @@
       : '<div class="empty" style="padding:18px 12px;font-size:13px;">لا توجد أجهزة مضافة في هذه المجموعة بعد. يمكنك ضم جهاز من القائمة أعلاه أو من صفحة الأجهزة.</div>';
     return '<div class="card group-card">' +
       '<div class="group-card-top" data-group-header-toggle="' + esc(g.id) + '" style="cursor:pointer;" title="اضغط لعرض أو إخفاء أجهزة المجموعة">' +
-        '<input class="input g-name-input" data-g-name="' + esc(g.id) + '" value="' + esc(g.name) + '">' +
-        '<select class="input g-mode-select" data-g-mode="' + esc(g.id) + '">' +
-          '<option value="whitelist"' + (g.mode === 'whitelist' ? ' selected' : '') + '>Whitelist</option>' +
-          '<option value="blacklist"' + (g.mode === 'blacklist' ? ' selected' : '') + '>Blacklist</option>' +
-        '</select>' +
-        '<span class="badge violet" data-toggle-group-devices="' + esc(g.id) + '" style="cursor:pointer;">🖥 ' + list.length + ' جهاز ' + (isOpen ? '▴' : '▾') + '</span>' +
-        '<span class="badge ' + (ephem ? 'green' : 'gray') + '">' + (ephem ? '🧹 تصفح نظيف مفعّل' : 'تصفح عادي') + '</span>' +
-        '<div class="group-card-actions">' +
-          '<button class="btn btn-primary btn-sm" data-save-group="' + esc(g.id) + '">حفظ</button>' +
-          '<button class="btn ' + (ephem ? 'btn-success' : 'btn-ghost') + ' btn-sm" data-toggle-ephemeral="' + esc(g.id) + '" data-ephem="' + (ephem ? '1' : '0') + '">' + (ephem ? '🧹 التصفح النظيف: مفعّل (إيقاف)' : '🧹 تفعيل التصفح النظيف') + '</button>' +
-          '<button class="btn btn-danger btn-sm" data-grp-cmd="block" data-id="' + esc(g.id) + '">قفل المجموعة</button>' +
-          '<button class="btn btn-success btn-sm" data-grp-cmd="unblock" data-id="' + esc(g.id) + '">فتح المجموعة</button>' +
-          '<button class="btn btn-ghost btn-sm" data-grp-cmd="update_client" data-id="' + esc(g.id) + '" title="إرسال وتثبيت أحدث نسخة من الكلاينت بصمت لكل أجهزة المجموعة">⬆ تحديث الكلاينت</button>' +
-          '<button class="btn btn-ghost btn-sm" data-del-group="' + esc(g.id) + '">حذف</button>' +
-        '</div>' +
+      '<input class="input g-name-input" data-g-name="' + esc(g.id) + '" value="' + esc(g.name) + '">' +
+      '<select class="input g-mode-select" data-g-mode="' + esc(g.id) + '">' +
+      '<option value="whitelist"' + (g.mode === 'whitelist' ? ' selected' : '') + '>Whitelist</option>' +
+      '<option value="blacklist"' + (g.mode === 'blacklist' ? ' selected' : '') + '>Blacklist</option>' +
+      '</select>' +
+      '<span class="badge violet" data-toggle-group-devices="' + esc(g.id) + '" style="cursor:pointer;">🖥 ' + list.length + ' جهاز ' + (isOpen ? '▴' : '▾') + '</span>' +
+      '<span class="badge ' + (ephem ? 'green' : 'gray') + '">' + (ephem ? '🧹 تصفح نظيف مفعّل' : 'تصفح عادي') + '</span>' +
+      '<span class="badge ' + (usbGrp ? 'amber' : 'gray') + '">' + (usbGrp ? '🔌 USB مقفول للمجموعة' : 'USB مفتوح') + '</span>' +
+      '<div class="group-card-actions">' +
+      '<button class="btn btn-primary btn-sm" data-save-group="' + esc(g.id) + '">حفظ</button>' +
+      '<button class="btn btn-ghost btn-sm" type="button" data-copy-default-sites="' + esc(g.id) + '" title="نسخ المواقع المسموحة والمقفولة من القائمة الافتراضية لهذه المجموعة">📋 نسخ من الافتراضي</button>' +
+      '<button class="btn ' + (ephem ? 'btn-success' : 'btn-ghost') + ' btn-sm" data-toggle-ephemeral="' + esc(g.id) + '" data-ephem="' + (ephem ? '1' : '0') + '">' + (ephem ? '🧹 التصفح النظيف: مفعّل' : '🧹 تفعيل التصفح النظيف') + '</button>' +
+      '<button class="btn ' + (usbGrp ? 'btn-danger' : 'btn-ghost') + ' btn-sm" data-toggle-usb-group="' + esc(g.id) + '" data-usb="' + (usbGrp ? '1' : '0') + '">' + (usbGrp ? '🔌 سياسة USB: مقفول' : '🔌 قفل USB بالسياسة') + '</button>' +
+      '<button class="btn btn-danger btn-sm" data-grp-cmd="block" data-id="' + esc(g.id) + '">قفل الإنترنت</button>' +
+      '<button class="btn btn-success btn-sm" data-grp-cmd="unblock" data-id="' + esc(g.id) + '">فتح الإنترنت</button>' +
+      '<button class="btn btn-ghost btn-sm" style="border-color:rgba(245,158,11,0.45);color:#d97706;" data-grp-cmd="usb_block" data-id="' + esc(g.id) + '">🔌 قفل USB للكل</button>' +
+      '<button class="btn btn-ghost btn-sm" data-grp-cmd="usb_unblock" data-id="' + esc(g.id) + '">🔓 فتح USB للكل</button>' +
+      '<button class="btn btn-ghost btn-sm" data-grp-cmd="update_client" data-id="' + esc(g.id) + '" title="إرسال وتثبيت أحدث نسخة من الكلاينت بصمت لكل أجهزة المجموعة">⬆ تحديث الكلاينت</button>' +
+      '<button class="btn btn-ghost btn-sm" data-del-group="' + esc(g.id) + '">حذف</button>' +
+      '</div>' +
       '</div>' +
       '<label class="group-ephem-row">' +
-        '<input type="checkbox" data-g-ephemeral="' + esc(g.id) + '"' + (ephem ? ' checked' : '') + ' style="width:15px;height:15px;accent-color:var(--primary);">' +
-        '<span>🧹 <b>وضع التصفح النظيف (Chrome &amp; Edge):</b> فتح كأول مرة ومسح السجل والكاش وكلمات السر والجلسات تلقائياً عند كل إغلاق</span>' +
+      '<input type="checkbox" data-g-ephemeral="' + esc(g.id) + '"' + (ephem ? ' checked' : '') + ' style="width:15px;height:15px;accent-color:var(--primary);">' +
+      '<span>🧹 <b>وضع التصفح النظيف (Chrome &amp; Edge):</b> فتح كأول مرة ومسح السجل والكاش وكلمات السر والجلسات تلقائياً عند كل إغلاق</span>' +
+      '</label>' +
+      '<label class="group-ephem-row" style="margin-top:4px;">' +
+      '<input type="checkbox" data-g-usb-block="' + esc(g.id) + '"' + (usbGrp ? ' checked' : '') + ' style="width:15px;height:15px;accent-color:#d97706;">' +
+      '<span>🔌 <b>قفل منافذ الفلاشات ووحدات التخزين (USB Storage):</b> منع الفلاشات والهاردات الخارجية ونقل ملفات الموبايل لأجهزة هذه المجموعة</span>' +
       '</label>' +
       '<div class="group-sites-grid">' +
-        '<div class="field"><span class="label"><span>المواقع المسموحة (سطر لكل موقع)</span><span class="badge green" style="padding:2px 8px;font-size:11px;">' + allowedCount + '</span></span>' +
-          '<textarea class="input mono" rows="3" dir="ltr" data-g-allowed="' + esc(g.id) + '">' + esc(allowed) + '</textarea></div>' +
-        '<div class="field"><span class="label"><span>المواقع المقفولة (سطر لكل موقع)</span><span class="badge red" style="padding:2px 8px;font-size:11px;">' + blockedCountSites + '</span></span>' +
-          '<textarea class="input mono" rows="3" dir="ltr" data-g-blocked="' + esc(g.id) + '">' + esc(blocked) + '</textarea></div>' +
+      '<div class="field"><span class="label"><span>المواقع المسموحة (سطر لكل موقع)</span><span class="badge green" style="padding:2px 8px;font-size:11px;">' + allowedCount + '</span></span>' +
+      '<textarea class="input mono" rows="3" dir="ltr" data-g-allowed="' + esc(g.id) + '">' + esc(allowed) + '</textarea></div>' +
+      '<div class="field"><span class="label"><span>المواقع المقفولة (سطر لكل موقع)</span><span class="badge red" style="padding:2px 8px;font-size:11px;">' + blockedCountSites + '</span></span>' +
+      '<textarea class="input mono" rows="3" dir="ltr" data-g-blocked="' + esc(g.id) + '">' + esc(blocked) + '</textarea></div>' +
       '</div>' +
       '<div class="group-devices-sec">' +
-        '<div class="group-devices-bar">' +
-          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;cursor:pointer;" data-toggle-group-devices="' + esc(g.id) + '">' +
-            '<b style="font-size:13px;">🖥 الأجهزة داخل مجموعة «' + esc(g.name) + '» (' + list.length + ')</b>' +
-            '<span class="badge green" style="padding:3px 9px;font-size:11px;">' + onlineCount + ' متصل</span>' +
-            '<span class="badge ' + (blockedCount ? 'red' : 'gray') + '" style="padding:3px 9px;font-size:11px;">' + blockedCount + ' مقفول</span>' +
-          '</div>' +
-          '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
-            '<select class="input" data-add-group-device-select="' + esc(g.id) + '">' + addOpts + '</select>' +
-            '<button type="button" class="btn btn-primary btn-sm" data-add-group-device-btn="' + esc(g.id) + '"' + (others.length ? '' : ' disabled') + '>+ ضم للمجموعة</button>' +
-          '</div>' +
-        '</div>' +
-        '<div class="devices-card-container" data-group-devices-panel="' + esc(g.id) + '" style="display:' + (isOpen ? '' : 'none') + ';">' +
-          devicesHtml +
-        '</div>' +
+      '<div class="group-devices-bar">' +
+      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;cursor:pointer;" data-toggle-group-devices="' + esc(g.id) + '">' +
+      '<b style="font-size:13px;">🖥 الأجهزة داخل مجموعة «' + esc(g.name) + '» (' + list.length + ')</b>' +
+      '<span class="badge green" style="padding:3px 9px;font-size:11px;">' + onlineCount + ' متصل</span>' +
+      '<span class="badge ' + (blockedCount ? 'red' : 'gray') + '" style="padding:3px 9px;font-size:11px;">' + blockedCount + ' مقفول إنترنت</span>' +
+      '<span class="badge ' + (usbBlockedCount ? 'amber' : 'gray') + '" style="padding:3px 9px;font-size:11px;">' + usbBlockedCount + ' مقفول USB</span>' +
       '</div>' +
-    '</div>';
+      '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+      '<select class="input" data-add-group-device-select="' + esc(g.id) + '">' + addOpts + '</select>' +
+      '<button type="button" class="btn btn-primary btn-sm" data-add-group-device-btn="' + esc(g.id) + '"' + (others.length ? '' : ' disabled') + '>+ ضم للمجموعة</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="devices-card-container" data-group-devices-panel="' + esc(g.id) + '" style="display:' + (isOpen ? '' : 'none') + ';">' +
+      devicesHtml +
+      '</div>' +
+      '</div>' +
+      '</div>';
   }
 
   async function loadGroups() {
@@ -1657,25 +2723,38 @@
       relay = Array.isArray(rr) ? rr : ((rr && rr.devices) || []);
     } catch (e) { groupsCache = []; }
     const allDevices = mergeGroupDevices(lan, relay);
-    $('groupsList').innerHTML = groupsCache.length
-      ? groupsCache.map((g) => {
-          const groupDevices = allDevices.filter((d) => d.group_id === g.id);
-          const otherDevices = allDevices.filter((d) => d.group_id !== g.id);
-          g.devices = groupDevices.length;
-          return groupCard(g, groupDevices, otherDevices);
-        }).join('')
-      : '<div class="empty">لا توجد مجموعات بعد. أنشئ مجموعة وابدأ بتعيين الأجهزة إليها.</div>';
+    const assignedCount = allDevices.filter((d) => d.group_id && groupsCache.some((g) => g.id === d.group_id)).length;
+    if ($('groupsSummaryBadge')) {
+      $('groupsSummaryBadge').textContent = groupsCache.length + ' مجموعة · ' + assignedCount + ' جهاز موزع · ' + Math.max(0, allDevices.length - assignedCount) + ' افتراضي';
+    }
+    const gq = (($('groupsSearchInput') && $('groupsSearchInput').value) || '').trim().toLowerCase();
+    const visibleGroups = groupsCache.filter((g) => {
+      if (!gq) return true;
+      if (String(g.name || '').toLowerCase().includes(gq)) return true;
+      return allDevices.some((d) => d.group_id === g.id && [d.label, d.hostname, d.ip].join(' ').toLowerCase().includes(gq));
+    });
+    $('groupsList').innerHTML = visibleGroups.length
+      ? visibleGroups.map((g) => {
+        const groupDevices = allDevices.filter((d) => d.group_id === g.id);
+        const otherDevices = allDevices.filter((d) => d.group_id !== g.id);
+        g.devices = groupDevices.length;
+        return groupCard(g, groupDevices, otherDevices);
+      }).join('')
+      : '<div class="empty">' + (groupsCache.length ? 'لا توجد مجموعات مطابقة للبحث.' : 'لا توجد مجموعات بعد. أنشئ مجموعة وابدأ بتعيين الأجهزة إليها.') + '</div>';
   }
+  if ($('groupsSearchInput')) $('groupsSearchInput').addEventListener('input', loadGroups);
 
   $('createGroupBtn').addEventListener('click', async () => {
     const name = $('newGroupName').value.trim();
     if (!name) { toast('اكتب اسم المجموعة', 'error'); return; }
     const ephem = Boolean($('newGroupEphemeral') && $('newGroupEphemeral').checked);
+    const usbGrp = Boolean($('newGroupUsbBlock') && $('newGroupUsbBlock').checked);
     try {
-      const r = await api.createRelayGroup(name, $('newGroupMode').value, ephem);
+      const r = await api.createRelayGroup(name, $('newGroupMode').value, ephem, usbGrp);
       if (r && r.success === false) { toast(r.error || 'فشل الإنشاء', 'error'); return; }
       $('newGroupName').value = '';
       if ($('newGroupEphemeral')) $('newGroupEphemeral').checked = false;
+      if ($('newGroupUsbBlock')) $('newGroupUsbBlock').checked = false;
       await loadGroups();
       toast('تم إنشاء المجموعة');
     } catch (e) { toast(e.message || 'فشل الإنشاء', 'error'); }
@@ -1715,6 +2794,19 @@
       } catch (err) { toast(err.message || 'فشل ضم الجهاز', 'error'); }
       return;
     }
+    const copyDef = e.target.closest('[data-copy-default-sites]');
+    if (copyDef) {
+      const id = copyDef.dataset.copyDefaultSites;
+      try {
+        const [al, bl] = await Promise.all([api.getAllowedSites(), api.getBlockedSites()]);
+        const alBox = document.querySelector('[data-g-allowed="' + id + '"]');
+        const blBox = document.querySelector('[data-g-blocked="' + id + '"]');
+        if (alBox) alBox.value = (al || []).join('\n');
+        if (blBox) blBox.value = (bl || []).join('\n');
+        toast('تم نسخ المواقع الافتراضية للمجموعة — اضغط "حفظ" لتطبيقها');
+      } catch (err) { toast('تعذر نسخ القوائم', 'error'); }
+      return;
+    }
     const save = e.target.closest('[data-save-group]');
     if (save) {
       const id = save.dataset.saveGroup;
@@ -1723,9 +2815,11 @@
       const allowed = linesToArr(document.querySelector('[data-g-allowed="' + id + '"]').value);
       const blocked = linesToArr(document.querySelector('[data-g-blocked="' + id + '"]').value);
       const ephemEl = document.querySelector('[data-g-ephemeral="' + id + '"]');
+      const usbEl = document.querySelector('[data-g-usb-block="' + id + '"]');
       const ephem = Boolean(ephemEl && ephemEl.checked);
+      const usbGrp = Boolean(usbEl && usbEl.checked);
       try {
-        const r = await api.updateRelayGroup(id, name, mode, allowed, blocked, ephem);
+        const r = await api.updateRelayGroup(id, name, mode, allowed, blocked, ephem, usbGrp);
         if (r && r.success === false) { toast(r.error || 'فشل الحفظ', 'error'); return; }
         loadGroups(); toast('تم حفظ المجموعة');
       } catch (err) { toast(err.message || 'فشل الحفظ', 'error'); }
@@ -1737,16 +2831,42 @@
       const curEphem = togEphem.dataset.ephem === '1';
       const nextEphem = !curEphem;
       const ephemEl = document.querySelector('[data-g-ephemeral="' + id + '"]');
+      const usbEl = document.querySelector('[data-g-usb-block="' + id + '"]');
       if (ephemEl) ephemEl.checked = nextEphem;
       const name = document.querySelector('[data-g-name="' + id + '"]').value.trim();
       const mode = document.querySelector('[data-g-mode="' + id + '"]').value;
       const allowed = linesToArr(document.querySelector('[data-g-allowed="' + id + '"]').value);
       const blocked = linesToArr(document.querySelector('[data-g-blocked="' + id + '"]').value);
+      const usbGrp = Boolean(usbEl && usbEl.checked);
       try {
-        const r = await api.updateRelayGroup(id, name, mode, allowed, blocked, nextEphem);
+        const r = await api.updateRelayGroup(id, name, mode, allowed, blocked, nextEphem, usbGrp);
         if (r && r.success === false) { toast(r.error || 'فشل التحديث', 'error'); return; }
         loadGroups();
         toast(nextEphem ? 'تم تفعيل التصفح النظيف لهذه المجموعة فقط' : 'تم إيقاف التصفح النظيف عن هذه المجموعة');
+      } catch (err) { toast(err.message || 'فشل التحديث', 'error'); }
+      return;
+    }
+    const togUsbGrp = e.target.closest('[data-toggle-usb-group]');
+    if (togUsbGrp) {
+      const id = togUsbGrp.dataset.toggleUsbGroup;
+      const curUsb = togUsbGrp.dataset.usb === '1';
+      const nextUsb = !curUsb;
+      const usbEl = document.querySelector('[data-g-usb-block="' + id + '"]');
+      const ephemEl = document.querySelector('[data-g-ephemeral="' + id + '"]');
+      if (usbEl) usbEl.checked = nextUsb;
+      const name = document.querySelector('[data-g-name="' + id + '"]').value.trim();
+      const mode = document.querySelector('[data-g-mode="' + id + '"]').value;
+      const allowed = linesToArr(document.querySelector('[data-g-allowed="' + id + '"]').value);
+      const blocked = linesToArr(document.querySelector('[data-g-blocked="' + id + '"]').value);
+      const ephem = Boolean(ephemEl && ephemEl.checked);
+      try {
+        const r = await api.updateRelayGroup(id, name, mode, allowed, blocked, ephem, nextUsb);
+        if (r && r.success === false) { toast(r.error || 'فشل التحديث', 'error'); return; }
+        await api.sendGroupCommand(id, nextUsb ? 'usb_block' : 'usb_unblock', currentAdminUser, currentAdminRole).catch(() => {});
+        loadGroups();
+        loadDevices();
+        loadRelayDevices();
+        toast(nextUsb ? '🔌 تم قفل منافذ تخزين USB لأجهزة هذه المجموعة' : '🔓 تم فتح منافذ تخزين USB لأجهزة هذه المجموعة');
       } catch (err) { toast(err.message || 'فشل التحديث', 'error'); }
       return;
     }
@@ -1796,8 +2916,12 @@
     }
     const sup = e.target.closest('[data-support-device]');
     if (sup) {
+      if (isAppleTouch) {
+        openIpadRustdeskSheet(sup.dataset.supportDevice, sup.dataset.rdPass || null, sup.dataset.deviceName || '');
+        return;
+      }
       try {
-        const r = await api.openSupportSession(sup.dataset.supportDevice, sup.dataset.rdPass || null, 'support');
+        const r = await api.openSupportSession(sup.dataset.supportDevice, sup.dataset.rdPass || null, 'support', sup.dataset.devIp || null);
         if (r && r.success !== false) toast('🛠 تم فتح جلسة الدعم الكامل عبر RustDesk (تحكم بالماوس والكيبورد)');
         else if (!(r && r.cancelled)) toast((r && r.error) || 'فشل فتح الجلسة', 'error');
       } catch (err) { toast(err.message || 'فشل فتح الجلسة', 'error'); }
@@ -1805,13 +2929,25 @@
     }
     const camBtn = e.target.closest('[data-camera-device]');
     if (camBtn) {
+      if (isAppleTouch) {
+        openScreen(
+          camBtn.dataset.cameraDevice,
+          camBtn.dataset.deviceName || '',
+          camBtn.dataset.transport || '',
+          'camera',
+          camBtn.dataset.rdId || '',
+          camBtn.dataset.rdPass || ''
+        );
+        return;
+      }
       const rdId = (camBtn.dataset.rdId || '').trim();
-      if (!rdId) {
+      const devIp = (camBtn.dataset.devIp || '').trim();
+      if (!rdId && !devIp) {
         toast('لا يوجد RustDesk ID مسجل لهذا الجهاز بعد — تأكد من تثبيت وتشغيل RustDesk على جهاز الموظف', 'error');
         return;
       }
       try {
-        const r = await api.openSupportSession(rdId, camBtn.dataset.rdPass || null, 'camera');
+        const r = await api.openSupportSession(rdId, camBtn.dataset.rdPass || null, 'camera', devIp || null);
         if (r && r.success !== false) toast('📷 تم فتح كاميرا الموظف مباشرة عبر RustDesk (بدون تحكم في الجهاز)');
         else if (!(r && r.cancelled)) toast((r && r.error) || 'فشل فتح الكاميرا عبر RustDesk', 'error');
       } catch (err) { toast(err.message || 'فشل فتح الكاميرا عبر RustDesk', 'error'); }
@@ -1831,13 +2967,25 @@
     }
     const watch = e.target.closest('[data-watch-device]');
     if (watch) {
+      if (isAppleTouch) {
+        openScreen(
+          watch.dataset.watchDevice,
+          watch.dataset.deviceName || '',
+          watch.dataset.transport || '',
+          'screen',
+          watch.dataset.rdId || '',
+          watch.dataset.rdPass || ''
+        );
+        return;
+      }
       const rdId = (watch.dataset.rdId || '').trim();
-      if (!rdId) {
+      const devIp = (watch.dataset.devIp || '').trim();
+      if (!rdId && !devIp) {
         toast('لا يوجد RustDesk ID مسجل لهذا الجهاز بعد — تأكد من تثبيت وتشغيل RustDesk على جهاز الموظف', 'error');
         return;
       }
       try {
-        const r = await api.openSupportSession(rdId, watch.dataset.rdPass || null, 'watch');
+        const r = await api.openSupportSession(rdId, watch.dataset.rdPass || null, 'watch', devIp || null);
         if (r && r.success !== false) toast('👁 تم فتح وضع المشاهدة فقط عبر RustDesk (بدون تحكم بالماوس أو الكيبورد)');
         else if (!(r && r.cancelled)) toast((r && r.error) || 'فشل فتح وضع المشاهدة عبر RustDesk', 'error');
       } catch (err) { toast(err.message || 'فشل فتح وضع المشاهدة عبر RustDesk', 'error'); }
@@ -1930,13 +3078,13 @@
     if (keys.length > BA_MAX) {
       keys.sort((a, b) => baItems[b].first - baItems[a].first).slice(BA_MAX).forEach((k) => delete baItems[k]);
     }
-    try { localStorage.setItem(BA_STORE_KEY, JSON.stringify(baItems)); } catch (e) {}
+    try { localStorage.setItem(BA_STORE_KEY, JSON.stringify(baItems)); } catch (e) { }
   }
   function baTime(ts) {
     const d = new Date(ts);
     const today = new Date().toDateString() === d.toDateString();
     return today ? d.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })
-                 : d.toLocaleString('ar-EG', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+      : d.toLocaleString('ar-EG', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   }
 
   function renderBlockedAttempts() {
@@ -1955,10 +3103,11 @@
     const readTs = baReadTs();
     $('blockedAttemptsBody').innerHTML = rows.map((a) =>
       '<tr class="' + (a.first > readTs ? 'ba-new' : '') + '">' +
-        '<td><strong>' + esc(a.device) + '</strong>' + (a.source === 'relay' ? ' <span class="ba-src">Relay</span>' : '') + '</td>' +
-        '<td class="ba-mono">' + esc(a.ip || '—') + '</td>' +
-        '<td class="ba-host">' + esc(a.host) + '</td>' +
-        '<td class="ba-time">' + esc(baTime(a.first)) + '</td>' +
+      '<td><strong>' + esc(a.device) + '</strong>' + (a.source === 'relay' ? ' <span class="ba-src">Relay</span>' : '') + '</td>' +
+      '<td class="ba-mono">' + esc(a.ip || '—') + '</td>' +
+      '<td class="ba-host">' + esc(a.host) + '</td>' +
+      '<td class="ba-time">' + esc(baTime(a.first)) + '</td>' +
+      '<td><button type="button" class="btn btn-success btn-sm" style="padding:2px 8px;font-size:11px;" data-ba-allow="' + esc(a.host) + '">✓ سماح</button></td>' +
       '</tr>').join('');
     $('blockedAttemptsEmpty').style.display = rows.length ? 'none' : 'block';
   }
@@ -2019,7 +3168,7 @@
       let lan = [];
       let relay = lastRelayDevicesSnapshot;
       if (api.getDevices) {
-        try { lan = (await api.getDevices()) || []; } catch (e) {}
+        try { lan = (await api.getDevices()) || []; } catch (e) { }
         changed = baIngest(lan, 'lan') || changed;
       }
       if (api.getRelayDevices && !relayDevicesBusy) {
@@ -2027,7 +3176,7 @@
           const r = await api.getRelayDevices();
           relay = Array.isArray(r) ? r : ((r && r.devices) || []);
           lastRelayDevicesSnapshot = relay;
-        } catch (e) {}
+        } catch (e) { }
       }
       changed = baIngest(relay, 'relay') || changed;
       liveDevices = lan.concat(relay);
@@ -2066,7 +3215,9 @@
   function startBlockedAttempts() {
     stopBlockedAttempts();
     pollBlockedAttempts();
-    baTimer = setInterval(pollBlockedAttempts, 8000);
+    baTimer = setInterval(() => {
+      if (!document.hidden) pollBlockedAttempts();
+    }, 8000);
   }
   function stopBlockedAttempts() {
     if (baTimer) { clearInterval(baTimer); baTimer = null; }
@@ -2081,7 +3232,20 @@
       panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
       renderBlockedAttempts();
     });
-    panel.addEventListener('click', (e) => e.stopPropagation());
+    panel.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const allowBtn = e.target.closest('[data-ba-allow]');
+      if (allowBtn) {
+        const host = cleanDomain(allowBtn.dataset.baAllow || '');
+        if (!host) return;
+        try {
+          if (api.addSitesBulk) await api.addSitesBulk([host], 'allowed');
+          else { await api.addSite(host); await api.syncPolicy(); }
+          await loadSites();
+          toast('✓ تم السماح للموقع (' + host + ') ومزامنة الصلاحيات');
+        } catch (err) { toast(err.message || 'تعذر إضافة الموقع', 'error'); }
+      }
+    });
     document.addEventListener('click', () => { panel.style.display = 'none'; });
     $('blockedAttemptsSearch').addEventListener('input', renderBlockedAttempts);
     $('blockedAttemptsRead').addEventListener('click', () => {
@@ -2098,8 +3262,18 @@
     renderBlockedAttempts();
   })();
 
-  /* ---------- Server File Archive ---------- */
+  /* ---------- Server File Archive (Scalable Calendar, Gallery & Lightbox) ---------- */
   let archiveFilesCache = [];
+  let archiveDailyIndex = [];
+  let archiveSummary = null;
+  let archiveDevicesList = [];
+  let archiveCurPage = 1;
+  let archiveTotalPages = 1;
+  let archiveTotalMatching = 0;
+  let archiveViewMode = localStorage.getItem('ibp_archive_view_mode') || 'gallery';
+  let archLbIndex = -1;
+  let archLbZoomed = false;
+  let archSearchTimer = null;
 
   function formatArchiveBytes(n) {
     const b = Number(n || 0);
@@ -2109,54 +3283,326 @@
     return b + ' B';
   }
 
+  function classifyArchiveExt(fileName) {
+    const lower = String(fileName || '').toLowerCase();
+    const dot = lower.lastIndexOf('.');
+    const ext = dot >= 0 ? lower.slice(dot + 1) : '';
+    if (['xls', 'xlsx', 'csv', 'doc', 'docx', 'pdf', 'ppt', 'pptx', 'txt', 'rtf', 'sql', 'db', 'sqlite', 'accdb', 'mdb', 'json', 'xml'].includes(ext)) return 'docs';
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic'].includes(ext)) return 'images';
+    if (['zip', 'rar', '7z', 'tar', 'gz', 'iso'].includes(ext)) return 'archives';
+    return 'other';
+  }
+
+  function getFileExtUpper(fileName) {
+    const s = String(fileName || '').trim();
+    const dot = s.lastIndexOf('.');
+    return dot >= 0 ? s.slice(dot + 1).toUpperCase().slice(0, 6) : 'FILE';
+  }
+
+  function formatArchiveExactDate(ts) {
+    if (!ts) return { date: '—', time: '' };
+    const d = new Date(Number(ts));
+    if (isNaN(d.getTime())) return { date: '—', time: '' };
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const time = d.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+    return { date: yyyy + '/' + mm + '/' + dd, time };
+  }
+
+  function toLocalYmd(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  function formatDayTitleAr(ymd) {
+    const parts = String(ymd || '').split('-').map(Number);
+    if (parts.length !== 3 || !parts[0]) return ymd;
+    const d = new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0);
+    return d.toLocaleDateString('ar-EG', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  }
+
+  function formatMonthTitleAr(ym) {
+    const parts = String(ym || '').split('-').map(Number);
+    if (parts.length < 2 || !parts[0]) return ym;
+    const d = new Date(parts[0], parts[1] - 1, 1, 12, 0, 0);
+    return d.toLocaleDateString('ar-EG', { month: 'long', year: 'numeric' });
+  }
+
+  function buildArchiveFileUrl(fileId, inline) {
+    const base = serverHttpBase + '/api/uploads/' + encodeURIComponent(fileId || '');
+    const params = [];
+    if (inline) params.push('inline=1');
+    if (authToken) params.push('token=' + encodeURIComponent(authToken));
+    return params.length ? (base + '?' + params.join('&')) : base;
+  }
+
+  function computeArchiveTimeBounds() {
+    const preset = ($('archiveDateFilter') && $('archiveDateFilter').value) || '';
+    const dFrom = (($('archiveDateFrom') && $('archiveDateFrom').value) || '').trim();
+    const dTo = (($('archiveDateTo') && $('archiveDateTo').value) || '').trim();
+
+    if (dFrom || dTo) {
+      const startYmd = dFrom || dTo;
+      const endYmd = dTo || dFrom;
+      const sp = startYmd.split('-').map(Number);
+      const ep = endYmd.split('-').map(Number);
+      const fromMs = sp.length === 3 ? new Date(sp[0], sp[1] - 1, sp[2], 0, 0, 0, 0).getTime() : 0;
+      const toMs = ep.length === 3 ? new Date(ep[0], ep[1] - 1, ep[2], 23, 59, 59, 999).getTime() : 0;
+      return { fromMs, toMs, singleDay: startYmd === endYmd ? startYmd : '' };
+    }
+
+    const now = new Date();
+    if (preset === 'today' || preset === '1') {
+      const s = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+      const e = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999).getTime();
+      return { fromMs: s, toMs: e, singleDay: toLocalYmd(now) };
+    }
+    if (preset === 'yesterday') {
+      const y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12, 0, 0);
+      const s = new Date(y.getFullYear(), y.getMonth(), y.getDate(), 0, 0, 0, 0).getTime();
+      const e = new Date(y.getFullYear(), y.getMonth(), y.getDate(), 23, 59, 59, 999).getTime();
+      return { fromMs: s, toMs: e, singleDay: toLocalYmd(y) };
+    }
+    const daysNum = parseInt(preset, 10) || 0;
+    if (daysNum > 0) {
+      return { fromMs: Date.now() - daysNum * 86400 * 1000, toMs: 0, singleDay: '' };
+    }
+    return { fromMs: 0, toMs: 0, singleDay: '' };
+  }
+
+  function buildArchiveQueryObject(overridePageSize) {
+    const bounds = computeArchiveTimeBounds();
+    const pageSize = overridePageSize || (parseInt(($('archPageSizeSelect') && $('archPageSizeSelect').value) || '60', 10) || 60);
+    return {
+      channel: ($('archiveChannelFilter') && $('archiveChannelFilter').value) || '',
+      fromMs: bounds.fromMs || null,
+      toMs: bounds.toMs || null,
+      fileType: ($('archiveTypeFilter') && $('archiveTypeFilter').value) || '',
+      device: ($('archiveDeviceFilter') && $('archiveDeviceFilter').value) || '',
+      search: (($('archiveSearchInput') && $('archiveSearchInput').value) || '').trim(),
+      page: overridePageSize ? 1 : archiveCurPage,
+      pageSize,
+      tzOffsetMins: new Date().getTimezoneOffset(),
+    };
+  }
+
+  function hasActiveArchiveFilters() {
+    return Boolean(
+      (($('archiveDateFilter') && $('archiveDateFilter').value) || '') ||
+      (($('archiveDateFrom') && $('archiveDateFrom').value) || '') ||
+      (($('archiveDateTo') && $('archiveDateTo').value) || '') ||
+      (($('archiveTypeFilter') && $('archiveTypeFilter').value) || '') ||
+      (($('archiveDeviceFilter') && $('archiveDeviceFilter').value) || '') ||
+      (($('archiveChannelFilter') && $('archiveChannelFilter').value) || '') ||
+      ((($('archiveSearchInput') && $('archiveSearchInput').value) || '').trim())
+    );
+  }
+
+  function syncArchiveViewTabsUi() {
+    const tabsWrap = $('archiveViewTabs');
+    if (tabsWrap) {
+      tabsWrap.querySelectorAll('[data-archive-view]').forEach((btn) => {
+        const active = btn.dataset.archiveView === archiveViewMode;
+        btn.classList.toggle('btn-primary', active);
+        btn.classList.toggle('btn-ghost', !active);
+      });
+    }
+    if ($('archiveDaysPane')) $('archiveDaysPane').style.display = archiveViewMode === 'days' ? 'block' : 'none';
+    if ($('archiveGalleryPane')) $('archiveGalleryPane').style.display = archiveViewMode === 'gallery' ? 'grid' : 'none';
+    if ($('archiveTablePane')) $('archiveTablePane').style.display = archiveViewMode === 'table' ? 'block' : 'none';
+  }
+
+  function renderArchiveDaysPane() {
+    const pane = $('archiveDaysPane');
+    if (!pane) return;
+    if (!archiveDailyIndex.length) {
+      pane.innerHTML = '<div class="empty">لا توجد أيام مسجّلة في الأرشيف حتى الآن.</div>';
+      return;
+    }
+    const byMonth = {};
+    const monthOrder = [];
+    archiveDailyIndex.forEach((d) => {
+      const ym = String(d.day || '').slice(0, 7);
+      if (!byMonth[ym]) { byMonth[ym] = []; monthOrder.push(ym); }
+      byMonth[ym].push(d);
+    });
+
+    pane.innerHTML = monthOrder.map((ym) => {
+      const days = byMonth[ym];
+      const mTotal = days.reduce((s, x) => s + Number(x.total || 0), 0);
+      const mImages = days.reduce((s, x) => s + Number(x.images || 0), 0);
+      return '<div style="margin-bottom:18px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;padding:0 4px;">' +
+        '<div style="font-weight:800;font-size:14.5px;color:var(--primary-2);">🗓 ' + esc(formatMonthTitleAr(ym)) + '</div>' +
+        '<div style="font-size:12px;color:var(--muted);font-weight:700;">' + mTotal + ' ملف · ' + mImages + ' صورة</div>' +
+        '</div>' +
+        '<div class="arch-day-grid">' +
+        days.map((d) =>
+          '<div class="arch-day-card">' +
+          '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">' +
+          '<div>' +
+          '<div style="font-weight:800;font-size:13.5px;">' + esc(formatDayTitleAr(d.day)) + '</div>' +
+          '<div class="mono" style="font-size:11px;color:var(--muted);margin-top:2px;">' + esc(d.day) + ' · ' + esc(formatArchiveBytes(d.bytes)) + '</div>' +
+          '</div>' +
+          '<span class="badge blue" style="font-weight:800;">' + Number(d.total || 0) + ' ملف</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;font-size:11.5px;">' +
+          '<span class="badge green">🖼 ' + Number(d.images || 0) + ' صورة</span>' +
+          (d.docs ? ('<span class="badge red">📄 ' + Number(d.docs) + ' مستند</span>') : '') +
+          (d.archives ? ('<span class="badge gold">📦 ' + Number(d.archives) + ' مضغوط</span>') : '') +
+          '</div>' +
+          '<div style="display:flex;gap:6px;margin-top:2px;">' +
+          '<button type="button" class="btn btn-primary btn-sm" style="flex:1;justify-content:center;" data-jump-archive-day="' + esc(d.day) + '" data-jump-type="images">🖼 صور اليوم</button>' +
+          '<button type="button" class="btn btn-ghost btn-sm" style="flex:1;justify-content:center;" data-jump-archive-day="' + esc(d.day) + '" data-jump-type="">📂 كل الملفات</button>' +
+          '</div>' +
+          '</div>'
+        ).join('') +
+        '</div></div>';
+    }).join('');
+  }
+
   function renderArchiveFiles() {
     const body = $('archiveTableBody');
+    const gallery = $('archiveGalleryPane');
     const empty = $('archiveEmpty');
-    if (!body || !empty) return;
-    const chFilter = ($('archiveChannelFilter') && $('archiveChannelFilter').value) || '';
-    const q = (($('archiveSearchInput') && $('archiveSearchInput').value) || '').trim().toLowerCase();
+    if (!body || !empty || !gallery) return;
+
+    syncArchiveViewTabsUi();
+
     const isLocalHost = Boolean(window.__TAURI__ && window.__TAURI__.core)
       || location.hostname === '127.0.0.1'
       || location.hostname === 'localhost';
 
-    const filtered = archiveFilesCache.filter((f) => {
-      const ch = String(f.channel || 'whatsapp_web').toLowerCase();
-      if (chFilter === 'whatsapp_web' && !ch.includes('whatsapp')) return false;
-      if (q) {
-        const hay = [
-          f.file_name,
-          f.device_name,
-          f.device_id,
-          f.windows_user,
-          f.recipient_name,
-          f.recipient_phone,
-          f.stored_path,
-          f.sha256,
-        ].join(' ').toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
+    const sum = archiveSummary || {
+      total_files: archiveFilesCache.length,
+      total_bytes: 0,
+      whatsapp_count: 0,
+      sensitive_count: 0,
+      images_count: 0,
+      today_count: 0,
+      top_device: '—',
+      top_device_count: 0,
+    };
 
-    let totalBytes = 0;
-    let waCount = 0;
-    archiveFilesCache.forEach((f) => {
-      totalBytes += Number(f.file_size || 0);
-      if (String(f.channel || 'whatsapp_web').toLowerCase().includes('whatsapp')) waCount++;
-    });
-    if ($('navArchiveCount')) $('navArchiveCount').textContent = archiveFilesCache.length;
+    if ($('dlpKpiTotal')) $('dlpKpiTotal').textContent = Number(sum.total_files || 0).toLocaleString('en-US');
+    if ($('dlpKpiSize')) $('dlpKpiSize').textContent = formatArchiveBytes(sum.total_bytes);
+    if ($('dlpKpiSensitive')) $('dlpKpiSensitive').textContent = Number(sum.sensitive_count || 0).toLocaleString('en-US');
+    if ($('dlpKpiToday')) $('dlpKpiToday').textContent = Number(sum.today_count || 0).toLocaleString('en-US');
+    if ($('dlpKpiTopDevice')) $('dlpKpiTopDevice').textContent = sum.top_device || '—';
+    if ($('dlpKpiTopCount')) $('dlpKpiTopCount').textContent = (sum.top_device_count || 0) + ' ملف';
+    if ($('navArchiveCount')) $('navArchiveCount').textContent = sum.total_files || 0;
     if ($('archiveStatsText')) {
       $('archiveStatsText').textContent =
-        archiveFilesCache.length + ' ملف (' + waCount + ' واتساب · ' + formatArchiveBytes(totalBytes) + ')';
+        (sum.total_files || 0) + ' ملف (' + (sum.images_count || 0) + ' صورة · ' + (sum.whatsapp_count || 0) + ' واتساب · ' + formatArchiveBytes(sum.total_bytes) + ')';
     }
 
-    if (!filtered.length) {
+    if ($('archiveDeviceFilter') && document.activeElement !== $('archiveDeviceFilter')) {
+      const curDev = $('archiveDeviceFilter').value || '';
+      $('archiveDeviceFilter').innerHTML = '<option value="">كل الأجهزة (' + archiveDevicesList.length + ')</option>' +
+        archiveDevicesList.map((d) => '<option value="' + esc(d.name) + '"' + (d.name === curDev ? ' selected' : '') + '>' + esc(d.name) + ' (' + d.count + ')</option>').join('');
+    }
+
+    if ($('archiveResetFiltersBtn')) {
+      $('archiveResetFiltersBtn').style.display = hasActiveArchiveFilters() ? '' : 'none';
+    }
+
+    const bounds = computeArchiveTimeBounds();
+    const dayBanner = $('archiveActiveDayBanner');
+    if (dayBanner) {
+      if (bounds.singleDay) {
+        dayBanner.style.display = 'flex';
+        if ($('archiveActiveDayText')) {
+          $('archiveActiveDayText').textContent = '📅 تتصفح الآن أرشيف يوم: ' + formatDayTitleAr(bounds.singleDay) + ' (' + archiveTotalMatching + ' ملف مطابق)';
+        }
+      } else {
+        dayBanner.style.display = 'none';
+      }
+    }
+
+    renderArchiveDaysPane();
+
+    const pageSize = parseInt(($('archPageSizeSelect') && $('archPageSizeSelect').value) || '60', 10) || 60;
+    const fromIdx = archiveTotalMatching ? ((archiveCurPage - 1) * pageSize + 1) : 0;
+    const toIdx = Math.min(archiveTotalMatching, fromIdx + archiveFilesCache.length - 1);
+    if ($('archiveMatchCounter')) {
+      $('archiveMatchCounter').textContent = archiveViewMode === 'days'
+        ? ('إجمالي الأيام النشطة: ' + archiveDailyIndex.length + ' يوم · إجمالي الملفات: ' + (sum.total_files || 0))
+        : (archiveTotalMatching
+          ? ('عرض ' + fromIdx + '–' + toIdx + ' من أصل ' + archiveTotalMatching.toLocaleString('en-US') + ' ملف مطابق')
+          : '0 ملف مطابق');
+    }
+
+    const pagBar = $('archivePaginationBar');
+    if (pagBar) {
+      const showPag = archiveViewMode !== 'days' && archiveTotalMatching > 0;
+      pagBar.style.display = showPag ? 'flex' : 'none';
+      if ($('archPageInfo')) $('archPageInfo').textContent = 'صفحة ' + archiveCurPage + ' من ' + archiveTotalPages;
+      if ($('archPageFirst')) $('archPageFirst').disabled = archiveCurPage <= 1;
+      if ($('archPagePrev')) $('archPagePrev').disabled = archiveCurPage <= 1;
+      if ($('archPageNext')) $('archPageNext').disabled = archiveCurPage >= archiveTotalPages;
+      if ($('archPageLast')) $('archPageLast').disabled = archiveCurPage >= archiveTotalPages;
+    }
+
+    if (archiveViewMode === 'days') {
+      empty.style.display = 'none';
+      return;
+    }
+
+    if (!archiveFilesCache.length) {
       body.innerHTML = '';
+      gallery.innerHTML = '';
       empty.style.display = 'block';
       return;
     }
     empty.style.display = 'none';
-    body.innerHTML = filtered.map((f) => {
+
+    // Render Photo Gallery Grid
+    gallery.innerHTML = archiveFilesCache.map((f, idx) => {
+      const cat = classifyArchiveExt(f.file_name);
+      const isImg = cat === 'images';
+      const inlineUrl = buildArchiveFileUrl(f.file_id, true);
+      const dlUrl = buildArchiveFileUrl(f.file_id, false);
+      const dt = formatArchiveExactDate(f.created_at);
+      const ch = String(f.channel || 'whatsapp_web').toLowerCase();
+      const chTag = ch.includes('whatsapp')
+        ? '<span class="badge green" style="background:rgba(16,185,129,0.9);color:#fff;font-size:10.5px;">واتساب</span>'
+        : '<span class="badge blue" style="background:rgba(37,99,235,0.9);color:#fff;font-size:10.5px;">ويب</span>';
+      const extLabel = getFileExtUpper(f.file_name);
+      const thumbInner = isImg
+        ? '<img src="' + esc(inlineUrl) + '" alt="' + esc(f.file_name || '') + '" loading="lazy" decoding="async">'
+        : '<div class="arch-doc-placeholder">' +
+          '<div style="font-size:30px;">' + (cat === 'archives' ? '📦' : (extLabel === 'PDF' ? '📕' : '📄')) + '</div>' +
+          '<span class="mono" style="background:rgba(255,255,255,0.14);padding:2px 8px;border-radius:6px;">' + esc(extLabel) + '</span>' +
+          '</div>';
+      const recip = f.recipient_name || f.page_url || '—';
+      return '<div class="arch-photo-card">' +
+        '<div class="arch-photo-thumb" data-arch-preview-idx="' + idx + '" title="اضغط للمعاينة المكبّرة">' +
+        thumbInner +
+        '<div class="arch-photo-overlay-top">' +
+        chTag +
+        '<span class="mono" style="background:rgba(15,23,42,0.78);color:#fff;padding:2px 7px;border-radius:6px;font-size:10.5px;font-weight:700;">' + esc(formatArchiveBytes(f.file_size)) + '</span>' +
+        '</div>' +
+        '</div>' +
+        '<div class="arch-photo-body">' +
+        '<div style="font-weight:800;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(f.file_name || '') + '">' + esc(f.file_name || 'file.bin') + '</div>' +
+        '<div class="mono" style="font-size:11px;color:var(--muted);">🗓 ' + esc(dt.date) + ' · ' + esc(dt.time) + '</div>' +
+        '<div style="font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">💻 <b>' + esc(f.device_name || f.device_id || '—') + '</b>' + (f.windows_user ? (' <span style="color:var(--muted);">(' + esc(f.windows_user) + ')</span>') : '') + '</div>' +
+        '<div style="font-size:11.5px;color:var(--primary-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(recip + (f.recipient_phone ? (' ' + f.recipient_phone) : '')) + '">👤 ' + esc(recip) + (f.recipient_phone ? (' · <span class="mono" dir="ltr">' + esc(f.recipient_phone) + '</span>') : '') + '</div>' +
+        '<div style="display:flex;gap:6px;margin-top:auto;padding-top:6px;">' +
+        '<button type="button" class="btn btn-ghost btn-sm" style="flex:1;justify-content:center;padding:5px 8px;font-size:11.5px;" data-arch-preview-idx="' + idx + '">👁 معاينة</button>' +
+        '<a class="btn btn-success btn-sm" style="flex:1;justify-content:center;padding:5px 8px;font-size:11.5px;text-decoration:none;" data-download-upload="' + esc(f.file_id || '') + '" data-file-name="' + esc(f.file_name || 'file') + '" href="' + esc(dlUrl) + '" target="_blank" rel="noreferrer" download="' + esc(f.file_name || 'file') + '">⬇ تحميل</a>' +
+        '</div>' +
+        '</div>' +
+        '</div>';
+    }).join('');
+
+    // Render Detailed Table
+    body.innerHTML = archiveFilesCache.map((f, idx) => {
+      const cat = classifyArchiveExt(f.file_name);
+      const isImg = cat === 'images';
+      const inlineUrl = buildArchiveFileUrl(f.file_id, true);
+      const dlUrl = buildArchiveFileUrl(f.file_id, false);
+      const dt = formatArchiveExactDate(f.created_at);
       const ch = String(f.channel || 'whatsapp_web').toLowerCase();
       const chBadge = ch.includes('whatsapp')
         ? '<span class="badge green">واتساب</span>'
@@ -2165,40 +3611,174 @@
       const phoneLine = f.recipient_phone
         ? '<div class="mono" dir="ltr" style="font-size:11.5px;color:#2563eb;font-weight:700;">' + esc(f.recipient_phone) + '</div>'
         : '<div style="font-size:11px;color:#94a3b8;">بدون رقم ظاهر</div>';
-      const shaShort = f.sha256 ? String(f.sha256).slice(0, 12) + '…' : '';
-      const dlUrl = serverHttpBase + '/api/uploads/' + encodeURIComponent(f.file_id || '');
+      const shaShort = f.sha256 ? String(f.sha256).slice(0, 10) + '…' : '';
       const localBtn = (isLocalHost && f.stored_path)
-        ? '<button class="btn btn-ghost btn-sm" type="button" data-open-archive-path="' + esc(f.stored_path) + '">📂 المجلد</button>'
+        ? '<button class="btn btn-ghost btn-sm" type="button" data-open-archive-path="' + esc(f.stored_path) + '">📂</button>'
         : '';
+      const miniThumb = isImg
+        ? '<img class="arch-mini-thumb" src="' + esc(inlineUrl) + '" alt="" loading="lazy" decoding="async" data-arch-preview-idx="' + idx + '" title="اضغط لتكبير الصورة">'
+        : '<div class="arch-mini-thumb" data-arch-preview-idx="' + idx + '" style="display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:800;">' + esc(getFileExtUpper(f.file_name)) + '</div>';
       return '<tr>' +
-        '<td class="mono" style="font-size:11.5px;white-space:nowrap;">' + esc(ago(f.created_at)) + '</td>' +
-        '<td><div style="font-weight:700;">' + esc(f.file_name || 'file.bin') + '</div>' +
-          '<div style="font-size:11px;color:#94a3b8;margin-top:2px;">' +
-            '<span class="mono">' + esc(formatArchiveBytes(f.file_size)) + '</span>' +
-            (shaShort ? (' · <span class="badge green" style="font-size:10px;padding:1px 6px;" title="SHA-256: ' + esc(f.sha256) + '">✓ طبق الأصل ' + esc(shaShort) + '</span>') : '') +
-          '</div></td>' +
+        '<td style="white-space:nowrap;">' +
+        '<div class="mono" style="font-weight:800;font-size:12px;">' + esc(dt.date) + '</div>' +
+        '<div style="font-size:11px;color:var(--muted);">' + esc(dt.time) + ' · ' + esc(ago(f.created_at)) + '</div>' +
+        '</td>' +
+        '<td><div style="display:flex;align-items:center;gap:10px;">' +
+        miniThumb +
+        '<div style="min-width:0;">' +
+        '<div style="font-weight:700;word-break:break-word;">' + esc(f.file_name || 'file.bin') + '</div>' +
+        '<div style="font-size:11px;color:#94a3b8;margin-top:2px;">' +
+        '<span class="mono">' + esc(formatArchiveBytes(f.file_size)) + '</span>' +
+        (shaShort ? (' · <span class="badge green" style="font-size:10px;padding:1px 6px;" title="SHA-256: ' + esc(f.sha256) + '">✓ ' + esc(shaShort) + '</span>') : '') +
+        '</div></div></div></td>' +
         '<td>' + chBadge + '</td>' +
         '<td><div><b>' + esc(f.device_name || f.device_id || '—') + '</b></div>' +
-          (f.windows_user ? ('<div class="mono" style="font-size:11px;color:#94a3b8;">' + esc(f.windows_user) + '</div>') : '') +
+        (f.windows_user ? ('<div class="mono" style="font-size:11px;color:#94a3b8;">' + esc(f.windows_user) + '</div>') : '') +
         '</td>' +
         '<td><div><b>' + recipLine + '</b></div>' + phoneLine + '</td>' +
         '<td><div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-          '<a class="btn btn-success btn-sm" data-download-upload="' + esc(f.file_id || '') + '" data-file-name="' + esc(f.file_name || 'file') + '" href="' + esc(dlUrl) + '" target="_blank" download="' + esc(f.file_name || 'file') + '" style="text-decoration:none;">⬇ تحميل النسخة الأصلية</a>' +
-          localBtn +
+        '<button type="button" class="btn btn-ghost btn-sm" data-arch-preview-idx="' + idx + '">👁 معاينة</button>' +
+        '<a class="btn btn-success btn-sm" data-download-upload="' + esc(f.file_id || '') + '" data-file-name="' + esc(f.file_name || 'file') + '" href="' + esc(dlUrl) + '" target="_blank" rel="noreferrer" download="' + esc(f.file_name || 'file') + '" style="text-decoration:none;">⬇ تحميل</a>' +
+        localBtn +
         '</div></td>' +
-      '</tr>';
+        '</tr>';
     }).join('');
   }
 
+  function openArchiveLightbox(idx) {
+    if (idx < 0 || idx >= archiveFilesCache.length) return;
+    archLbIndex = idx;
+    archLbZoomed = false;
+    const modal = $('archiveLightboxModal');
+    if (!modal) return;
+    const f = archiveFilesCache[idx];
+    const dt = formatArchiveExactDate(f.created_at);
+    const cat = classifyArchiveExt(f.file_name);
+    const ext = getFileExtUpper(f.file_name);
+    const inlineUrl = buildArchiveFileUrl(f.file_id, true);
+    const dlUrl = buildArchiveFileUrl(f.file_id, false);
+
+    if ($('archLbTitle')) $('archLbTitle').textContent = f.file_name || 'ملف مؤرشف';
+    if ($('archLbMeta')) {
+      const parts = [
+        '🗓 ' + dt.date + ' ' + dt.time,
+        '📦 ' + formatArchiveBytes(f.file_size),
+        '💻 ' + (f.device_name || f.device_id || '—') + (f.windows_user ? (' (' + f.windows_user + ')') : ''),
+        '👤 ' + (f.recipient_name || f.page_url || '—') + (f.recipient_phone ? (' · ' + f.recipient_phone) : ''),
+      ];
+      $('archLbMeta').textContent = parts.join('   |   ');
+    }
+    if ($('archLbCounter')) $('archLbCounter').textContent = (idx + 1) + ' / ' + archiveFilesCache.length;
+    if ($('archLbPrev')) $('archLbPrev').disabled = idx <= 0;
+    if ($('archLbNext')) $('archLbNext').disabled = idx >= archiveFilesCache.length - 1;
+    if ($('archLbZoomBtn')) {
+      $('archLbZoomBtn').style.display = cat === 'images' ? '' : 'none';
+      $('archLbZoomBtn').textContent = '🔍 تكبير';
+    }
+    const dlBtn = $('archLbDownloadBtn');
+    if (dlBtn) {
+      dlBtn.href = dlUrl;
+      dlBtn.setAttribute('download', f.file_name || 'file');
+      dlBtn.dataset.downloadUpload = f.file_id || '';
+      dlBtn.dataset.fileName = f.file_name || 'file';
+    }
+
+    const stage = $('archLbStage');
+    if (stage) {
+      if (cat === 'images') {
+        stage.innerHTML = '<img id="archLbImg" src="' + esc(inlineUrl) + '" alt="' + esc(f.file_name || '') + '" style="max-width:100%;max-height:68vh;object-fit:contain;border-radius:8px;cursor:zoom-in;">';
+      } else if (ext === 'PDF') {
+        stage.innerHTML = '<iframe src="' + esc(inlineUrl) + '" style="width:100%;height:68vh;border:0;border-radius:8px;background:#fff;"></iframe>';
+      } else {
+        stage.innerHTML = '<div style="text-align:center;color:#e2e8f0;padding:40px 20px;">' +
+          '<div style="font-size:52px;margin-bottom:12px;">' + (cat === 'archives' ? '📦' : '📄') + '</div>' +
+          '<div style="font-weight:800;font-size:17px;margin-bottom:6px;">' + esc(f.file_name || '') + '</div>' +
+          '<div style="font-size:13px;color:#94a3b8;margin-bottom:18px;">صيغة الملف (' + esc(ext) + ') · الحجم: ' + esc(formatArchiveBytes(f.file_size)) + '</div>' +
+          (f.sha256 ? ('<div class="mono" style="font-size:11px;color:#64748b;margin-bottom:16px;">SHA-256: ' + esc(f.sha256) + '</div>') : '') +
+          '<p style="font-size:13px;color:#cbd5e1;">اضغط «⬇ تحميل الأصل» بالأعلى لفتح النسخة الكاملة على جهازك.</p>' +
+          '</div>';
+      }
+    }
+    modal.style.display = 'flex';
+    modal.classList.add('show');
+  }
+
+  function closeArchiveLightbox() {
+    const modal = $('archiveLightboxModal');
+    if (!modal) return;
+    modal.classList.remove('show');
+    modal.style.display = 'none';
+    if ($('archLbStage')) $('archLbStage').innerHTML = '';
+    archLbIndex = -1;
+  }
+
+  function toggleArchiveLightboxZoom() {
+    const img = $('archLbImg');
+    if (!img) return;
+    archLbZoomed = !archLbZoomed;
+    if (archLbZoomed) {
+      img.style.maxWidth = 'none';
+      img.style.maxHeight = 'none';
+      img.style.width = '155%';
+      img.style.cursor = 'zoom-out';
+      if ($('archLbZoomBtn')) $('archLbZoomBtn').textContent = '🔍 تصغير';
+    } else {
+      img.style.maxWidth = '100%';
+      img.style.maxHeight = '68vh';
+      img.style.width = '';
+      img.style.cursor = 'zoom-in';
+      if ($('archLbZoomBtn')) $('archLbZoomBtn').textContent = '🔍 تكبير';
+    }
+  }
+
+  function updateArchiveDiskBadge(freeBytes, totalBytes) {
+    const badge = $('archiveDiskSpaceBadge');
+    if (!badge) return;
+    const free = Number(freeBytes || 0);
+    const total = Number(totalBytes || 0);
+    if (!total) {
+      badge.style.display = 'none';
+      return;
+    }
+    const freeGb = (free / (1024 * 1024 * 1024)).toFixed(1);
+    const totalGb = (total / (1024 * 1024 * 1024)).toFixed(0);
+    badge.style.display = 'inline-flex';
+    badge.textContent = '💾 متاح بالقرص: ' + freeGb + ' GB من ' + totalGb + ' GB';
+    if (free < 5 * 1024 * 1024 * 1024) badge.className = 'badge red';
+    else if (free < 15 * 1024 * 1024 * 1024) badge.className = 'badge gold';
+    else badge.className = 'badge green';
+  }
+
   let archiveBusy = false;
-  async function loadArchiveFiles() {
+  async function loadArchiveFiles(resetPage) {
     if (!api.getUploadedFiles || archiveBusy) return;
+    if (resetPage === true) archiveCurPage = 1;
     archiveBusy = true;
     try {
-      const r = await api.getUploadedFiles(null);
+      const r = await api.getUploadedFiles(buildArchiveQueryObject());
       archiveFilesCache = (r && Array.isArray(r.files)) ? r.files : [];
-      if ($('archiveRootPath') && r && r.archive_root) {
-        $('archiveRootPath').textContent = r.archive_root;
+      archiveSummary = (r && r.summary) ? r.summary : null;
+      archiveDevicesList = (r && Array.isArray(r.devices)) ? r.devices : [];
+      archiveDailyIndex = (r && Array.isArray(r.daily_index)) ? r.daily_index : [];
+      archiveTotalMatching = (r && typeof r.total_matching === 'number') ? r.total_matching : archiveFilesCache.length;
+      archiveTotalPages = (r && r.total_pages) ? r.total_pages : 1;
+      archiveCurPage = (r && r.page) ? r.page : archiveCurPage;
+
+      if (r && r.archive_root) {
+        if ($('archiveRootPath')) $('archiveRootPath').textContent = r.archive_root;
+        if ($('archiveDirInput') && document.activeElement !== $('archiveDirInput')) {
+          $('archiveDirInput').value = r.archive_root;
+        }
+      }
+      if (r) updateArchiveDiskBadge(r.disk_free_bytes, r.disk_total_bytes);
+      if (r && Array.isArray(r.drives)) {
+        renderServerDriveButtons('archiveServerDrivesBar', 'archiveDirInput', 'IT-ELKHAWGA-Archive', r.drives);
+      }
+      if ($('toggleArchivePathBtn')) {
+        $('toggleArchivePathBtn').style.display = hasSuperAdminAccess() ? '' : 'none';
+      }
+      if ($('browseArchiveDirBtn')) {
+        $('browseArchiveDirBtn').style.display = (api.browseArchiveFolder && $('adminUpdateStatusBadge') && $('adminUpdateStatusBadge').textContent.includes('الرئيسي')) ? '' : 'none';
       }
     } catch (e) {
       archiveFilesCache = [];
@@ -2208,9 +3788,244 @@
     renderArchiveFiles();
   }
 
-  if ($('refreshArchiveBtn')) $('refreshArchiveBtn').addEventListener('click', loadArchiveFiles);
-  if ($('archiveChannelFilter')) $('archiveChannelFilter').addEventListener('change', renderArchiveFiles);
-  if ($('archiveSearchInput')) $('archiveSearchInput').addEventListener('input', renderArchiveFiles);
+  async function fetchFilteredArchiveForExport() {
+    try {
+      const r = await api.getUploadedFiles(buildArchiveQueryObject(5000));
+      return (r && Array.isArray(r.files)) ? r.files : archiveFilesCache;
+    } catch (e) {
+      return archiveFilesCache;
+    }
+  }
+
+  if ($('toggleArchivePathBtn')) {
+    $('toggleArchivePathBtn').addEventListener('click', () => {
+      const card = $('archiveStorageCard');
+      if (!card) return;
+      const nextShow = card.style.display === 'none';
+      card.style.display = nextShow ? 'block' : 'none';
+      if (nextShow && $('archiveDirInput')) {
+        if (!$('archiveDirInput').value && $('archiveRootPath')) {
+          $('archiveDirInput').value = $('archiveRootPath').textContent || '';
+        }
+        $('archiveDirInput').focus();
+      }
+    });
+  }
+  if ($('browseArchiveDirBtn')) {
+    $('browseArchiveDirBtn').addEventListener('click', async () => {
+      if (!api.browseArchiveFolder) return;
+      try {
+        const r = await api.browseArchiveFolder();
+        if (r && r.success && r.path && $('archiveDirInput')) {
+          $('archiveDirInput').value = r.path;
+        }
+      } catch (e) {
+        toast(e.message || 'تعذر فتح مستعرض المجلدات', 'error');
+      }
+    });
+  }
+  async function applyArchiveDirChange(pathStr) {
+    if (!api.setArchiveDir) return;
+    const moveExisting = Boolean($('moveExistingArchiveChk') && $('moveExistingArchiveChk').checked);
+    const btn = $('saveArchiveDirBtn');
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ جارٍ التطبيق...'; }
+    try {
+      const r = await api.setArchiveDir(pathStr, moveExisting);
+      if (r && r.success) {
+        const movedMsg = r.moved_files ? (' (تم نقل ' + r.moved_files + ' ملف تلقائياً)') : '';
+        toast('✓ تم تحديث مسار تخزين الأرشيف بنجاح' + movedMsg);
+        if ($('archiveStorageCard')) $('archiveStorageCard').style.display = 'none';
+        await loadArchiveFiles(false);
+      } else {
+        toast((r && r.error) || 'تعذر تغيير مسار التخزين', 'error');
+      }
+    } catch (e) {
+      toast(e.message || 'تعذر تغيير مسار التخزين', 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = orig; }
+    }
+  }
+  if ($('saveArchiveDirBtn')) {
+    $('saveArchiveDirBtn').addEventListener('click', () => {
+      const target = (($('archiveDirInput') && $('archiveDirInput').value) || '').trim();
+      if (!target) { toast('اكتب المسار الجديد أو اختره بالماوس أولاً', 'error'); return; }
+      applyArchiveDirChange(target);
+    });
+  }
+  if ($('resetArchiveDirBtn')) {
+    $('resetArchiveDirBtn').addEventListener('click', () => {
+      if (!confirm('إعادة مسار تخزين الأرشيف إلى المجلد الافتراضي (C:\\IT-ELKHAWGA-Archive)؟')) return;
+      applyArchiveDirChange('');
+    });
+  }
+
+  if ($('archiveViewTabs')) {
+    $('archiveViewTabs').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-archive-view]');
+      if (!b) return;
+      archiveViewMode = b.dataset.archiveView;
+      try { localStorage.setItem('ibp_archive_view_mode', archiveViewMode); } catch (_) {}
+      renderArchiveFiles();
+    });
+  }
+
+  if ($('refreshArchiveBtn')) $('refreshArchiveBtn').addEventListener('click', () => loadArchiveFiles(false));
+  if ($('archiveChannelFilter')) $('archiveChannelFilter').addEventListener('change', () => loadArchiveFiles(true));
+  if ($('archiveDateFilter')) {
+    $('archiveDateFilter').addEventListener('change', () => {
+      const val = $('archiveDateFilter').value;
+      if (val !== 'custom') {
+        if ($('archiveDateFrom')) $('archiveDateFrom').value = '';
+        if ($('archiveDateTo')) $('archiveDateTo').value = '';
+      }
+      loadArchiveFiles(true);
+    });
+  }
+  if ($('archiveDateFrom')) {
+    $('archiveDateFrom').addEventListener('change', () => {
+      if ($('archiveDateFilter')) $('archiveDateFilter').value = ($('archiveDateFrom').value || ($('archiveDateTo') && $('archiveDateTo').value)) ? 'custom' : '';
+      loadArchiveFiles(true);
+    });
+  }
+  if ($('archiveDateTo')) {
+    $('archiveDateTo').addEventListener('change', () => {
+      if ($('archiveDateFilter')) $('archiveDateFilter').value = ($('archiveDateTo').value || ($('archiveDateFrom') && $('archiveDateFrom').value)) ? 'custom' : '';
+      loadArchiveFiles(true);
+    });
+  }
+  if ($('archiveSameDayBtn')) {
+    $('archiveSameDayBtn').addEventListener('click', () => {
+      const fromEl = $('archiveDateFrom');
+      const toEl = $('archiveDateTo');
+      const chosen = (fromEl && fromEl.value) || (toEl && toEl.value) || toLocalYmd(new Date());
+      if (fromEl) fromEl.value = chosen;
+      if (toEl) toEl.value = chosen;
+      if ($('archiveDateFilter')) $('archiveDateFilter').value = 'custom';
+      loadArchiveFiles(true);
+    });
+  }
+  if ($('archiveClearDayBtn')) {
+    $('archiveClearDayBtn').addEventListener('click', () => {
+      if ($('archiveDateFrom')) $('archiveDateFrom').value = '';
+      if ($('archiveDateTo')) $('archiveDateTo').value = '';
+      if ($('archiveDateFilter')) $('archiveDateFilter').value = '';
+      loadArchiveFiles(true);
+    });
+  }
+  if ($('archiveResetFiltersBtn')) {
+    $('archiveResetFiltersBtn').addEventListener('click', () => {
+      if ($('archiveDateFilter')) $('archiveDateFilter').value = '';
+      if ($('archiveDateFrom')) $('archiveDateFrom').value = '';
+      if ($('archiveDateTo')) $('archiveDateTo').value = '';
+      if ($('archiveTypeFilter')) $('archiveTypeFilter').value = '';
+      if ($('archiveDeviceFilter')) $('archiveDeviceFilter').value = '';
+      if ($('archiveChannelFilter')) $('archiveChannelFilter').value = '';
+      if ($('archiveSearchInput')) $('archiveSearchInput').value = '';
+      loadArchiveFiles(true);
+    });
+  }
+  if ($('archiveTypeFilter')) $('archiveTypeFilter').addEventListener('change', () => loadArchiveFiles(true));
+  if ($('archiveDeviceFilter')) $('archiveDeviceFilter').addEventListener('change', () => loadArchiveFiles(true));
+  if ($('archiveSearchInput')) {
+    $('archiveSearchInput').addEventListener('input', () => {
+      clearTimeout(archSearchTimer);
+      archSearchTimer = setTimeout(() => loadArchiveFiles(true), 260);
+    });
+  }
+  if ($('archPageSizeSelect')) $('archPageSizeSelect').addEventListener('change', () => loadArchiveFiles(true));
+  if ($('archPageFirst')) $('archPageFirst').addEventListener('click', () => { if (archiveCurPage > 1) { archiveCurPage = 1; loadArchiveFiles(false); } });
+  if ($('archPagePrev')) $('archPagePrev').addEventListener('click', () => { if (archiveCurPage > 1) { archiveCurPage--; loadArchiveFiles(false); } });
+  if ($('archPageNext')) $('archPageNext').addEventListener('click', () => { if (archiveCurPage < archiveTotalPages) { archiveCurPage++; loadArchiveFiles(false); } });
+  if ($('archPageLast')) $('archPageLast').addEventListener('click', () => { if (archiveCurPage < archiveTotalPages) { archiveCurPage = archiveTotalPages; loadArchiveFiles(false); } });
+
+  if ($('archLbClose')) $('archLbClose').addEventListener('click', closeArchiveLightbox);
+  if ($('archLbPrev')) $('archLbPrev').addEventListener('click', () => { if (archLbIndex > 0) openArchiveLightbox(archLbIndex - 1); });
+  if ($('archLbNext')) $('archLbNext').addEventListener('click', () => { if (archLbIndex < archiveFilesCache.length - 1) openArchiveLightbox(archLbIndex + 1); });
+  if ($('archLbZoomBtn')) $('archLbZoomBtn').addEventListener('click', toggleArchiveLightboxZoom);
+  if ($('archiveLightboxModal')) {
+    $('archiveLightboxModal').addEventListener('click', (e) => {
+      if (e.target === $('archiveLightboxModal')) closeArchiveLightbox();
+      else if (e.target && e.target.id === 'archLbImg') toggleArchiveLightboxZoom();
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    const modal = $('archiveLightboxModal');
+    if (!modal || modal.style.display === 'none') return;
+    if (e.key === 'Escape') closeArchiveLightbox();
+    else if (e.key === 'ArrowLeft' && archLbIndex < archiveFilesCache.length - 1) openArchiveLightbox(archLbIndex + 1);
+    else if (e.key === 'ArrowRight' && archLbIndex > 0) openArchiveLightbox(archLbIndex - 1);
+  });
+
+  document.addEventListener('click', (e) => {
+    const dayBtn = e.target.closest('[data-jump-archive-day]');
+    if (dayBtn) {
+      const day = dayBtn.dataset.jumpArchiveDay || '';
+      const jType = dayBtn.dataset.jumpType || '';
+      if ($('archiveDateFrom')) $('archiveDateFrom').value = day;
+      if ($('archiveDateTo')) $('archiveDateTo').value = day;
+      if ($('archiveDateFilter')) $('archiveDateFilter').value = 'custom';
+      if ($('archiveTypeFilter')) $('archiveTypeFilter').value = jType;
+      archiveViewMode = jType === 'images' ? 'gallery' : 'table';
+      try { localStorage.setItem('ibp_archive_view_mode', archiveViewMode); } catch (_) {}
+      loadArchiveFiles(true);
+      return;
+    }
+    const prevEl = e.target.closest('[data-arch-preview-idx]');
+    if (prevEl) {
+      const idx = parseInt(prevEl.dataset.archPreviewIdx, 10);
+      if (!isNaN(idx)) openArchiveLightbox(idx);
+    }
+  });
+
+  if ($('exportDlpCsvBtn')) {
+    $('exportDlpCsvBtn').addEventListener('click', async () => {
+      const list = await fetchFilteredArchiveForExport();
+      if (!list.length) { toast('لا توجد ملفات مطابقة لتصديرها', 'error'); return; }
+      const header = ['التاريخ والوقت', 'اسم الملف', 'الحجم', 'القناة', 'الجهاز', 'مستخدم الويندوز', 'المرسل إليه / الوجهة', 'رقم الهاتف', 'SHA-256', 'المسار على السيرفر'].map(csvCell).join(',');
+      const rows = list.map((f) => [
+        f.created_at ? new Date(f.created_at).toLocaleString('ar-EG') : '',
+        f.file_name || '',
+        formatArchiveBytes(f.file_size),
+        String(f.channel || '').includes('whatsapp') ? 'واتساب ويب' : 'ويب',
+        f.device_name || f.device_id || '',
+        f.windows_user || '',
+        f.recipient_name || f.page_url || '',
+        f.recipient_phone || '',
+        f.sha256 || '',
+        f.stored_path || '',
+      ].map(csvCell).join(','));
+      const d = new Date().toISOString().slice(0, 10);
+      await saveDownloadText([header].concat(rows).join('\r\n'), 'IT-ELKHAWGA-DLP-Report-' + d + '.csv', 'text/csv;charset=utf-8');
+    });
+  }
+  if ($('exportDlpPrintBtn')) {
+    $('exportDlpPrintBtn').addEventListener('click', async () => {
+      const list = await fetchFilteredArchiveForExport();
+      if (!list.length) { toast('لا توجد ملفات مطابقة لإنشاء التقرير', 'error'); return; }
+      const nowStr = new Date().toLocaleString('ar-EG');
+      const rowsHtml = list.map((f, idx) =>
+        '<tr>' +
+        '<td>' + (idx + 1) + '</td>' +
+        '<td>' + esc(f.created_at ? new Date(f.created_at).toLocaleString('ar-EG') : '—') + '</td>' +
+        '<td><b>' + esc(f.device_name || f.device_id || '—') + '</b><br><small>' + esc(f.windows_user || '') + '</small></td>' +
+        '<td><b>' + esc(f.file_name || '') + '</b><br><small>' + esc(formatArchiveBytes(f.file_size)) + '</small></td>' +
+        '<td>' + (String(f.channel || '').includes('whatsapp') ? 'واتساب ويب' : 'ويب') + '</td>' +
+        '<td>' + esc(f.recipient_name || f.page_url || '—') + (f.recipient_phone ? ('<br><span dir="ltr">' + esc(f.recipient_phone) + '</span>') : '') + '</td>' +
+        '<td style="font-family:monospace;font-size:10px;">' + esc((f.sha256 || '').slice(0, 16)) + '</td>' +
+        '</tr>'
+      ).join('');
+      const reportHtml = '<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>تقرير حماية الملفات DLP - IT ELKHAWGA</title>' +
+        '<style>body{font-family:Segoe UI,Tahoma,sans-serif;margin:28px;color:#0f172a}h1{margin:0 0 6px;font-size:22px;color:#0f4c81}.meta{color:#475569;font-size:13px;margin-bottom:18px}table{width:100%;border-collapse:collapse;font-size:12.5px}th,td{border:1px solid #cbd5e1;padding:8px 10px;text-align:right;vertical-align:top}th{background:#f1f5f9;font-weight:800}@media print{.no-print{display:none}}</style></head><body>' +
+        '<div class="no-print" style="margin-bottom:16px;"><button onclick="window.print()" style="padding:8px 18px;font-weight:700;cursor:pointer;">🖨 طباعة / حفظ كملف PDF</button></div>' +
+        '<h1>IT ELKHAWGA — تقرير حماية الملفات والبيانات (DLP)</h1>' +
+        '<div class="meta">تاريخ إصدار التقرير: ' + esc(nowStr) + ' · إجمالي السجلات بالتقرير: <b>' + list.length + '</b></div>' +
+        '<table><thead><tr><th>#</th><th>التاريخ والوقت</th><th>الجهاز / المستخدم</th><th>الملف والحجم</th><th>القناة</th><th>المرسل إليه / الرقم</th><th>بصمة SHA-256</th></tr></thead><tbody>' + rowsHtml + '</tbody></table>' +
+        '</body></html>';
+      const d = new Date().toISOString().slice(0, 10);
+      await saveDownloadText(reportHtml, 'IT-ELKHAWGA-DLP-Printable-' + d + '.html', 'text/html;charset=utf-8');
+    });
+  }
   if ($('openArchiveFolderBtn')) {
     $('openArchiveFolderBtn').addEventListener('click', async () => {
       try {
@@ -2242,6 +4057,15 @@
       }
       return;
     }
+    if (dlLink && isAppleTouch) {
+      e.preventDefault();
+      const fid = dlLink.dataset.downloadUpload || '';
+      if (fid) {
+        const tokPart = authToken ? ('&token=' + encodeURIComponent(authToken)) : '';
+        window.open(serverHttpBase + '/api/uploads/' + encodeURIComponent(fid) + '?inline=1' + tokPart, '_blank', 'noopener,noreferrer');
+      }
+      return;
+    }
     const b = e.target.closest('[data-open-archive-path]');
     if (!b || !api.openArchiveFolder) return;
     try {
@@ -2250,20 +4074,2398 @@
     } catch (err) { toast(err.message || 'تعذر فتح موقع الملف', 'error'); }
   });
 
+  let connTimer = null;
+  let connBusy = false;
+  async function refreshServerConnectionPill(manualClick) {
+    const pill = $('adminServerConnPill');
+    const txt = $('adminServerConnText');
+    if (!pill || !txt || connBusy) return;
+    connBusy = true;
+    const t0 = performance.now();
+    try {
+      const info = api.checkServerConnection
+        ? await api.checkServerConnection()
+        : await api.getServerInfo();
+      const rtt = Math.max(1, Math.round(performance.now() - t0));
+      const relayOk = info && info.relay_connected !== undefined ? Boolean(info.relay_connected) : true;
+      const isHost = Boolean(info && info.is_host_server);
+      const lanOk = Boolean(info && Number(info.lan_port || info.port || 0) > 0);
+      const pingMs = Number(info && info.relay_latency_ms) || rtt;
+
+      if (relayOk) {
+        pill.className = 'live-pill srv-conn ok';
+        txt.textContent = isHost ? 'السيرفر الرئيسي متصل' : ('متصل بالسيرفر · ' + pingMs + 'ms');
+        pill.title = isHost
+          ? ('أنت تعمل على السيرفر الرئيسي مباشرة (LAN :' + (info.lan_port || 8787) + ' + Relay متاح)')
+          : ('متصل بسيرفر الشركة بنجاح — زمن الاستجابة: ' + pingMs + 'ms');
+        if (manualClick) toast('✓ متصل بالسيرفر بنجاح (' + pingMs + 'ms)');
+      } else if (lanOk && isTauriRuntime) {
+        pill.className = 'live-pill srv-conn warn';
+        txt.textContent = 'متصل محلياً فقط (السحابي غير متاح)';
+        pill.title = (info && info.error) || 'تعذر الوصول للسيرفر السحابي حالياً';
+        if (manualClick) toast('⚠ البرنامج يعمل محلياً لكن تعذر الوصول للسيرفر السحابي: ' + ((info && info.error) || ''), 'error');
+      } else {
+        pill.className = 'live-pill srv-conn offline';
+        txt.textContent = 'غير متصل بالسيرفر!';
+        pill.title = (info && info.error) || 'انقطع الاتصال بالسيرفر';
+        if (manualClick) toast('🔴 غير متصل بالسيرفر: ' + ((info && info.error) || 'تحقق من الإنترنت أو تشغيل السيرفر'), 'error');
+      }
+    } catch (err) {
+      pill.className = 'live-pill srv-conn offline';
+      txt.textContent = 'غير متصل بالسيرفر!';
+      pill.title = 'انقطع الاتصال بالسيرفر — جاري إعادة المحاولة تلقائياً';
+      if (manualClick) toast('🔴 تعذر الاتصال بالسيرفر حالياً — تأكد من الإنترنت أو حالة السيرفر الرئيسي', 'error');
+    } finally {
+      connBusy = false;
+    }
+  }
+  if ($('adminServerConnPill')) {
+    $('adminServerConnPill').addEventListener('click', () => refreshServerConnectionPill(true));
+  }
+
+  /* ---------- WhatsApp Bot Center ---------- */
+  let waBotPollTimer = null;
+  let waBotDirty = false;
+  let waBotLoadedOnce = false;
+  let waBotLastState = 'disconnected';
+
+  async function callWaBotApi(shimName, rpcCmd, rpcArgs) {
+    if (api && typeof api[shimName] === 'function') {
+      if (shimName === 'saveWaBotConfig') return api.saveWaBotConfig(rpcArgs && rpcArgs.config);
+      if (shimName === 'disconnectWaBot') return api.disconnectWaBot(Boolean(rpcArgs && rpcArgs.logout));
+      return api[shimName]();
+    }
+    if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+      return window.__TAURI__.core.invoke(rpcCmd, rpcArgs || {});
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    const tok = (api && api.getAuthToken && api.getAuthToken()) || authToken || '';
+    if (tok) headers['Authorization'] = 'Bearer ' + tok;
+    const resp = await fetch('/api/rpc', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ cmd: rpcCmd, args: rpcArgs || {} }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    return data.result;
+  }
+
+  function updateWaBotFeatureCountBadge() {
+    const boxes = Array.from(document.querySelectorAll('input[data-wa-feat]'));
+    const active = boxes.filter((b) => b.checked).length;
+    const badge = $('waBotActiveFeatCount');
+    if (badge) {
+      badge.textContent = 'الخصائص المفعّلة: ' + active + ' من ' + (boxes.length || 13);
+      badge.className = 'badge ' + (active > 0 ? 'green' : 'gray');
+    }
+  }
+
+  function collectWaBotConfigFromUi() {
+    const features = {};
+    document.querySelectorAll('input[data-wa-feat]').forEach((el) => {
+      const k = el.getAttribute('data-wa-feat');
+      if (k) features[k] = Boolean(el.checked);
+    });
+    return {
+      enabled: Boolean($('waBotEnabledToggle') && $('waBotEnabledToggle').checked),
+      recipients: (($('waBotRecipientsInput') && $('waBotRecipientsInput').value) || '').trim(),
+      max_file_mb: Math.max(1, Math.min(64, Number(($('waBotMaxMbInput') && $('waBotMaxMbInput').value) || 25) || 25)),
+      custom_aliases: (($('waBotCustomAliasesInput') && $('waBotCustomAliasesInput').value) || '').trim(),
+      features,
+    };
+  }
+
+  function renderWaBotStatus(st, forceSyncForm) {
+    if (!st || (!st.ok && !st.success)) return;
+    const state = st.state || 'disconnected';
+    waBotLastState = state;
+    const badge = $('waBotStateBadge');
+    const desc = $('waBotStateDesc');
+    const navBadge = $('navWaBotBadge');
+    const qrBox = $('waBotQrBox');
+    const qrImg = $('waBotQrImg');
+    const errBanner = $('waBotErrorBanner');
+    const connectBtn = $('waBotConnectBtn');
+    const testBtn = $('waBotTestBtn');
+    const pauseBtn = $('waBotPauseBtn');
+    const logoutBtn = $('waBotLogoutBtn');
+
+    if (navBadge) {
+      if (state === 'connected') {
+        navBadge.style.display = '';
+        navBadge.textContent = st.config && st.config.enabled ? 'نشط' : 'متصل';
+        navBadge.style.background = st.config && st.config.enabled ? 'rgba(16,185,129,0.18)' : 'rgba(59,130,246,0.16)';
+        navBadge.style.color = st.config && st.config.enabled ? '#10b981' : '#3b82f6';
+      } else if (state === 'qr_ready') {
+        navBadge.style.display = '';
+        navBadge.textContent = 'QR';
+        navBadge.style.background = 'rgba(245,158,11,0.18)';
+        navBadge.style.color = '#f59e0b';
+      } else {
+        navBadge.style.display = 'none';
+      }
+    }
+
+    if (badge) {
+      if (state === 'connected') {
+        badge.className = 'badge green';
+        badge.textContent = '🟢 متصل' + (st.bot_phone ? (' (+' + st.bot_phone + ')') : '');
+      } else if (state === 'qr_ready') {
+        badge.className = 'badge amber';
+        badge.textContent = '🟡 بانتظار مسح رمز QR';
+      } else if (state === 'connecting') {
+        badge.className = 'badge blue';
+        badge.textContent = '🔄 جاري الاتصال بواتساب...';
+      } else {
+        badge.className = 'badge gray';
+        badge.textContent = st.has_saved_session ? '⏸ متوقف مؤقتاً (الجلسة محفوظة)' : '⚪ غير مرتبط';
+      }
+    }
+
+    if (desc) {
+      if (state === 'connected') {
+        desc.innerHTML = '✅ تم ربط هاتف البوت بنجاح' +
+          (st.bot_name ? (' (<b>' + esc(st.bot_name) + '</b>)') : '') +
+          '. اختر الخصائص التي تريد تفعيلها بالأسفل أو أرسل رسالة اختبار للتأكد من وصول التنبيهات لهاتفك.';
+      } else if (state === 'qr_ready') {
+        desc.innerHTML = '📱 امسح رمز <b>QR</b> الظاهر على اليسار من تطبيق واتساب على شريحة البوت (الأجهزة المرتبطة ⬅ ربط جهاز). يتم التحديث تلقائياً فور المسح.';
+      } else if (state === 'connecting') {
+        desc.innerHTML = '⏳ جاري تهيئة الاتصال المشفّر مع خوادم واتساب وتجهيز الجلسة...';
+      } else {
+        desc.innerHTML = 'اربط رقم شريحة البوت بمسح رمز <b>QR</b> مرة واحدة فقط، ثم شغّل أو أوقف كل خاصية على حدة بحرية كاملة.';
+      }
+    }
+
+    if (qrBox && qrImg) {
+      if (state === 'qr_ready' && st.qr_data_url) {
+        qrImg.src = st.qr_data_url;
+        qrBox.style.display = 'flex';
+      } else {
+        qrBox.style.display = 'none';
+      }
+    }
+
+    if (errBanner) {
+      if (st.last_error) {
+        errBanner.textContent = '⚠ ' + st.last_error;
+        errBanner.style.display = 'block';
+      } else {
+        errBanner.style.display = 'none';
+      }
+    }
+
+    if (connectBtn) {
+      connectBtn.style.display = state === 'connected' ? 'none' : '';
+      connectBtn.textContent = st.has_saved_session && state === 'disconnected'
+        ? '▶ استئناف اتصال البوت'
+        : (state === 'qr_ready' ? '↻ توليد رمز QR جديد' : '🔗 ربط / توليد رمز QR');
+    }
+    if (testBtn) testBtn.style.display = state === 'connected' ? '' : 'none';
+    if (pauseBtn) pauseBtn.style.display = (state === 'connected' || state === 'connecting' || state === 'qr_ready') ? '' : 'none';
+    if (logoutBtn) logoutBtn.style.display = (state === 'connected' || st.has_saved_session) ? '' : 'none';
+
+    if ((forceSyncForm || !waBotLoadedOnce || !waBotDirty) && st.config) {
+      waBotLoadedOnce = true;
+      const cfg = st.config;
+      if ($('waBotEnabledToggle')) $('waBotEnabledToggle').checked = Boolean(cfg.enabled);
+      if ($('waBotRecipientsInput')) $('waBotRecipientsInput').value = cfg.recipients || '';
+      if ($('waBotMaxMbInput')) $('waBotMaxMbInput').value = cfg.max_file_mb || 25;
+      if ($('waBotCustomAliasesInput')) $('waBotCustomAliasesInput').value = cfg.custom_aliases || '';
+      const feats = cfg.features || {};
+      document.querySelectorAll('input[data-wa-feat]').forEach((el) => {
+        const k = el.getAttribute('data-wa-feat');
+        el.checked = Boolean(k && feats[k]);
+      });
+      if (forceSyncForm) waBotDirty = false;
+      updateWaBotFeatureCountBadge();
+    }
+
+    const logsEl = $('waBotLogsBox');
+    if (logsEl && Array.isArray(st.logs)) {
+      logsEl.textContent = st.logs.length
+        ? st.logs.map((l) => '[' + (l.time || '') + '] ' + (l.text || '')).join('\n')
+        : 'لا توجد أحداث مسجلة بعد.';
+    }
+  }
+
+  async function loadWaBotStatus(forceSyncForm) {
+    try {
+      const st = await callWaBotApi('getWaBotStatus', 'get_wa_bot_status', {});
+      renderWaBotStatus(st, Boolean(forceSyncForm));
+    } catch (_) {}
+  }
+
+  function startWaBotPoll() {
+    stopWaBotPoll();
+    waBotPollTimer = setInterval(() => {
+      if (document.hidden) return;
+      const open = $('view-wabot') && $('view-wabot').classList.contains('active');
+      if (!open) return;
+      loadWaBotStatus(false);
+    }, 2500);
+  }
+
+  function stopWaBotPoll() {
+    if (waBotPollTimer) {
+      clearInterval(waBotPollTimer);
+      waBotPollTimer = null;
+    }
+  }
+
+  async function saveWaBotSettings(showToastMsg = true) {
+    const cfg = collectWaBotConfigFromUi();
+    const res = await callWaBotApi('saveWaBotConfig', 'save_wa_bot_config', { config: cfg });
+    if (res && (res.ok || res.success)) {
+      waBotDirty = false;
+      renderWaBotStatus(res, true);
+      if (showToastMsg) toast('✓ تم حفظ إعدادات وخصائص بوت واتساب بنجاح');
+      return true;
+    }
+    if (showToastMsg) toast((res && res.error) || 'تعذر حفظ إعدادات البوت', 'error');
+    return false;
+  }
+
+  (function initWaBotUi() {
+    document.querySelectorAll('input[data-wa-feat], #waBotEnabledToggle, #waBotRecipientsInput, #waBotMaxMbInput, #waBotCustomAliasesInput').forEach((el) => {
+      el.addEventListener('change', () => {
+        waBotDirty = true;
+        updateWaBotFeatureCountBadge();
+      });
+      if ((el.tagName === 'INPUT' && el.type !== 'checkbox') || el.tagName === 'TEXTAREA') {
+        el.addEventListener('input', () => { waBotDirty = true; });
+      }
+    });
+
+    if ($('waBotSelectAllBtn')) {
+      $('waBotSelectAllBtn').addEventListener('click', () => {
+        document.querySelectorAll('input[data-wa-feat]').forEach((el) => { el.checked = true; });
+        if ($('waBotEnabledToggle')) $('waBotEnabledToggle').checked = true;
+        waBotDirty = true;
+        updateWaBotFeatureCountBadge();
+      });
+    }
+
+    if ($('waBotClearAllBtn')) {
+      $('waBotClearAllBtn').addEventListener('click', () => {
+        document.querySelectorAll('input[data-wa-feat]').forEach((el) => { el.checked = false; });
+        waBotDirty = true;
+        updateWaBotFeatureCountBadge();
+      });
+    }
+
+    ['waBotSaveBtn', 'waBotSaveBtnBottom'].forEach((id) => {
+      if ($(id)) {
+        $(id).addEventListener('click', async () => {
+          const btn = $(id);
+          const orig = btn.innerHTML;
+          btn.disabled = true;
+          btn.innerHTML = '<span class="spinner"></span> جاري الحفظ...';
+          try { await saveWaBotSettings(true); } finally { btn.disabled = false; btn.innerHTML = orig; }
+        });
+      }
+    });
+
+    if ($('waBotConnectBtn')) {
+      $('waBotConnectBtn').addEventListener('click', async () => {
+        const btn = $('waBotConnectBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري تجهيز QR...';
+        try {
+          if (waBotDirty) await saveWaBotSettings(false);
+          const res = await callWaBotApi('connectWaBot', 'connect_wa_bot', {});
+          if (res && (res.ok || res.success)) {
+            renderWaBotStatus(res, false);
+            startWaBotPoll();
+            if (res.state === 'qr_ready') {
+              toast('📱 تم توليد رمز QR — امسحه الآن من هاتف البوت');
+            }
+          } else {
+            toast((res && res.error) || 'تعذر بدء ربط البوت', 'error');
+          }
+        } catch (e) {
+          toast('خطأ: ' + (e.message || e), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('waBotPauseBtn')) {
+      $('waBotPauseBtn').addEventListener('click', async () => {
+        const res = await callWaBotApi('disconnectWaBot', 'disconnect_wa_bot', { logout: false });
+        if (res && (res.ok || res.success)) {
+          renderWaBotStatus(res, false);
+          toast('تم إيقاف اتصال البوت مؤقتاً مع الاحتفاظ بالجلسة');
+        } else {
+          toast((res && res.error) || 'تعذر الإيقاف', 'error');
+        }
+      });
+    }
+
+    if ($('waBotLogoutBtn')) {
+      $('waBotLogoutBtn').addEventListener('click', async () => {
+        if (!window.confirm('هل تريد فك ربط رقم الهاتف الحالي نهائياً ومسح الجلسة لربط رقم جديد؟')) return;
+        const res = await callWaBotApi('disconnectWaBot', 'disconnect_wa_bot', { logout: true });
+        if (res && (res.ok || res.success)) {
+          renderWaBotStatus(res, false);
+          toast('تم فك ربط الرقم بنجاح — يمكنك مسح QR لرقم جديد');
+        } else {
+          toast((res && res.error) || 'تعذر فك الربط', 'error');
+        }
+      });
+    }
+
+    if ($('waBotTestBtn')) {
+      $('waBotTestBtn').addEventListener('click', async () => {
+        const btn = $('waBotTestBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الإرسال...';
+        try {
+          if (waBotDirty) await saveWaBotSettings(false);
+          const res = await callWaBotApi('sendWaBotTest', 'send_wa_bot_test', {});
+          if (res && (res.ok || res.success)) {
+            toast('✅ تم إرسال رسالة الاختبار إلى واتساب بنجاح!');
+            loadWaBotStatus(false);
+          } else {
+            toast((res && res.error) || 'تعذر إرسال رسالة الاختبار', 'error');
+          }
+        } catch (e) {
+          toast('تعذر الإرسال: ' + (e.message || e), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('waBotRefreshBtn')) {
+      $('waBotRefreshBtn').addEventListener('click', () => loadWaBotStatus(true));
+    }
+  })();
+
+  /* ---------- Dahua CCTV Live Monitoring Center (v1.1.1 Enterprise Suite + Live Audio) ---------- */
+  let cctvDvrs = [];
+  let cctvSettings = { super_only: false, auto_hide_empty: true, favorites: [] };
+  let cctvGridCols = 2; // 1, 2, 3, 4
+  let cctvSelectedBranch = 'all';
+  let cctvChannelPage = 0;
+  let cctvLivePlaying = true;
+  let cctvAutoTourTimer = null;
+  let cctvStreamEpoch = 0;
+  let cctvDetectedChannelNames = null;
+  let cctvBridgeDevicesCache = [];
+  let cctvHdTarget = null; // { dvrId, channel, tilesList, index, item }
+  let cctvHdEpoch = 0;
+  let cctvHdLastDataUrl = '';
+  let cctvZoomScale = 1;
+  let cctvPanX = 0;
+  let cctvPanY = 0;
+  let cctvDragging = false;
+  let cctvDragStart = { x: 0, y: 0 };
+
+  // Live Camera Audio state (`0% CPU` & `0 B/s` when muted)
+  let cctvAudioTarget = null; // { dvrId, channel, label }
+  let cctvAudioEpoch = 0;
+  let cctvAudioCtx = null;
+  let cctvAudioGain = null;
+  let cctvAudioVolume = 1.35;
+  let cctvAudioNextTime = 0;
+  let cctvAudioLastAdtsTail = null; // { bytes: Uint8Array, count: number }
+  const cctvAudioScanAttempted = new Set();
+
+  // True whenever running inside the installed Tauri Desktop Admin app (`http://tauri.localhost` or `tauri://`)
+  // so camera frames & clip downloads route through Rust -> Cloud Relay HTTPS instead of relative `/api/cctv/...`!
+  const isNativeTauriOrigin = Boolean(
+    window.__TAURI__ &&
+    window.__TAURI__.core &&
+    (location.hostname === 'tauri.localhost' || (location.protocol !== 'http:' && location.protocol !== 'https:'))
+  );
+
+  async function callCctvApi(shimName, rpcCmd, rpcArgs) {
+    if (api && typeof api[shimName] === 'function') {
+      if (shimName === 'cctvSaveDvr') return api.cctvSaveDvr(rpcArgs && rpcArgs.dvr);
+      if (shimName === 'cctvDeleteDvr') return api.cctvDeleteDvr(rpcArgs && rpcArgs.id);
+      if (shimName === 'cctvTestDvr') return api.cctvTestDvr(rpcArgs && rpcArgs.dvr);
+      if (shimName === 'cctvScanLan') return api.cctvScanLan(rpcArgs && rpcArgs.bridgeDeviceId);
+      if (shimName === 'cctvSetSettings') return api.cctvSetSettings(Boolean(rpcArgs && rpcArgs.superOnly));
+      if (shimName === 'cctvGetFrameB64') return api.cctvGetFrameB64(rpcArgs.dvrId, rpcArgs.channel, rpcArgs.hd);
+      if (shimName === 'cctvAction') return api.cctvAction(rpcArgs.action, rpcArgs.payload);
+      return api[shimName]();
+    }
+    if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+      return window.__TAURI__.core.invoke(rpcCmd, rpcArgs || {});
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    const tok = (api && api.getAuthToken && api.getAuthToken()) || authToken || '';
+    if (tok) headers['Authorization'] = 'Bearer ' + tok;
+    const resp = await fetch('/api/rpc', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ cmd: rpcCmd, args: rpcArgs || {} }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    return data.result;
+  }
+
+  function isChannelFav(dvrId, channel) {
+    const favs = Array.isArray(cctvSettings.favorites) ? cctvSettings.favorites : [];
+    return favs.some((f) => f.dvr_id === dvrId && Number(f.channel) === Number(channel));
+  }
+
+  async function toggleChannelFav(dvrId, channel) {
+    const cur = Array.isArray(cctvSettings.favorites) ? cctvSettings.favorites.slice() : [];
+    const idx = cur.findIndex((f) => f.dvr_id === dvrId && Number(f.channel) === Number(channel));
+    const added = idx === -1;
+    if (added) {
+      cur.push({ dvr_id: dvrId, channel: Number(channel) });
+    } else {
+      cur.splice(idx, 1);
+    }
+    const res = await callCctvApi('cctvAction', 'cctv_action', {
+      action: 'save_favorites',
+      payload: { favorites: cur },
+    });
+    if (res && res.ok && res.settings) {
+      cctvSettings = res.settings;
+      syncCctvBranchAndPageSelectors();
+      toast(added ? '⭐ تمت إضافة الكاميرا إلى شاشة الإدارة المفضّلة (VIP)' : 'تمت إزالة الكاميرا من المفضّلة');
+      renderCctvWall();
+    }
+  }
+
+  function applyCctvRoleVisibility() {
+    const isSuper = hasSuperAdminAccess();
+    const isViewer = String(currentAdminRole || '').toLowerCase() === 'viewer';
+    const navItem = $('navCamerasItem');
+    if (navItem) {
+      navItem.style.display = (cctvSettings.super_only && !isSuper) ? 'none' : '';
+    }
+    const superWrap = $('cctvSuperOnlyWrap');
+    if (superWrap) {
+      superWrap.style.display = isSuper ? 'inline-flex' : 'none';
+    }
+    const superSw = $('cctvSuperOnlySwitch');
+    if (superSw) {
+      superSw.checked = Boolean(cctvSettings.super_only);
+    }
+    const autoHideSw = $('cctvAutoHideSwitch');
+    if (autoHideSw) {
+      autoHideSw.checked = cctvSettings.auto_hide_empty !== false;
+    }
+    const manageBtn = $('cctvManageToggleBtn');
+    if (manageBtn) {
+      manageBtn.style.display = isViewer ? 'none' : '';
+    }
+  }
+
+  function buildCctvFrameUrl(dvrId, channel, hd) {
+    const tok = (api && api.getAuthToken && api.getAuthToken()) || authToken || '';
+    const qs = new URLSearchParams({
+      dvr_id: String(dvrId || ''),
+      channel: String(channel || 1),
+      hd: hd ? '1' : '0',
+      _t: String(Date.now()) + '_' + Math.random().toString(36).slice(2, 6),
+    });
+    if (tok) qs.set('token', tok);
+    return '/api/cctv/frame?' + qs.toString();
+  }
+
+  function isChannelSkipped(dvr, ch) {
+    const manualHidden = Array.isArray(dvr.hidden_channels) && dvr.hidden_channels.includes(Number(ch));
+    if (manualHidden) return true;
+    if (cctvSettings.auto_hide_empty !== false) {
+      const deadArr = Array.isArray(dvr.dead_channels) ? dvr.dead_channels : [];
+      if (deadArr.includes(Number(ch))) return true;
+    }
+    return false;
+  }
+
+  function getVisibleCctvTiles() {
+    const enabledDvrs = cctvDvrs.filter((d) => d.enabled !== false);
+    if (!enabledDvrs.length) return { allTiles: [], pageTiles: [], totalPages: 1 };
+    const perPage = cctvGridCols * cctvGridCols;
+
+    if (cctvSelectedBranch === 'vip') {
+      const favs = Array.isArray(cctvSettings.favorites) ? cctvSettings.favorites : [];
+      const tiles = [];
+      for (const f of favs) {
+        const d = enabledDvrs.find((x) => x.id === f.dvr_id);
+        if (!d) continue;
+        const ch = Number(f.channel || 1);
+        const customTitle = (d.channel_names && d.channel_names[String(ch)]) || '';
+        tiles.push({
+          dvr: d,
+          dvrId: d.id,
+          channel: ch,
+          branchName: d.name,
+          camLabel: customTitle ? ('ك' + ch + ' · ' + customTitle) : ('كاميرا ' + ch),
+        });
+      }
+      const totalPages = Math.max(1, Math.ceil(tiles.length / perPage));
+      if (cctvChannelPage >= totalPages) cctvChannelPage = 0;
+      const start = cctvChannelPage * perPage;
+      return { allTiles: tiles, pageTiles: tiles.slice(start, start + perPage), totalPages };
+    }
+
+    if (cctvSelectedBranch === 'all') {
+      const tiles = [];
+      let maxCh = 1;
+      enabledDvrs.forEach((d) => { if ((d.channels_count || 1) > maxCh) maxCh = d.channels_count || 1; });
+      for (let ch = 1; ch <= maxCh && tiles.length < 48; ch++) {
+        for (const d of enabledDvrs) {
+          if (ch <= (d.channels_count || 8) && !isChannelSkipped(d, ch)) {
+            const customTitle = (d.channel_names && d.channel_names[String(ch)]) || '';
+            tiles.push({
+              dvr: d,
+              dvrId: d.id,
+              channel: ch,
+              branchName: d.name,
+              camLabel: customTitle ? ('ك' + ch + ' · ' + customTitle) : ('كاميرا ' + ch),
+            });
+          }
+        }
+      }
+      const totalPages = Math.max(1, Math.ceil(tiles.length / perPage));
+      if (cctvChannelPage >= totalPages) cctvChannelPage = 0;
+      const start = cctvChannelPage * perPage;
+      return { allTiles: tiles, pageTiles: tiles.slice(start, start + perPage), totalPages };
+    }
+
+    const dvr = enabledDvrs.find((d) => d.id === cctvSelectedBranch) || enabledDvrs[0];
+    if (!dvr) return { allTiles: [], pageTiles: [], totalPages: 1 };
+    const totalCh = Math.max(1, Number(dvr.channels_count || 8));
+    const tiles = [];
+    for (let ch = 1; ch <= totalCh; ch++) {
+      if (isChannelSkipped(dvr, ch)) continue;
+      const customTitle = (dvr.channel_names && dvr.channel_names[String(ch)]) || '';
+      tiles.push({
+        dvr,
+        dvrId: dvr.id,
+        channel: ch,
+        branchName: dvr.name,
+        camLabel: customTitle ? ('كاميرا ' + ch + ' · ' + customTitle) : ('كاميرا ' + ch),
+      });
+    }
+    const totalPages = Math.max(1, Math.ceil(tiles.length / perPage));
+    if (cctvChannelPage >= totalPages) cctvChannelPage = 0;
+    const start = cctvChannelPage * perPage;
+    return { allTiles: tiles, pageTiles: tiles.slice(start, start + perPage), totalPages };
+  }
+
+  function stopCctvAutoTour() {
+    if (cctvAutoTourTimer) {
+      clearInterval(cctvAutoTourTimer);
+      cctvAutoTourTimer = null;
+    }
+    const btn = $('cctvAutoTourBtn');
+    if (btn) {
+      btn.className = 'btn btn-ghost btn-sm';
+      btn.textContent = '🔄 دوران تلقائي';
+    }
+  }
+
+  function toggleCctvAutoTour() {
+    if (cctvAutoTourTimer) {
+      stopCctvAutoTour();
+      toast('تم إيقاف الدوران التلقائي');
+      return;
+    }
+    const btn = $('cctvAutoTourBtn');
+    if (btn) {
+      btn.className = 'btn btn-primary btn-sm';
+      btn.textContent = '🔄 يدور الآن (12ث)';
+    }
+    toast('🔄 تم تشغيل وضع الدوران التلقائي لغرفة العمليات (يقلب كل 12 ثانية)');
+    cctvAutoTourTimer = setInterval(() => {
+      if (document.hidden) return;
+      const open = $('view-cameras') && $('view-cameras').classList.contains('active');
+      if (!open) { stopCctvAutoTour(); return; }
+      const computed = getVisibleCctvTiles();
+      const totalPages = computed.totalPages || 1;
+      if (totalPages > 1) {
+        cctvChannelPage = (cctvChannelPage + 1) % totalPages;
+        renderCctvWall();
+      } else if (cctvDvrs.length > 1) {
+        const ids = ['all'].concat(cctvDvrs.map((d) => d.id));
+        const curIdx = ids.indexOf(cctvSelectedBranch);
+        cctvSelectedBranch = ids[(curIdx + 1) % ids.length];
+        cctvChannelPage = 0;
+        if ($('cctvBranchSelect')) $('cctvBranchSelect').value = cctvSelectedBranch;
+        renderCctvWall();
+      }
+    }, 12000);
+  }
+
+  function stopCctvWall() {
+    cctvStreamEpoch += 1;
+    stopCctvAutoTour();
+    stopCctvAudio(true);
+    closeCctvHdModal();
+  }
+
+  function hasChannelAudio(dvr, channel) {
+    if (!dvr || !Array.isArray(dvr.audio_channels)) return false;
+    return dvr.audio_channels.includes(Number(channel));
+  }
+
+  function isAudioPlayingFor(dvrId, channel) {
+    return Boolean(
+      cctvAudioTarget &&
+      cctvAudioTarget.dvrId === dvrId &&
+      Number(cctvAudioTarget.channel) === Number(channel)
+    );
+  }
+
+  function ensureCctvAudioContext() {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      throw new Error('متصفحك الحالي لا يدعم تشغيل الصوت المباشر (Web Audio API)');
+    }
+    if (!cctvAudioCtx || cctvAudioCtx.state === 'closed') {
+      cctvAudioCtx = new AudioCtx();
+      cctvAudioGain = cctvAudioCtx.createGain();
+      cctvAudioGain.gain.value = cctvAudioVolume;
+      cctvAudioGain.connect(cctvAudioCtx.destination);
+    }
+    if (cctvAudioCtx.state === 'suspended') {
+      cctvAudioCtx.resume().catch(() => {});
+    }
+    // Unlock iPadOS / iOS Safari audio output inside user gesture
+    try {
+      const silent = cctvAudioCtx.createBuffer(1, 1, 22050);
+      const sNode = cctvAudioCtx.createBufferSource();
+      sNode.buffer = silent;
+      sNode.connect(cctvAudioGain);
+      sNode.start(0);
+    } catch (_) {}
+    return cctvAudioCtx;
+  }
+
+  function setCctvAudioVolumePercent(pct) {
+    const clamped = Math.max(20, Math.min(250, Number(pct || 135) || 135));
+    cctvAudioVolume = clamped / 100;
+    if (cctvAudioGain && cctvAudioCtx) {
+      try { cctvAudioGain.gain.setValueAtTime(cctvAudioVolume, cctvAudioCtx.currentTime); } catch (_) {
+        cctvAudioGain.gain.value = cctvAudioVolume;
+      }
+    }
+    if ($('cctvWallVolumeSlider') && Number($('cctvWallVolumeSlider').value) !== clamped) {
+      $('cctvWallVolumeSlider').value = String(clamped);
+    }
+    if ($('cctvHdVolumeSlider') && Number($('cctvHdVolumeSlider').value) !== clamped) {
+      $('cctvHdVolumeSlider').value = String(clamped);
+    }
+  }
+
+  function sliceTailAdtsFrames(u8, maxFrames) {
+    const slices = [];
+    let pos = 0;
+    while (pos + 7 <= u8.length) {
+      if (u8[pos] === 0xff && (u8[pos + 1] & 0xf0) === 0xf0 && (u8[pos + 1] & 0x06) === 0x00) {
+        const len = ((u8[pos + 3] & 0x03) << 11) | (u8[pos + 4] << 3) | ((u8[pos + 5] & 0xe0) >> 5);
+        if (len >= 7 && len <= 2048 && pos + len <= u8.length) {
+          slices.push(u8.subarray(pos, pos + len));
+          pos += len;
+          continue;
+        }
+      }
+      pos += 1;
+    }
+    if (!slices.length) return null;
+    const picked = slices.slice(-maxFrames);
+    let total = 0;
+    picked.forEach((s) => { total += s.length; });
+    const out = new Uint8Array(total);
+    let off = 0;
+    picked.forEach((s) => { out.set(s, off); off += s.length; });
+    return { bytes: out, count: picked.length };
+  }
+
+  async function scheduleCctvAudioChunk(chunk, boundEpoch) {
+    if (!chunk || !chunk.data_b64 || !cctvAudioCtx || !cctvAudioGain) return;
+    if (boundEpoch !== cctvAudioEpoch || !cctvAudioTarget) return;
+    const bin = atob(chunk.data_b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    if (!u8.length) return;
+
+    if (chunk.format === 'aac') {
+      const prevTail = cctvAudioLastAdtsTail;
+      cctvAudioLastAdtsTail = sliceTailAdtsFrames(u8, 2);
+      let decodeU8 = u8;
+      let warmupFrames = 0;
+      if (prevTail && prevTail.bytes && prevTail.bytes.length) {
+        decodeU8 = new Uint8Array(prevTail.bytes.length + u8.length);
+        decodeU8.set(prevTail.bytes, 0);
+        decodeU8.set(u8, prevTail.bytes.length);
+        warmupFrames = prevTail.count;
+      }
+      try {
+        const audioBuf = await cctvAudioCtx.decodeAudioData(decodeU8.buffer.slice(0));
+        if (boundEpoch !== cctvAudioEpoch || !cctvAudioTarget) return;
+        const sr = Math.max(8000, Number(chunk.sample_rate || 16000) || 16000);
+        const fc = Math.max(1, Number(chunk.frame_count || 1) || 1);
+        const expectedDur = (fc * 1024) / sr;
+        const warmupOffset = warmupFrames > 0
+          ? Math.max(0, Math.min(Math.max(0, audioBuf.duration - expectedDur), (warmupFrames * 1024) / sr))
+          : 0;
+        const playDur = Math.max(0.01, Math.min(expectedDur, audioBuf.duration - warmupOffset));
+        const nowCtx = cctvAudioCtx.currentTime;
+        if (cctvAudioNextTime < nowCtx + 0.04) {
+          cctvAudioNextTime = nowCtx + 0.28;
+        } else if (cctvAudioNextTime > nowCtx + 1.5) {
+          cctvAudioNextTime = nowCtx + 0.30;
+        }
+        const src = cctvAudioCtx.createBufferSource();
+        src.buffer = audioBuf;
+        src.connect(cctvAudioGain);
+        src.start(cctvAudioNextTime, warmupOffset, playDur);
+        cctvAudioNextTime += playDur;
+      } catch (_) {}
+      return;
+    }
+
+    // 16-bit Little-Endian PCM (`pcm16`, e.g. decoded G.711A / G.711Mu @ 8000 Hz)
+    const sampleCount = Math.floor(u8.length / 2);
+    if (sampleCount <= 0) return;
+    const sr = Math.max(8000, Number(chunk.sample_rate || 8000) || 8000);
+    const audioBuf = cctvAudioCtx.createBuffer(1, sampleCount, sr);
+    const chData = audioBuf.getChannelData(0);
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    for (let i = 0; i < sampleCount; i++) {
+      chData[i] = dv.getInt16(i * 2, true) / 32768;
+    }
+    const nowCtx = cctvAudioCtx.currentTime;
+    if (cctvAudioNextTime < nowCtx + 0.04) {
+      cctvAudioNextTime = nowCtx + 0.26;
+    } else if (cctvAudioNextTime > nowCtx + 1.5) {
+      cctvAudioNextTime = nowCtx + 0.28;
+    }
+    const src = cctvAudioCtx.createBufferSource();
+    src.buffer = audioBuf;
+    src.connect(cctvAudioGain);
+    src.start(cctvAudioNextTime);
+    cctvAudioNextTime += audioBuf.duration;
+  }
+
+  function syncCctvAudioButtonsUi() {
+    const topBar = $('cctvActiveAudioBar');
+    const topLbl = $('cctvActiveAudioLabel');
+    if (topBar) {
+      topBar.style.display = cctvAudioTarget ? 'inline-flex' : 'none';
+      if (topLbl && cctvAudioTarget) {
+        topLbl.textContent = '🎙️ ' + (cctvAudioTarget.label || ('كاميرا ' + cctvAudioTarget.channel));
+      }
+    }
+
+    const computed = getVisibleCctvTiles();
+    const pageTiles = computed.pageTiles || [];
+    document.querySelectorAll('[data-cctv-audio]').forEach((btn) => {
+      const idx = Number(btn.getAttribute('data-cctv-audio') || 0);
+      const t = pageTiles[idx];
+      if (!t) return;
+      const playing = isAudioPlayingFor(t.dvrId, t.channel);
+      const hasMic = hasChannelAudio(t.dvr, t.channel);
+      const scannedNoMic = Boolean(t.dvr && t.dvr.audio_scanned && !hasMic);
+      if (playing) {
+        btn.textContent = '🔊 شغّال';
+        btn.style.background = 'rgba(16,185,129,0.92)';
+        btn.style.color = '#ffffff';
+        btn.style.borderColor = '#34d399';
+        btn.style.opacity = '1';
+      } else if (hasMic) {
+        btn.textContent = '🔇 صوت';
+        btn.style.background = 'rgba(15,23,42,0.84)';
+        btn.style.color = '#34d399';
+        btn.style.borderColor = 'rgba(52,211,153,0.55)';
+        btn.style.opacity = '1';
+      } else {
+        btn.textContent = '🔇';
+        btn.style.background = 'rgba(15,23,42,0.75)';
+        btn.style.color = '#94a3b8';
+        btn.style.borderColor = 'rgba(148,163,184,0.28)';
+        btn.style.opacity = scannedNoMic ? '0.52' : '0.88';
+      }
+    });
+
+    const hdBtn = $('cctvHdAudioBtn');
+    const hdVol = $('cctvHdVolumeSlider');
+    if (hdBtn && cctvHdTarget && cctvHdTarget.item) {
+      const it = cctvHdTarget.item;
+      const playing = isAudioPlayingFor(it.dvrId, it.channel);
+      const hasMic = hasChannelAudio(it.dvr, it.channel);
+      if (playing) {
+        hdBtn.className = 'btn btn-success btn-sm';
+        hdBtn.style.color = '#fff';
+        hdBtn.textContent = '🔊 الصوت يعمل (كتم)';
+        if (hdVol) hdVol.style.display = '';
+      } else {
+        hdBtn.className = 'btn btn-ghost btn-sm';
+        hdBtn.style.color = hasMic ? '#34d399' : '#94a3b8';
+        hdBtn.style.borderColor = hasMic ? 'rgba(52,211,153,0.5)' : 'rgba(148,163,184,0.3)';
+        hdBtn.textContent = (it.dvr && it.dvr.audio_scanned && !hasMic)
+          ? '🔇 بدون مايك'
+          : (hasMic ? '🔇 تشغيل الصوت 🎙️' : '🔇 تشغيل الصوت');
+        if (hdVol) hdVol.style.display = 'none';
+      }
+    }
+  }
+
+  function stopCctvAudio(notifyBackend) {
+    const prev = cctvAudioTarget;
+    cctvAudioEpoch += 1;
+    cctvAudioTarget = null;
+    cctvAudioNextTime = 0;
+    cctvAudioLastAdtsTail = null;
+    if (cctvAudioCtx && cctvAudioCtx.state === 'running') {
+      // Reset scheduled nodes cleanly by recreating gain node
+      try {
+        if (cctvAudioGain) cctvAudioGain.disconnect();
+        cctvAudioGain = cctvAudioCtx.createGain();
+        cctvAudioGain.gain.value = cctvAudioVolume;
+        cctvAudioGain.connect(cctvAudioCtx.destination);
+      } catch (_) {}
+    }
+    syncCctvAudioButtonsUi();
+    if (notifyBackend && prev) {
+      callCctvApi('cctvAction', 'cctv_action', {
+        action: 'stop_audio',
+        payload: { dvr_id: prev.dvrId },
+      }).catch(() => {});
+    }
+  }
+
+  async function toggleCctvAudio(dvr, channel, label) {
+    if (!dvr) return;
+    const ch = Number(channel || 1) || 1;
+    if (isAudioPlayingFor(dvr.id, ch)) {
+      stopCctvAudio(true);
+      toast('🔇 تم كتم صوت الكاميرا');
+      return;
+    }
+
+    if (dvr.audio_scanned && Array.isArray(dvr.audio_channels) && !dvr.audio_channels.includes(ch)) {
+      const hint = dvr.audio_channels.length
+        ? (' — الكاميرات المزوّدة بصوت في «' + dvr.name + '»: كاميرا ' + dvr.audio_channels.join(' ، '))
+        : ' — لا توجد كاميرات مفعّل لها الصوت في إعدادات هذا الـ DVR';
+      toast('🔇 هذه الكاميرا غير مزوّدة بمايكروفون' + hint, 'error');
+      return;
+    }
+
+    try {
+      ensureCctvAudioContext();
+    } catch (e) {
+      toast(e.message || 'تعذر تهيئة الصوت', 'error');
+      return;
+    }
+
+    if (cctvAudioTarget && cctvAudioTarget.dvrId !== dvr.id) {
+      callCctvApi('cctvAction', 'cctv_action', {
+        action: 'stop_audio',
+        payload: { dvr_id: cctvAudioTarget.dvrId },
+      }).catch(() => {});
+    }
+
+    cctvAudioEpoch += 1;
+    const myAudioEpoch = cctvAudioEpoch;
+    cctvAudioTarget = {
+      dvrId: dvr.id,
+      channel: ch,
+      label: label || (dvr.name + ' · كاميرا ' + ch),
+    };
+    cctvAudioNextTime = 0;
+    cctvAudioLastAdtsTail = null;
+    syncCctvAudioButtonsUi();
+    toast('🔊 جاري تشغيل الصوت المباشر: ' + cctvAudioTarget.label);
+
+    let lastSeq = 0;
+    const pollLoop = async () => {
+      if (myAudioEpoch !== cctvAudioEpoch || !cctvAudioTarget) return;
+      const camOpen = ($('view-cameras') && $('view-cameras').classList.contains('active')) ||
+        ($('cctvHdModal') && $('cctvHdModal').classList.contains('show'));
+      if (!camOpen || document.hidden) {
+        if (!camOpen) {
+          stopCctvAudio(true);
+          return;
+        }
+        setTimeout(pollLoop, 500);
+        return;
+      }
+      try {
+        const res = await callCctvApi('cctvAction', 'cctv_action', {
+          action: 'poll_audio',
+          payload: {
+            dvr_id: dvr.id,
+            channel: ch,
+            since_seq: lastSeq,
+          },
+        });
+        if (myAudioEpoch !== cctvAudioEpoch || !cctvAudioTarget) return;
+        if (!res || !res.ok) {
+          const errMsg = (res && res.error) || 'هذه الكاميرا غير مزوّدة بمايكروفون';
+          if (res && Array.isArray(res.audio_channels)) {
+            dvr.audio_channels = res.audio_channels;
+            dvr.audio_scanned = true;
+          }
+          stopCctvAudio(false);
+          toast(errMsg, 'error');
+          return;
+        }
+        if (typeof res.seq === 'number' && res.seq > lastSeq) {
+          lastSeq = res.seq;
+        }
+        if (Array.isArray(res.chunks) && res.chunks.length) {
+          for (const c of res.chunks) {
+            await scheduleCctvAudioChunk(c, myAudioEpoch);
+          }
+        }
+        setTimeout(pollLoop, 260);
+      } catch (e) {
+        if (myAudioEpoch !== cctvAudioEpoch) return;
+        setTimeout(pollLoop, 900);
+      }
+    };
+    pollLoop();
+  }
+
+  function renderCctvHealthBar() {
+    const bar = $('cctvHealthSummaryBar');
+    if (!bar) return;
+    if (!cctvDvrs.length) {
+      bar.style.display = 'none';
+      return;
+    }
+    const badges = cctvDvrs.map((d) => {
+      const h = d.health || {};
+      if (!h.checked_at) {
+        return '<span class="badge gray" title="اضغط «🛡️ فحص الهاردات» لفحص حالة التسجيل">🏢 ' + esc(d.name) + ': لم يُفحص الهارد بعد</span>';
+      }
+      if (h.hdd_status === 'ok') {
+        const space = h.total_gb > 0 ? (' · متاح ' + h.free_gb + 'GB من ' + h.total_gb + 'GB') : '';
+        return '<span class="badge green">🟢 ' + esc(d.name) + ': هارد سليم' + esc(space) + '</span>';
+      }
+      if (h.hdd_status === 'error') {
+        return '<span class="badge red">🚨 ' + esc(d.name) + ': عطل في هارد التسجيل!</span>';
+      }
+      if (h.hdd_status === 'missing') {
+        return '<span class="badge amber">⚠️ ' + esc(d.name) + ': لا يوجد هارد مكتشف</span>';
+      }
+      return '<span class="badge blue">🏢 ' + esc(d.name) + (h.device_model ? (' · ' + esc(h.device_model)) : '') + '</span>';
+    });
+    bar.innerHTML = badges.join('');
+    bar.style.display = 'flex';
+  }
+
+  function syncCctvBranchAndPageSelectors() {
+    const sel = $('cctvBranchSelect');
+    if (sel) {
+      const prev = cctvSelectedBranch;
+      const favCount = Array.isArray(cctvSettings.favorites) ? cctvSettings.favorites.length : 0;
+      const opts = [
+        '<option value="all">🌐 غرفة العمليات الموحدة (كل الفروع — ' + cctvDvrs.length + ')</option>',
+      ];
+      if (favCount > 0 || prev === 'vip') {
+        opts.unshift('<option value="vip">⭐ شاشة الإدارة المفضّلة VIP (' + favCount + ' كاميرات)</option>');
+      }
+      cctvDvrs.forEach((d) => {
+        const modeTag = d.connection_mode === 'bridge' ? '🌉 جسر فرع' : '🖧 مباشر';
+        opts.push(
+          '<option value="' + esc(d.id) + '">🏢 ' + esc(d.name) + ' (' + (d.channels_count || 8) + ' كاميرات · ' + modeTag + ')</option>'
+        );
+      });
+      sel.innerHTML = opts.join('');
+      if ((prev === 'vip' && favCount > 0) || (prev !== 'all' && cctvDvrs.some((d) => d.id === prev))) {
+        sel.value = prev;
+      } else {
+        cctvSelectedBranch = 'all';
+        sel.value = 'all';
+      }
+    }
+
+    const navCnt = $('navCctvCount');
+    if (navCnt) navCnt.textContent = String(cctvDvrs.length || 0);
+    renderCctvHealthBar();
+  }
+
+  function renderCctvSavedList() {
+    const box = $('cctvSavedList');
+    if (!box) return;
+    if (!cctvDvrs.length) {
+      box.innerHTML = '<div class="empty" style="padding:16px;">لم يتم إضافة أي جهاز Dahua DVR بعد. أضف أول فرع أو مخزن بالأعلى.</div>';
+      return;
+    }
+    box.innerHTML = '<div style="display:grid;gap:8px;">' + cctvDvrs.map((d) => {
+      const modeBadge = d.connection_mode === 'bridge'
+        ? '<span class="badge blue">🌉 جسر الفرع: ' + esc(d.bridge_device_name || d.bridge_device_id || 'غير محدد') + '</span>'
+        : '<span class="badge green">🖧 مباشر على شبكة السيرفر</span>';
+      const hiddenCnt = Array.isArray(d.hidden_channels) ? d.hidden_channels.length : 0;
+      return (
+        '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:10px 13px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border);">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+            '<strong style="font-size:13.5px;">🏢 ' + esc(d.name) + '</strong>' +
+            modeBadge +
+            '<span class="mono" dir="ltr" style="font-size:12px;color:var(--muted);">' + esc(d.host) + ':' + (d.http_port || 80) + '</span>' +
+            '<span class="badge gray">' + (d.channels_count || 8) + ' كاميرات' + (hiddenCnt ? (' · ' + hiddenCnt + ' مخفية') : '') + '</span>' +
+            (d.allowed_admins ? '<span class="badge amber">👥 مخصّص لـ: ' + esc(d.allowed_admins) + '</span>' : '') +
+          '</div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-watch="' + esc(d.id) + '">👁 عرض</button>' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-pullnames="' + esc(d.id) + '" title="سحب أسماء الكاميرات من داخل الـ DVR">🏷️ سحب الأسماء</button>' +
+            (hiddenCnt ? '<button type="button" class="btn btn-ghost btn-sm" data-cctv-unhideall="' + esc(d.id) + '">👁 إظهار المخفي</button>' : '') +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-edit="' + esc(d.id) + '">✏ تعديل</button>' +
+            '<button type="button" class="btn btn-danger btn-sm" data-cctv-del="' + esc(d.id) + '">🗑 حذف</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('') + '</div>';
+  }
+
+  function renderCctvWall() {
+    cctvStreamEpoch += 1;
+    const myEpoch = cctvStreamEpoch;
+    const wall = $('cctvWallGrid');
+    if (!wall) return;
+
+    applyCctvRoleVisibility();
+    if (cctvSettings.super_only && !hasSuperAdminAccess()) {
+      wall.style.gridTemplateColumns = '1fr';
+      wall.innerHTML = '<div class="card" style="text-align:center;padding:42px;"><div style="font-size:34px;margin-bottom:8px;">🔒</div><div style="font-weight:800;font-size:16px;">تم حصر مشاهدة كاميرات الفروع والمخازن بحساب السوبر أدمن فقط</div></div>';
+      return;
+    }
+
+    if (!cctvDvrs.length) {
+      wall.style.gridTemplateColumns = '1fr';
+      wall.innerHTML =
+        '<div class="card" style="text-align:center;padding:44px 24px;">' +
+          '<div style="font-size:40px;margin-bottom:10px;">🎥</div>' +
+          '<div style="font-weight:800;font-size:17px;margin-bottom:6px;">غرفة المراقبة الحية لأجهزة Dahua DVR جاهزة للتشغيل</div>' +
+          '<div class="hint" style="max-width:620px;margin:0 auto 16px;line-height:1.65;">' +
+            'أضف أجهزة الـ DVR الخاصة بالمقر الرئيسي أو الفروع والمخازن الخارجية (بدون Static IP عبر جسر الفرع)، وتابع جميع الكاميرات في شاشة موحّدة.' +
+          '</div>' +
+          '<button type="button" class="btn btn-primary" id="cctvEmptyAddBtn">➕ إضافة أول جهاز Dahua DVR الآن</button>' +
+        '</div>';
+      const emptyBtn = $('cctvEmptyAddBtn');
+      if (emptyBtn) {
+        emptyBtn.addEventListener('click', () => {
+          const pnl = $('cctvManagePanel');
+          if (pnl) { pnl.style.display = 'block'; refreshCctvBridgeDevicesDropdown(); }
+        });
+      }
+      if ($('cctvPageWrap')) $('cctvPageWrap').style.display = 'none';
+      if ($('cctvActiveStatsBadge')) $('cctvActiveStatsBadge').textContent = '';
+      return;
+    }
+
+    const computed = getVisibleCctvTiles();
+    const pageTiles = computed.pageTiles || [];
+    const allTiles = computed.allTiles || [];
+    const totalPages = computed.totalPages || 1;
+    const perPage = cctvGridCols * cctvGridCols;
+
+    if (!pageTiles.length) {
+      wall.style.gridTemplateColumns = '1fr';
+      wall.innerHTML = '<div class="card" style="text-align:center;padding:32px;"><div class="hint">لا توجد كاميرات معروضة في هذا الفلتر حالياً (يمكنك إلغاء «🙈 إخفاء الفارغ» لإظهار جميع القنوات).</div></div>';
+      return;
+    }
+
+    const pageWrap = $('cctvPageWrap');
+    const pageSel = $('cctvPageSelect');
+    if (pageWrap && pageSel) {
+      if (totalPages > 1) {
+        pageWrap.style.display = '';
+        const pOpts = [];
+        for (let p = 0; p < totalPages; p++) {
+          const fromN = p * perPage + 1;
+          const toN = Math.min(allTiles.length, (p + 1) * perPage);
+          pOpts.push('<option value="' + p + '">صفحة ' + (p + 1) + ' (' + fromN + '–' + toN + ')</option>');
+        }
+        pageSel.innerHTML = pOpts.join('');
+        pageSel.value = String(cctvChannelPage);
+      } else {
+        pageWrap.style.display = 'none';
+      }
+    }
+
+    wall.style.gridTemplateColumns = 'repeat(' + cctvGridCols + ', minmax(0, 1fr))';
+    const useHdInTile = cctvGridCols === 1;
+    if ($('cctvActiveStatsBadge')) {
+      $('cctvActiveStatsBadge').textContent =
+        (cctvLivePlaying ? '● مباشر' : '⏸ متوقف') +
+        ' · يعرض ' + pageTiles.length + ' من ' + allTiles.length +
+        (useHdInTile ? ' (HD)' : ' (Sub-Stream)');
+    }
+
+    wall.innerHTML = pageTiles.map((t, idx) => {
+      const tileId = 'cctvTile_' + idx;
+      const fav = isChannelFav(t.dvrId, t.channel);
+      const hasMic = hasChannelAudio(t.dvr, t.channel);
+      const playingAud = isAudioPlayingFor(t.dvrId, t.channel);
+      const scannedNoMic = Boolean(t.dvr && t.dvr.audio_scanned && !hasMic);
+      const audBg = playingAud ? 'rgba(16,185,129,0.92)' : (hasMic ? 'rgba(15,23,42,0.84)' : 'rgba(15,23,42,0.75)');
+      const audClr = playingAud ? '#ffffff' : (hasMic ? '#34d399' : '#94a3b8');
+      const audBdr = playingAud ? '#34d399' : (hasMic ? 'rgba(52,211,153,0.55)' : 'rgba(148,163,184,0.28)');
+      const audTxt = playingAud ? '🔊 شغّال' : (hasMic ? '🔇 صوت' : '🔇');
+      const audTitle = playingAud
+        ? 'كتم الصوت المباشر لهذه الكاميرا'
+        : (hasMic ? 'تشغيل الصوت المباشر لهذه الكاميرا (مزوّدة بمايكروفون)' : (scannedNoMic ? 'هذه الكاميرا غير مزوّدة بمايكروفون' : 'تشغيل الصوت المباشر'));
+      return (
+        '<div class="cctv-tile" id="' + tileId + '" data-tile-idx="' + idx + '" style="position:relative;background:#090d16;border-radius:13px;overflow:hidden;aspect-ratio:16/9;border:1px solid rgba(148,163,184,0.2);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,0.22);" title="اضغط مرتين لتكبير الكاميرا بجودة HD الكاملة وعمل Zoom">' +
+          '<img id="' + tileId + '_img" alt="cam" style="width:100%;height:100%;object-fit:cover;display:none;">' +
+          '<div id="' + tileId + '_msg" style="color:#94a3b8;font-size:12.5px;padding:16px;text-align:center;line-height:1.5;">⏳ جاري الاتصال بالكاميرا...</div>' +
+          '<div style="position:absolute;top:0;right:0;left:0;padding:7px 10px;background:linear-gradient(180deg,rgba(2,6,23,0.85),rgba(2,6,23,0));display:flex;align-items:center;justify-content:space-between;gap:6px;pointer-events:none;">' +
+            '<div style="display:flex;align-items:center;gap:6px;min-width:0;">' +
+              '<span id="' + tileId + '_dot" style="width:8px;height:8px;border-radius:50%;background:#f59e0b;flex-shrink:0;"></span>' +
+              '<span style="color:#f8fafc;font-weight:800;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(t.branchName) + ' · ' + esc(t.camLabel) + (hasMic ? ' <span title="كاميرا بصوت" style="color:#34d399;">🎙️</span>' : '') + '</span>' +
+            '</div>' +
+            '<span id="' + tileId + '_time" class="mono" style="color:#cbd5e1;font-size:10.5px;flex-shrink:0;"></span>' +
+          '</div>' +
+          '<div style="position:absolute;bottom:7px;left:8px;display:flex;gap:4px;">' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-audio="' + idx + '" style="padding:3px 8px;font-size:11.5px;font-weight:800;background:' + audBg + ';color:' + audClr + ';border-color:' + audBdr + ';opacity:' + (scannedNoMic && !playingAud ? '0.52' : '1') + ';" title="' + audTitle + '">' + audTxt + '</button>' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-fav="' + idx + '" style="padding:3px 7px;font-size:11.5px;background:rgba(15,23,42,0.78);color:' + (fav ? '#fbbf24' : '#cbd5e1') + ';border-color:rgba(148,163,184,0.3);" title="تثبيت في شاشة الإدارة المفضّلة VIP">' + (fav ? '⭐' : '☆') + '</button>' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-snap="' + idx + '" style="padding:3px 7px;font-size:11px;background:rgba(15,23,42,0.78);color:#f8fafc;border-color:rgba(148,163,184,0.3);" title="حفظ لقطة">📸</button>' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-cctv-hd="' + idx + '" style="padding:3px 8px;font-size:11px;background:rgba(15,23,42,0.78);color:#f8fafc;border-color:rgba(148,163,184,0.3);" title="تكبير HD + تقريب Zoom + PTZ">⛶ HD</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
+
+    pageTiles.forEach((tileInfo, idx) => {
+      const tileEl = $('cctvTile_' + idx);
+      if (tileEl) {
+        tileEl.addEventListener('dblclick', () => openCctvHdModal(allTiles, cctvChannelPage * perPage + idx));
+      }
+      startTileStreamLoop(tileInfo, idx, useHdInTile, myEpoch);
+    });
+  }
+
+  function startTileStreamLoop(tileInfo, idx, hdMode, boundEpoch) {
+    const paceMs = cctvGridCols === 1 ? 220 : (cctvGridCols === 2 ? 450 : 720);
+
+    const tick = async () => {
+      if (boundEpoch !== cctvStreamEpoch) return;
+      const camViewOpen = $('view-cameras') && $('view-cameras').classList.contains('active');
+      if (!camViewOpen) return;
+      const hdOpen = $('cctvHdModal') && $('cctvHdModal').classList.contains('show');
+      if (document.hidden || !cctvLivePlaying || hdOpen) {
+        setTimeout(tick, 650);
+        return;
+      }
+
+      const imgEl = $('cctvTile_' + idx + '_img');
+      const msgEl = $('cctvTile_' + idx + '_msg');
+      const dotEl = $('cctvTile_' + idx + '_dot');
+      const timeEl = $('cctvTile_' + idx + '_time');
+      if (!imgEl) return;
+
+      try {
+        if (isNativeTauriOrigin) {
+          const r = await callCctvApi('cctvGetFrameB64', 'cctv_get_frame_b64', {
+            dvrId: tileInfo.dvrId,
+            channel: tileInfo.channel,
+            hd: hdMode,
+          });
+          if (boundEpoch !== cctvStreamEpoch) return;
+          if (r && r.ok && r.image) {
+            const dUrl = 'data:' + (r.mime || 'image/jpeg') + ';base64,' + r.image;
+            imgEl.src = dUrl;
+            imgEl.dataset.lastSrc = dUrl;
+            imgEl.style.display = 'block';
+            if (msgEl) msgEl.style.display = 'none';
+            if (dotEl) dotEl.style.background = '#10b981';
+            if (timeEl) timeEl.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
+          } else {
+            throw new Error((r && r.error) || 'في انتظار البث...');
+          }
+        } else {
+          const url = buildCctvFrameUrl(tileInfo.dvrId, tileInfo.channel, hdMode);
+          await new Promise((resolve, reject) => {
+            const pre = new Image();
+            const killer = setTimeout(() => {
+              pre.onload = null;
+              pre.onerror = null;
+              reject(new Error('timeout'));
+            }, 13000);
+            pre.onload = () => {
+              clearTimeout(killer);
+              resolve(url);
+            };
+            pre.onerror = async () => {
+              clearTimeout(killer);
+              let reason = '';
+              try {
+                const errRes = await fetch(url).then((r) => r.json());
+                if (errRes && errRes.error) reason = errRes.error;
+              } catch (_) {}
+              reject(new Error(reason || 'تعذر جلب إطار الكاميرا'));
+            };
+            pre.src = url;
+          });
+          if (boundEpoch !== cctvStreamEpoch) return;
+          imgEl.src = url;
+          imgEl.dataset.lastSrc = url;
+          imgEl.style.display = 'block';
+          if (msgEl) msgEl.style.display = 'none';
+          if (dotEl) dotEl.style.background = '#10b981';
+          if (timeEl) timeEl.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
+        }
+        setTimeout(tick, paceMs);
+      } catch (err) {
+        if (boundEpoch !== cctvStreamEpoch) return;
+        if (dotEl) dotEl.style.background = '#ef4444';
+        const em = String((err && err.message) || '');
+        const isEmptyChan = em.includes('غير متصلة');
+        if (isEmptyChan && tileInfo.dvr) {
+          if (!Array.isArray(tileInfo.dvr.dead_channels)) tileInfo.dvr.dead_channels = [];
+          if (!tileInfo.dvr.dead_channels.includes(tileInfo.channel)) {
+            tileInfo.dvr.dead_channels.push(tileInfo.channel);
+            if (cctvSettings.auto_hide_empty !== false) {
+              renderCctvWall();
+              return;
+            }
+          }
+        }
+        if (!imgEl.dataset.lastSrc && msgEl) {
+          msgEl.style.display = 'block';
+          if (em && em !== 'timeout' && em !== 'تعذر جلب إطار الكاميرا') {
+            msgEl.textContent = '📵 ' + em;
+          } else {
+            msgEl.textContent = tileInfo.dvr && tileInfo.dvr.connection_mode === 'bridge'
+              ? '📡 جاري إيقاظ جسر الفرع أو التحقق من اتصال الـ DVR...'
+              : '⚠ تعذر الوصول للكاميرا (تأكد من الـ IP وكلمة السر)';
+          }
+        }
+        setTimeout(tick, isEmptyChan ? 10000 : 1800);
+      }
+    };
+
+    setTimeout(tick, idx * 65);
+  }
+
+  function applyHdZoomTransform() {
+    const img = $('cctvHdImg');
+    const rst = $('cctvHdZoomResetBtn');
+    if (!img) return;
+    if (cctvZoomScale <= 1.01) {
+      cctvZoomScale = 1;
+      cctvPanX = 0;
+      cctvPanY = 0;
+    }
+    img.style.transform = 'translate(' + cctvPanX + 'px, ' + cctvPanY + 'px) scale(' + cctvZoomScale.toFixed(2) + ')';
+    img.style.cursor = cctvZoomScale > 1 ? (cctvDragging ? 'grabbing' : 'grab') : 'zoom-in';
+    if (rst) rst.textContent = cctvZoomScale.toFixed(1).replace(/\.0$/, '') + 'x';
+  }
+
+  function openCctvHdModal(tilesList, index) {
+    if (!Array.isArray(tilesList) || !tilesList.length) return;
+    const safeIdx = ((index % tilesList.length) + tilesList.length) % tilesList.length;
+    const item = tilesList[safeIdx];
+    const wasAudioActive = Boolean(cctvAudioTarget);
+    cctvHdTarget = { tilesList, index: safeIdx, item };
+    cctvHdEpoch += 1;
+    const myHdEpoch = cctvHdEpoch;
+    cctvHdLastDataUrl = '';
+    cctvZoomScale = 1;
+    cctvPanX = 0;
+    cctvPanY = 0;
+    applyHdZoomTransform();
+
+    if (wasAudioActive && !isAudioPlayingFor(item.dvrId, item.channel)) {
+      if (!item.dvr.audio_scanned || hasChannelAudio(item.dvr, item.channel)) {
+        toggleCctvAudio(item.dvr, item.channel, item.branchName + ' · ' + item.camLabel);
+      } else {
+        stopCctvAudio(true);
+      }
+    }
+
+    const modal = $('cctvHdModal');
+    const title = $('cctvHdTitle');
+    const sub = $('cctvHdSub');
+    const img = $('cctvHdImg');
+    const empty = $('cctvHdEmpty');
+    const badge = $('cctvHdLiveBadge');
+    const starBtn = $('cctvHdStarBtn');
+    if (!modal || !img) return;
+
+    if (title) title.textContent = '🎥 ' + item.branchName + ' — ' + item.camLabel;
+    if (sub) {
+      sub.textContent =
+        (item.dvr.connection_mode === 'bridge' ? ('عبر جسر الفرع: ' + (item.dvr.bridge_device_name || item.dvr.bridge_device_id)) : ('اتصال مباشر: ' + item.dvr.host)) +
+        ' · البث الرئيسي عالي الدقة (Main Stream HD) · استخدم عجلة الماوس للـ Zoom والسحب للتحريك';
+    }
+    if (starBtn) {
+      const fav = isChannelFav(item.dvrId, item.channel);
+      starBtn.textContent = fav ? '⭐ في المفضلة' : '☆ مفضلة';
+    }
+    img.style.display = 'none';
+    if (empty) {
+      empty.style.display = 'block';
+      empty.textContent = '⏳ جاري جلب البث المباشر عالي الدقة HD...';
+    }
+    modal.classList.add('show');
+    syncCctvAudioButtonsUi();
+
+    const loopHd = async () => {
+      if (myHdEpoch !== cctvHdEpoch) return;
+      if (!modal.classList.contains('show')) return;
+      if (document.hidden) {
+        setTimeout(loopHd, 500);
+        return;
+      }
+      try {
+        if (isNativeTauriOrigin) {
+          const r = await callCctvApi('cctvGetFrameB64', 'cctv_get_frame_b64', {
+            dvrId: item.dvrId,
+            channel: item.channel,
+            hd: true,
+          });
+          if (myHdEpoch !== cctvHdEpoch) return;
+          if (r && r.ok && r.image) {
+            const dUrl = 'data:' + (r.mime || 'image/jpeg') + ';base64,' + r.image;
+            cctvHdLastDataUrl = dUrl;
+            img.src = dUrl;
+            img.style.display = 'block';
+            if (empty) empty.style.display = 'none';
+            if (badge) { badge.className = 'badge green'; badge.textContent = '● LIVE HD · ' + new Date().toLocaleTimeString('en-GB', { hour12: false }); }
+          } else {
+            throw new Error((r && r.error) || 'تعذر جلب HD');
+          }
+        } else {
+          const url = buildCctvFrameUrl(item.dvrId, item.channel, true);
+          await new Promise((resolve, reject) => {
+            const pre = new Image();
+            const killer = setTimeout(() => { pre.onload = null; pre.onerror = null; reject(new Error('timeout')); }, 12000);
+            pre.onload = () => { clearTimeout(killer); resolve(url); };
+            pre.onerror = () => { clearTimeout(killer); reject(new Error('err')); };
+            pre.src = url;
+          });
+          if (myHdEpoch !== cctvHdEpoch) return;
+          cctvHdLastDataUrl = url;
+          img.src = url;
+          img.style.display = 'block';
+          if (empty) empty.style.display = 'none';
+          if (badge) { badge.className = 'badge green'; badge.textContent = '● LIVE HD · ' + new Date().toLocaleTimeString('en-GB', { hour12: false }); }
+        }
+        setTimeout(loopHd, 220);
+      } catch (e) {
+        if (myHdEpoch !== cctvHdEpoch) return;
+        if (badge) { badge.className = 'badge amber'; badge.textContent = '⏳ إعادة المحاولة...'; }
+        if (!cctvHdLastDataUrl && empty) {
+          empty.textContent = '⚠ تعذر استلام بث HD حالياً — جاري إعادة المحاولة تلقائياً...';
+        }
+        setTimeout(loopHd, 1400);
+      }
+    };
+    loopHd();
+  }
+
+  function closeCctvHdModal() {
+    cctvHdEpoch += 1;
+    cctvHdTarget = null;
+    if ($('cctvPtzPad')) $('cctvPtzPad').style.display = 'none';
+    const modal = $('cctvHdModal');
+    if (modal) modal.classList.remove('show');
+    syncCctvAudioButtonsUi();
+  }
+
+  function toLocalDatetimeInputVal(dt) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return dt.getFullYear() + '-' + pad(dt.getMonth() + 1) + '-' + pad(dt.getDate()) + 'T' + pad(dt.getHours()) + ':' + pad(dt.getMinutes());
+  }
+
+  function toDahuaDateTimeStr(inputVal) {
+    const s = String(inputVal || '').trim().replace('T', ' ');
+    if (!s) return '';
+    return s.length === 16 ? (s + ':00') : s;
+  }
+
+  function openCctvPlaybackModal(prefDvrId, prefChannel) {
+    if (!cctvDvrs.length) {
+      toast('أضف جهاز DVR أولاً لاسترجاع التسجيلات', 'error');
+      return;
+    }
+    const modal = $('cctvPlaybackModal');
+    const bSel = $('cctvPbBranchSelect');
+    const cSel = $('cctvPbChannelSelect');
+    if (!modal || !bSel || !cSel) return;
+
+    bSel.innerHTML = cctvDvrs.map((d) => '<option value="' + esc(d.id) + '">🏢 ' + esc(d.name) + '</option>').join('');
+    const chosenDvr = cctvDvrs.find((d) => d.id === prefDvrId) || cctvDvrs[0];
+    bSel.value = chosenDvr.id;
+
+    const fillChannels = (dvrObj, selCh) => {
+      const cnt = Math.max(1, Number((dvrObj && dvrObj.channels_count) || 8));
+      const cOpts = [];
+      for (let i = 1; i <= cnt; i++) {
+        const nm = (dvrObj && dvrObj.channel_names && dvrObj.channel_names[String(i)]) || '';
+        cOpts.push('<option value="' + i + '">كاميرا ' + i + (nm ? (' · ' + esc(nm)) : '') + '</option>');
+      }
+      cSel.innerHTML = cOpts.join('');
+      if (selCh) cSel.value = String(selCh);
+    };
+    fillChannels(chosenDvr, prefChannel || 1);
+    bSel.onchange = () => {
+      const d = cctvDvrs.find((x) => x.id === bSel.value);
+      fillChannels(d, 1);
+    };
+
+    const nowDt = new Date();
+    const hourAgo = new Date(nowDt.getTime() - 60 * 60 * 1000);
+    if ($('cctvPbStartInput')) $('cctvPbStartInput').value = toLocalDatetimeInputVal(hourAgo);
+    if ($('cctvPbEndInput')) $('cctvPbEndInput').value = toLocalDatetimeInputVal(nowDt);
+    modal.classList.add('show');
+  }
+
+  function buildCctvClipUrl(dvrId, channel, startTime, endTime) {
+    const tok = (api && api.getAuthToken && api.getAuthToken()) || authToken || '';
+    const qs = new URLSearchParams({
+      dvr_id: String(dvrId || ''),
+      channel: String(channel || 1),
+      start_time: startTime,
+      end_time: endTime,
+    });
+    if (tok) qs.set('token', tok);
+    return '/api/cctv/clip?' + qs.toString();
+  }
+
+  async function downloadCctvSnapshotUrl(srcUrl, fileName) {
+    if (!srcUrl) {
+      toast('انتظر ظهور صورة الكاميرا أولاً', 'error');
+      return;
+    }
+    try {
+      if (srcUrl.startsWith('data:') && api && typeof api.saveBase64Image === 'function') {
+        const res = await api.saveBase64Image(srcUrl, fileName);
+        if (res && res.success) toast('✓ تم حفظ لقطة الكاميرا في التنزيلات');
+        return;
+      }
+      const resp = await fetch(srcUrl);
+      const blob = await resp.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(a.href);
+        a.remove();
+      }, 1500);
+      toast('📸 تم تنزيل لقطة الكاميرا');
+    } catch (e) {
+      toast('تعذر حفظ اللقطة: ' + (e.message || e), 'error');
+    }
+  }
+
+  async function refreshCctvBridgeDevicesDropdown(selectedId) {
+    const sel = $('cctvBridgeDeviceSelect');
+    if (!sel) return;
+    try {
+      const rDevs = await api.getRelayDevices();
+      cctvBridgeDevicesCache = Array.isArray(rDevs) ? rDevs : ((rDevs && rDevs.devices) || []);
+    } catch (_) {}
+    const curVal = selectedId !== undefined ? selectedId : sel.value;
+    const opts = ['<option value="">— اختر جهاز الكمبيوتر الموجود في نفس الفرع / المخزن —</option>'];
+    cctvBridgeDevicesCache.forEach((d) => {
+      const online = Boolean(d.online);
+      const name = d.label || d.hostname || d.device_id;
+      const ver = d.app_version || '1.0.0';
+      const dot = online ? '🟢 متصل' : '⚪ غير متصل';
+      opts.push(
+        '<option value="' + esc(d.device_id) + '">' +
+          dot + ' — ' + esc(name) + ' (v' + esc(ver) + (d.ip ? ' · ' + esc(d.ip) : '') + ')' +
+        '</option>'
+      );
+    });
+    sel.innerHTML = opts.join('');
+    if (curVal) sel.value = curVal;
+    checkSelectedBridgeDeviceVersion();
+  }
+
+  function isClientVerReadyForCctv(verStr) {
+    const p = String(verStr || '0.0.0').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+    if ((p[0] || 0) !== 1) return (p[0] || 0) > 1;
+    if ((p[1] || 0) !== 1) return (p[1] || 0) > 1;
+    return (p[2] || 0) >= 0;
+  }
+
+  function checkSelectedBridgeDeviceVersion() {
+    const box = $('cctvBridgeUpgradeBox');
+    const txt = $('cctvBridgeUpgradeText');
+    const sel = $('cctvBridgeDeviceSelect');
+    const mode = ($('cctvModeSelect') && $('cctvModeSelect').value) || 'bridge';
+    if (!box || !sel || mode !== 'bridge' || !sel.value) {
+      if (box) box.style.display = 'none';
+      return;
+    }
+    const dev = cctvBridgeDevicesCache.find((d) => d.device_id === sel.value);
+    if (!dev || isClientVerReadyForCctv(dev.app_version)) {
+      box.style.display = 'none';
+      return;
+    }
+    const name = dev.label || dev.hostname || dev.device_id;
+    if (txt) {
+      txt.textContent =
+        '⚠ جهاز «' + name + '» يعمل بالإصدار v' + (dev.app_version || '1.0.0') +
+        ' — اضغط الزر لترقيته صامتاً بالخلفية إلى v1.1.0 لتفعيل فحص الهارد واسترجاع التسجيلات.';
+    }
+    box.style.display = 'flex';
+  }
+
+  function resetCctvForm() {
+    cctvDetectedChannelNames = null;
+    if ($('cctvEditIdInput')) $('cctvEditIdInput').value = '';
+    if ($('cctvFormTitle')) $('cctvFormTitle').textContent = '➕ إضافة جهاز Dahua DVR / XVR جديد (فرع أو مخزن)';
+    if ($('cctvNameInput')) $('cctvNameInput').value = '';
+    if ($('cctvModeSelect')) $('cctvModeSelect').value = 'bridge';
+    if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = '';
+    if ($('cctvBridgeDeviceSelect')) $('cctvBridgeDeviceSelect').value = '';
+    if ($('cctvHostInput')) $('cctvHostInput').value = '';
+    if ($('cctvHttpPortInput')) $('cctvHttpPortInput').value = '80';
+    if ($('cctvChannelsInput')) $('cctvChannelsInput').value = '8';
+    if ($('cctvUserInput')) $('cctvUserInput').value = 'admin';
+    if ($('cctvPassInput')) {
+      $('cctvPassInput').value = '';
+      $('cctvPassInput').placeholder = 'أدخل كلمة مرور جهاز Dahua DVR';
+    }
+    if ($('cctvAllowedAdminsInput')) $('cctvAllowedAdminsInput').value = '';
+    if ($('cctvTestResultBanner')) $('cctvTestResultBanner').style.display = 'none';
+    if ($('cctvScanResultsBox')) $('cctvScanResultsBox').style.display = 'none';
+  }
+
+  function collectCctvFormPayload() {
+    const mode = ($('cctvModeSelect') && $('cctvModeSelect').value) === 'direct' ? 'direct' : 'bridge';
+    const out = {
+      id: (($('cctvEditIdInput') && $('cctvEditIdInput').value) || '').trim(),
+      name: (($('cctvNameInput') && $('cctvNameInput').value) || '').trim(),
+      connection_mode: mode,
+      bridge_device_id: mode === 'bridge' ? (($('cctvBridgeDeviceSelect') && $('cctvBridgeDeviceSelect').value) || '').trim() : '',
+      host: (($('cctvHostInput') && $('cctvHostInput').value) || '').trim(),
+      http_port: Number(($('cctvHttpPortInput') && $('cctvHttpPortInput').value) || 80) || 80,
+      channels_count: Number(($('cctvChannelsInput') && $('cctvChannelsInput').value) || 8) || 8,
+      username: (($('cctvUserInput') && $('cctvUserInput').value) || 'admin').trim() || 'admin',
+      password: ($('cctvPassInput') && $('cctvPassInput').value) || '',
+      allowed_admins: (($('cctvAllowedAdminsInput') && $('cctvAllowedAdminsInput').value) || '').trim(),
+    };
+    if (cctvDetectedChannelNames && Object.keys(cctvDetectedChannelNames).length) {
+      out.channel_names = cctvDetectedChannelNames;
+    }
+    return out;
+  }
+
+  async function loadCctvDvrs(reRenderWall) {
+    try {
+      const res = await callCctvApi('cctvListDvrs', 'cctv_list_dvrs', {});
+      if (res && res.settings) {
+        cctvSettings = res.settings;
+      }
+      if (res && Array.isArray(res.dvrs)) {
+        cctvDvrs = res.dvrs;
+      }
+      applyCctvRoleVisibility();
+      syncCctvBranchAndPageSelectors();
+      renderCctvSavedList();
+      if (reRenderWall && $('view-cameras') && $('view-cameras').classList.contains('active')) {
+        renderCctvWall();
+      }
+    } catch (_) {}
+  }
+
+  async function openCamerasView() {
+    await loadCctvDvrs(false);
+    renderCctvWall();
+    // Auto-discover microphone-enabled channels once in the background so `🎙️` badges appear automatically
+    for (const d of cctvDvrs) {
+      if (d && d.enabled !== false && !d.audio_scanned && !cctvAudioScanAttempted.has(d.id)) {
+        cctvAudioScanAttempted.add(d.id);
+        callCctvApi('cctvAction', 'cctv_action', {
+          action: 'detect_audio',
+          payload: { dvr_id: d.id },
+        })
+          .then((r) => {
+            if (r && r.ok && Array.isArray(r.dvrs)) {
+              cctvDvrs = r.dvrs;
+              if ($('view-cameras') && $('view-cameras').classList.contains('active')) {
+                renderCctvWall();
+              }
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  }
+
+  (function initCctvUi() {
+    if ($('cctvBranchSelect')) {
+      $('cctvBranchSelect').addEventListener('change', (e) => {
+        cctvSelectedBranch = e.target.value || 'all';
+        cctvChannelPage = 0;
+        renderCctvWall();
+      });
+    }
+    if ($('cctvPageSelect')) {
+      $('cctvPageSelect').addEventListener('change', (e) => {
+        cctvChannelPage = Number(e.target.value || 0) || 0;
+        renderCctvWall();
+      });
+    }
+    document.querySelectorAll('[data-cctv-grid]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        cctvGridCols = Number(btn.getAttribute('data-cctv-grid') || 2) || 2;
+        cctvChannelPage = 0;
+        document.querySelectorAll('[data-cctv-grid]').forEach((b) => {
+          b.className = 'btn btn-sm ' + (b === btn ? 'btn-primary' : 'btn-ghost');
+        });
+        renderCctvWall();
+      });
+    });
+
+    if ($('cctvAutoHideSwitch')) {
+      $('cctvAutoHideSwitch').addEventListener('change', async (e) => {
+        const val = Boolean(e.target.checked);
+        cctvSettings.auto_hide_empty = val;
+        cctvChannelPage = 0;
+        renderCctvWall();
+        await callCctvApi('cctvAction', 'cctv_action', {
+          action: 'save_settings',
+          payload: { auto_hide_empty: val },
+        }).catch(() => {});
+      });
+    }
+
+    if ($('cctvAutoTourBtn')) {
+      $('cctvAutoTourBtn').addEventListener('click', toggleCctvAutoTour);
+    }
+
+    if ($('cctvOpenPlaybackBtn')) {
+      $('cctvOpenPlaybackBtn').addEventListener('click', () => {
+        const prefId = (cctvSelectedBranch !== 'all' && cctvSelectedBranch !== 'vip') ? cctvSelectedBranch : '';
+        openCctvPlaybackModal(prefId, 1);
+      });
+    }
+
+    if ($('cctvCheckHealthBtn')) {
+      $('cctvCheckHealthBtn').addEventListener('click', async () => {
+        const btn = $('cctvCheckHealthBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الفحص...';
+        try {
+          const res = await callCctvApi('cctvAction', 'cctv_action', { action: 'check_all_health', payload: {} });
+          if (res && res.ok) {
+            if (Array.isArray(res.dvrs)) cctvDvrs = res.dvrs;
+            renderCctvHealthBar();
+            toast('🛡️ اكتمل فحص صحة هاردات التسجيل وأجهزة الـ DVR بنجاح');
+          } else {
+            toast((res && res.error) || 'تعذر الفحص', 'error');
+          }
+        } catch (e) {
+          toast('خطأ: ' + (e.message || e), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('cctvPlayPauseBtn')) {
+      $('cctvPlayPauseBtn').addEventListener('click', () => {
+        cctvLivePlaying = !cctvLivePlaying;
+        if (!cctvLivePlaying) stopCctvAudio(true);
+        const btn = $('cctvPlayPauseBtn');
+        btn.textContent = cctvLivePlaying ? '⏸ إيقاف' : '▶ تشغيل';
+        btn.className = 'btn btn-sm ' + (cctvLivePlaying ? 'btn-success' : 'btn-primary');
+        renderCctvWall();
+      });
+    }
+
+    if ($('cctvMuteTopBtn')) {
+      $('cctvMuteTopBtn').addEventListener('click', () => {
+        stopCctvAudio(true);
+        toast('🔇 تم كتم الصوت المباشر');
+      });
+    }
+    if ($('cctvWallVolumeSlider')) {
+      $('cctvWallVolumeSlider').addEventListener('input', (e) => setCctvAudioVolumePercent(e.target.value));
+    }
+    if ($('cctvHdVolumeSlider')) {
+      $('cctvHdVolumeSlider').addEventListener('input', (e) => setCctvAudioVolumePercent(e.target.value));
+    }
+    if ($('cctvHdAudioBtn')) {
+      $('cctvHdAudioBtn').addEventListener('click', () => {
+        if (!cctvHdTarget || !cctvHdTarget.item) return;
+        const it = cctvHdTarget.item;
+        toggleCctvAudio(it.dvr, it.channel, it.branchName + ' · ' + it.camLabel);
+      });
+    }
+
+    if ($('cctvRefreshNowBtn')) {
+      $('cctvRefreshNowBtn').addEventListener('click', () => {
+        cctvLivePlaying = true;
+        if ($('cctvPlayPauseBtn')) {
+          $('cctvPlayPauseBtn').textContent = '⏸ إيقاف';
+          $('cctvPlayPauseBtn').className = 'btn btn-success btn-sm';
+        }
+        loadCctvDvrs(true);
+      });
+    }
+
+    if ($('cctvSuperOnlySwitch')) {
+      $('cctvSuperOnlySwitch').addEventListener('change', async (e) => {
+        const val = Boolean(e.target.checked);
+        const res = await callCctvApi('cctvSetSettings', 'cctv_set_settings', { superOnly: val });
+        if (res && res.ok) {
+          cctvSettings = res.settings || { ...cctvSettings, super_only: val };
+          toast(val ? '🔒 تم حصر الكاميرات بحساب السوبر أدمن فقط' : '🔓 تم السماح للمديرين بمشاهدة الكاميرات');
+        } else {
+          e.target.checked = !val;
+          toast((res && res.error) || 'تعذر تحديث الإعداد', 'error');
+        }
+      });
+    }
+
+    if ($('cctvManageToggleBtn')) {
+      $('cctvManageToggleBtn').addEventListener('click', () => {
+        const pnl = $('cctvManagePanel');
+        if (!pnl) return;
+        const show = pnl.style.display === 'none';
+        pnl.style.display = show ? 'block' : 'none';
+        if (show) refreshCctvBridgeDevicesDropdown();
+      });
+    }
+    if ($('cctvCloseManageBtn')) {
+      $('cctvCloseManageBtn').addEventListener('click', () => {
+        if ($('cctvManagePanel')) $('cctvManagePanel').style.display = 'none';
+      });
+    }
+    if ($('cctvModeSelect')) {
+      $('cctvModeSelect').addEventListener('change', (e) => {
+        const isBridge = e.target.value !== 'direct';
+        if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = isBridge ? '' : 'none';
+        if (isBridge) refreshCctvBridgeDevicesDropdown();
+      });
+    }
+    if ($('cctvReloadDevicesBtn')) {
+      $('cctvReloadDevicesBtn').addEventListener('click', () => refreshCctvBridgeDevicesDropdown());
+    }
+    if ($('cctvBridgeDeviceSelect')) {
+      $('cctvBridgeDeviceSelect').addEventListener('change', () => checkSelectedBridgeDeviceVersion());
+    }
+    if ($('cctvUpgradeBridgeBtn')) {
+      $('cctvUpgradeBridgeBtn').addEventListener('click', async () => {
+        const sel = $('cctvBridgeDeviceSelect');
+        const devId = sel && sel.value;
+        if (!devId) return;
+        const btn = $('cctvUpgradeBridgeBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الترقية الصامتة بالخلفية...';
+        try {
+          const r = await api.sendRelayCommand(devId, 'update_client', currentAdminUser, currentAdminRole);
+          if (r && (r.success || r.ok)) {
+            toast('⬆️ تم إرسال الترقية الصامتة لجهاز الفرع — جاري الانتظار حتى يتصل بـ v1.1.0...');
+            const started = Date.now();
+            while (Date.now() - started < 55000) {
+              await new Promise((res) => setTimeout(res, 3500));
+              await refreshCctvBridgeDevicesDropdown(devId);
+              const updated = cctvBridgeDevicesCache.find((d) => d.device_id === devId);
+              if (updated && isClientVerReadyForCctv(updated.app_version)) {
+                toast('✅ اكتملت ترقية جهاز الفرع إلى v' + updated.app_version + ' بنجاح!');
+                break;
+              }
+            }
+          } else {
+            toast((r && r.error) || 'تعذر إرسال أمر الترقية', 'error');
+          }
+        } catch (e) {
+          toast('خطأ: ' + (e.message || e), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+          checkSelectedBridgeDeviceVersion();
+        }
+      });
+    }
+    if ($('cctvResetFormBtn')) {
+      $('cctvResetFormBtn').addEventListener('click', resetCctvForm);
+    }
+
+    if ($('cctvAutoScanBtn')) {
+      $('cctvAutoScanBtn').addEventListener('click', async () => {
+        const btn = $('cctvAutoScanBtn');
+        const box = $('cctvScanResultsBox');
+        const mode = ($('cctvModeSelect') && $('cctvModeSelect').value) === 'direct' ? 'direct' : 'bridge';
+        const bridgeId = mode === 'bridge' ? (($('cctvBridgeDeviceSelect') && $('cctvBridgeDeviceSelect').value) || '').trim() : '';
+        if (mode === 'bridge' && !bridgeId) {
+          toast('اختر كمبيوتر الفرع أولاً ليقوم بفحص شبكته الداخلية عن أجهزة Dahua', 'error');
+          return;
+        }
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الفحص...';
+        if (box) {
+          box.style.display = 'block';
+          box.innerHTML = '⏳ جاري مسح الشبكة المحلية بحثاً عن أجهزة Dahua DVR (منفذ 37777)... قد يستغرق 5–10 ثوانٍ.';
+        }
+        try {
+          const res = await callCctvApi('cctvScanLan', 'cctv_scan_lan', { bridgeDeviceId: bridgeId || null });
+          if (res && res.ok && Array.isArray(res.found)) {
+            if (!res.found.length) {
+              box.innerHTML = '⚠ لم يتم العثور تلقائياً على منفذ Dahua 37777 على نفس الشبكة — يمكنك كتابة الـ IP يدوياً.';
+            } else {
+              box.innerHTML =
+                '<div style="font-weight:700;margin-bottom:5px;color:#10b981;">✓ تم اكتشاف ' + res.found.length + ' جهاز Dahua (اضغط للاختيار):</div>' +
+                '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+                res.found.map((f) =>
+                  '<button type="button" class="btn btn-ghost btn-sm" data-pick-dvr-ip="' + esc(f.host) + '" data-pick-dvr-port="' + (f.http_port || 80) + '">' +
+                    '📹 <span class="mono" dir="ltr">' + esc(f.host) + ':' + (f.http_port || 80) + '</span>' +
+                  '</button>'
+                ).join('') +
+                '</div>';
+            }
+          } else {
+            box.innerHTML = '<span style="color:var(--danger);">⚠ ' + esc((res && res.error) || 'تعذر الفحص') + '</span>';
+          }
+        } catch (e) {
+          if (box) box.innerHTML = '<span style="color:var(--danger);">⚠ ' + esc(e.message || e) + '</span>';
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('cctvTestBtn')) {
+      $('cctvTestBtn').addEventListener('click', async () => {
+        const btn = $('cctvTestBtn');
+        const banner = $('cctvTestResultBanner');
+        const payload = collectCctvFormPayload();
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الفحص...';
+        try {
+          const res = await callCctvApi('cctvTestDvr', 'cctv_test_dvr', { dvr: payload });
+          if (res && res.ok) {
+            if (res.detected_channels && $('cctvChannelsInput')) {
+              const std = [4, 8, 16, 24, 32, 64].find((n) => n >= res.detected_channels) || 16;
+              $('cctvChannelsInput').value = String(std);
+            }
+            if (res.channel_names) {
+              cctvDetectedChannelNames = res.channel_names;
+            }
+            if (banner) {
+              banner.style.display = 'block';
+              banner.style.background = 'rgba(16,185,129,0.12)';
+              banner.style.color = '#10b981';
+              banner.style.border = '1px solid rgba(16,185,129,0.3)';
+              banner.textContent = res.message || '✓ نجح الاتصال بجهاز الـ DVR';
+            }
+            toast('✓ نجح فحص الاتصال بجهاز الـ DVR');
+          } else {
+            if (banner) {
+              banner.style.display = 'block';
+              banner.style.background = 'rgba(239,68,68,0.12)';
+              banner.style.color = '#ef4444';
+              banner.style.border = '1px solid rgba(239,68,68,0.3)';
+              banner.textContent = '⚠ ' + ((res && res.error) || 'فشل الاتصال بجهاز الـ DVR');
+            }
+          }
+        } catch (e) {
+          if (banner) {
+            banner.style.display = 'block';
+            banner.style.background = 'rgba(239,68,68,0.12)';
+            banner.style.color = '#ef4444';
+            banner.textContent = '⚠ ' + (e.message || e);
+          }
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('cctvSaveBtn')) {
+      $('cctvSaveBtn').addEventListener('click', async () => {
+        const btn = $('cctvSaveBtn');
+        const payload = collectCctvFormPayload();
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الحفظ...';
+        try {
+          const res = await callCctvApi('cctvSaveDvr', 'cctv_save_dvr', { dvr: payload });
+          if (res && res.ok) {
+            cctvDvrs = res.dvrs || [];
+            if (res.settings) cctvSettings = res.settings;
+            syncCctvBranchAndPageSelectors();
+            renderCctvSavedList();
+            resetCctvForm();
+            renderCctvWall();
+            toast('✓ تم حفظ جهاز الـ DVR وتشغيل البث المباشر');
+          } else {
+            toast((res && res.error) || 'تعذر حفظ بيانات الـ DVR', 'error');
+          }
+        } catch (e) {
+          toast('خطأ: ' + (e.message || e), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    document.addEventListener('click', async (e) => {
+      const pickBtn = e.target.closest('[data-pick-dvr-ip]');
+      if (pickBtn) {
+        if ($('cctvHostInput')) $('cctvHostInput').value = pickBtn.getAttribute('data-pick-dvr-ip') || '';
+        if ($('cctvHttpPortInput')) $('cctvHttpPortInput').value = pickBtn.getAttribute('data-pick-dvr-port') || '80';
+        toast('✓ تم تعبئة عنوان IP والمنفذ تلقائياً');
+        return;
+      }
+
+      const watchBtn = e.target.closest('[data-cctv-watch]');
+      if (watchBtn) {
+        cctvSelectedBranch = watchBtn.getAttribute('data-cctv-watch') || 'all';
+        cctvChannelPage = 0;
+        if ($('cctvBranchSelect')) $('cctvBranchSelect').value = cctvSelectedBranch;
+        if ($('cctvManagePanel')) $('cctvManagePanel').style.display = 'none';
+        renderCctvWall();
+        return;
+      }
+
+      const pullBtn = e.target.closest('[data-cctv-pullnames]');
+      if (pullBtn) {
+        const id = pullBtn.getAttribute('data-cctv-pullnames');
+        const orig = pullBtn.innerHTML;
+        pullBtn.disabled = true;
+        pullBtn.innerHTML = '⏳...';
+        try {
+          const res = await callCctvApi('cctvAction', 'cctv_action', { action: 'pull_names', payload: { dvr_id: id } });
+          if (res && res.ok) {
+            if (Array.isArray(res.dvrs)) cctvDvrs = res.dvrs;
+            renderCctvSavedList();
+            renderCctvWall();
+            toast(res.message || '✓ تم سحب أسماء الكاميرات');
+          } else {
+            toast((res && res.error) || 'تعذر سحب الأسماء', 'error');
+          }
+        } catch (err) {
+          toast('خطأ: ' + (err.message || err), 'error');
+        } finally {
+          pullBtn.disabled = false;
+          pullBtn.innerHTML = orig;
+        }
+        return;
+      }
+
+      const unhideBtn = e.target.closest('[data-cctv-unhideall]');
+      if (unhideBtn) {
+        const id = unhideBtn.getAttribute('data-cctv-unhideall');
+        const dvr = cctvDvrs.find((x) => x.id === id);
+        if (!dvr) return;
+        const res = await callCctvApi('cctvSaveDvr', 'cctv_save_dvr', {
+          dvr: { ...dvr, hidden_channels: [] },
+        });
+        if (res && res.ok) {
+          cctvDvrs = res.dvrs || [];
+          renderCctvSavedList();
+          renderCctvWall();
+          toast('✓ تمت استعادة إظهار جميع القنوات المخفية');
+        }
+        return;
+      }
+
+      const editBtn = e.target.closest('[data-cctv-edit]');
+      if (editBtn) {
+        const id = editBtn.getAttribute('data-cctv-edit');
+        const dvr = cctvDvrs.find((x) => x.id === id);
+        if (!dvr) return;
+        if ($('cctvManagePanel')) $('cctvManagePanel').style.display = 'block';
+        await refreshCctvBridgeDevicesDropdown(dvr.bridge_device_id || '');
+        if ($('cctvEditIdInput')) $('cctvEditIdInput').value = dvr.id;
+        if ($('cctvFormTitle')) $('cctvFormTitle').textContent = '✏ تعديل بيانات جهاز DVR: ' + dvr.name;
+        if ($('cctvNameInput')) $('cctvNameInput').value = dvr.name || '';
+        if ($('cctvModeSelect')) $('cctvModeSelect').value = dvr.connection_mode || 'direct';
+        if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = dvr.connection_mode === 'bridge' ? '' : 'none';
+        if ($('cctvBridgeDeviceSelect')) $('cctvBridgeDeviceSelect').value = dvr.bridge_device_id || '';
+        if ($('cctvHostInput')) $('cctvHostInput').value = dvr.host || '';
+        if ($('cctvHttpPortInput')) $('cctvHttpPortInput').value = String(dvr.http_port || 80);
+        if ($('cctvChannelsInput')) $('cctvChannelsInput').value = String(dvr.channels_count || 8);
+        if ($('cctvUserInput')) $('cctvUserInput').value = dvr.username || 'admin';
+        if ($('cctvAllowedAdminsInput')) $('cctvAllowedAdminsInput').value = dvr.allowed_admins || '';
+        if ($('cctvPassInput')) {
+          $('cctvPassInput').value = '';
+          $('cctvPassInput').placeholder = dvr.has_password ? 'محفوظة مسبقاً (اتركها فارغة لعدم التغيير)' : 'أدخل كلمة مرور الـ DVR';
+        }
+        cctvDetectedChannelNames = dvr.channel_names || null;
+        checkSelectedBridgeDeviceVersion();
+        return;
+      }
+
+      const delBtn = e.target.closest('[data-cctv-del]');
+      if (delBtn) {
+        const id = delBtn.getAttribute('data-cctv-del');
+        const dvr = cctvDvrs.find((x) => x.id === id);
+        if (!dvr) return;
+        if (!window.confirm('هل تريد حذف جهاز الـ DVR الخاص بـ «' + dvr.name + '»؟')) return;
+        const res = await callCctvApi('cctvDeleteDvr', 'cctv_delete_dvr', { id });
+        if (res && res.ok) {
+          cctvDvrs = res.dvrs || [];
+          syncCctvBranchAndPageSelectors();
+          renderCctvSavedList();
+          renderCctvWall();
+          toast('تم حذف جهاز الـ DVR');
+        }
+        return;
+      }
+
+      const audBtn = e.target.closest('[data-cctv-audio]');
+      if (audBtn) {
+        e.stopPropagation();
+        const tileIdx = Number(audBtn.getAttribute('data-cctv-audio') || 0);
+        const computed = getVisibleCctvTiles();
+        const tile = (computed.pageTiles || [])[tileIdx];
+        if (tile) {
+          await toggleCctvAudio(tile.dvr, tile.channel, tile.branchName + ' · ' + tile.camLabel);
+        }
+        return;
+      }
+
+      const favBtn = e.target.closest('[data-cctv-fav]');
+      if (favBtn) {
+        e.stopPropagation();
+        const tileIdx = Number(favBtn.getAttribute('data-cctv-fav') || 0);
+        const computed = getVisibleCctvTiles();
+        const tile = (computed.pageTiles || [])[tileIdx];
+        if (tile) await toggleChannelFav(tile.dvrId, tile.channel);
+        return;
+      }
+
+      const hdBtn = e.target.closest('[data-cctv-hd]');
+      if (hdBtn) {
+        e.stopPropagation();
+        const tileIdx = Number(hdBtn.getAttribute('data-cctv-hd') || 0);
+        const computed = getVisibleCctvTiles();
+        const perPage = cctvGridCols * cctvGridCols;
+        openCctvHdModal(computed.allTiles || [], cctvChannelPage * perPage + tileIdx);
+        return;
+      }
+
+      const snapBtn = e.target.closest('[data-cctv-snap]');
+      if (snapBtn) {
+        e.stopPropagation();
+        const tileIdx = Number(snapBtn.getAttribute('data-cctv-snap') || 0);
+        const imgEl = $('cctvTile_' + tileIdx + '_img');
+        const computed = getVisibleCctvTiles();
+        const tile = (computed.pageTiles || [])[tileIdx];
+        const fname = 'Dahua_' + ((tile && tile.branchName) || 'Cam') + '_CH' + ((tile && tile.channel) || 1) + '_' + Date.now() + '.jpg';
+        await downloadCctvSnapshotUrl(imgEl && imgEl.dataset.lastSrc, fname);
+        return;
+      }
+
+      const ptzBtn = e.target.closest('[data-ptz-code]');
+      if (ptzBtn && cctvHdTarget && cctvHdTarget.item) {
+        const code = ptzBtn.getAttribute('data-ptz-code');
+        const res = await callCctvApi('cctvAction', 'cctv_action', {
+          action: 'ptz',
+          payload: { dvr_id: cctvHdTarget.item.dvrId, channel: cctvHdTarget.item.channel, code, speed: 4 },
+        }).catch((err) => ({ ok: false, error: err.message }));
+        if (!res || !res.ok) {
+          toast((res && res.error) || 'هذه الكاميرا ثابتة أو لا تدعم تحريك PTZ', 'error');
+        }
+        return;
+      }
+
+      const clipDlBtn = e.target.closest('[data-pb-clip]');
+      if (clipDlBtn) {
+        const dvrId = clipDlBtn.getAttribute('data-pb-dvr');
+        const ch = clipDlBtn.getAttribute('data-pb-ch');
+        const st = clipDlBtn.getAttribute('data-pb-st');
+        const et = clipDlBtn.getAttribute('data-pb-et');
+        // Cap clip window to 60 seconds from start so download finishes in seconds with zero branch lag
+        const stDate = new Date(st.replace(' ', 'T'));
+        const etDate = new Date(et.replace(' ', 'T'));
+        let safeEt = et;
+        if (!isNaN(stDate.getTime()) && (isNaN(etDate.getTime()) || (etDate.getTime() - stDate.getTime()) > 60000)) {
+          const capped = new Date(stDate.getTime() + 60000);
+          safeEt = toDahuaDateTimeStr(toLocalDatetimeInputVal(capped));
+        }
+        toast('⏳ جاري سحب مقطع الفيديو (60 ثانية) من هارد الـ DVR...');
+        if (isNativeTauriOrigin) {
+          const dlRes = await callCctvApi('cctvAction', 'cctv_action', {
+            action: 'download_clip_local',
+            payload: { dvr_id: dvrId, channel: Number(ch || 1), start_time: st, end_time: safeEt },
+          });
+          if (dlRes && (dlRes.ok || dlRes.success)) {
+            toast('✅ تم حفظ مقطع الفيديو في التنزيلات وفتح المجلد');
+          } else {
+            toast((dlRes && dlRes.error) || 'تعذر سحب المقطع', 'error');
+          }
+        } else {
+          window.open(buildCctvClipUrl(dvrId, ch, st, safeEt), '_blank');
+        }
+        return;
+      }
+    });
+
+    // HD Digital Zoom & Pan bindings
+    if ($('cctvHdZoomInBtn')) {
+      $('cctvHdZoomInBtn').addEventListener('click', () => {
+        cctvZoomScale = Math.min(5, cctvZoomScale + 0.5);
+        applyHdZoomTransform();
+      });
+    }
+    if ($('cctvHdZoomOutBtn')) {
+      $('cctvHdZoomOutBtn').addEventListener('click', () => {
+        cctvZoomScale = Math.max(1, cctvZoomScale - 0.5);
+        applyHdZoomTransform();
+      });
+    }
+    if ($('cctvHdZoomResetBtn')) {
+      $('cctvHdZoomResetBtn').addEventListener('click', () => {
+        cctvZoomScale = 1; cctvPanX = 0; cctvPanY = 0;
+        applyHdZoomTransform();
+      });
+    }
+    const vp = $('cctvHdViewport');
+    if (vp) {
+      vp.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? 0.35 : -0.35;
+        cctvZoomScale = Math.max(1, Math.min(5, cctvZoomScale + delta));
+        applyHdZoomTransform();
+      }, { passive: false });
+      vp.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button') || cctvZoomScale <= 1) return;
+        cctvDragging = true;
+        cctvDragStart = { x: e.clientX - cctvPanX, y: e.clientY - cctvPanY };
+        applyHdZoomTransform();
+      });
+      window.addEventListener('pointermove', (e) => {
+        if (!cctvDragging) return;
+        cctvPanX = e.clientX - cctvDragStart.x;
+        cctvPanY = e.clientY - cctvDragStart.y;
+        applyHdZoomTransform();
+      });
+      window.addEventListener('pointerup', () => {
+        if (cctvDragging) {
+          cctvDragging = false;
+          applyHdZoomTransform();
+        }
+      });
+    }
+
+    if ($('cctvHdStarBtn')) {
+      $('cctvHdStarBtn').addEventListener('click', async () => {
+        if (!cctvHdTarget || !cctvHdTarget.item) return;
+        await toggleChannelFav(cctvHdTarget.item.dvrId, cctvHdTarget.item.channel);
+        const fav = isChannelFav(cctvHdTarget.item.dvrId, cctvHdTarget.item.channel);
+        $('cctvHdStarBtn').textContent = fav ? '⭐ في المفضلة' : '☆ مفضلة';
+      });
+    }
+    if ($('cctvHdRenameBtn')) {
+      $('cctvHdRenameBtn').addEventListener('click', async () => {
+        if (!cctvHdTarget || !cctvHdTarget.item) return;
+        const it = cctvHdTarget.item;
+        const curName = (it.dvr.channel_names && it.dvr.channel_names[String(it.channel)]) || '';
+        const newName = window.prompt('أدخل اسماً واضحاً لهذه الكاميرا (مثال: كاشير أكتوبر · بوابة المخزن):', curName);
+        if (newName === null) return;
+        const res = await callCctvApi('cctvAction', 'cctv_action', {
+          action: 'save_channel_meta',
+          payload: { dvr_id: it.dvrId, channel: it.channel, title: newName },
+        });
+        if (res && res.ok) {
+          cctvDvrs = res.dvrs || cctvDvrs;
+          const labelTxt = newName.trim() ? ('كاميرا ' + it.channel + ' · ' + newName.trim()) : ('كاميرا ' + it.channel);
+          if ($('cctvHdTitle')) $('cctvHdTitle').textContent = '🎥 ' + it.branchName + ' — ' + labelTxt;
+          renderCctvWall();
+          toast('✓ تم حفظ اسم الكاميرا بنجاح');
+        }
+      });
+    }
+    if ($('cctvHdHideChanBtn')) {
+      $('cctvHdHideChanBtn').addEventListener('click', async () => {
+        if (!cctvHdTarget || !cctvHdTarget.item) return;
+        const it = cctvHdTarget.item;
+        if (!window.confirm('هل تريد إخفاء «' + it.camLabel + '» من شاشة العرض؟ (يمكنك استعادتها في أي وقت من إعدادات الـ DVR)')) return;
+        const res = await callCctvApi('cctvAction', 'cctv_action', {
+          action: 'save_channel_meta',
+          payload: { dvr_id: it.dvrId, channel: it.channel, hidden: true },
+        });
+        if (res && res.ok) {
+          cctvDvrs = res.dvrs || cctvDvrs;
+          closeCctvHdModal();
+          renderCctvSavedList();
+          renderCctvWall();
+          toast('🙈 تم إخفاء القناة من شاشة العرض');
+        }
+      });
+    }
+    if ($('cctvHdPtzToggleBtn')) {
+      $('cctvHdPtzToggleBtn').addEventListener('click', () => {
+        const pad = $('cctvPtzPad');
+        if (pad) pad.style.display = pad.style.display === 'none' ? 'block' : 'none';
+      });
+    }
+    if ($('cctvHdPlaybackJumpBtn')) {
+      $('cctvHdPlaybackJumpBtn').addEventListener('click', () => {
+        const it = cctvHdTarget && cctvHdTarget.item;
+        closeCctvHdModal();
+        if (it) openCctvPlaybackModal(it.dvrId, it.channel);
+      });
+    }
+
+    if ($('cctvHdCloseBtn')) $('cctvHdCloseBtn').addEventListener('click', closeCctvHdModal);
+    if ($('cctvHdModal')) {
+      $('cctvHdModal').addEventListener('click', (e) => {
+        if (e.target === $('cctvHdModal')) closeCctvHdModal();
+      });
+    }
+    if ($('cctvHdPrevBtn')) {
+      $('cctvHdPrevBtn').addEventListener('click', () => {
+        if (cctvHdTarget) openCctvHdModal(cctvHdTarget.tilesList, cctvHdTarget.index - 1);
+      });
+    }
+    if ($('cctvHdNextBtn')) {
+      $('cctvHdNextBtn').addEventListener('click', () => {
+        if (cctvHdTarget) openCctvHdModal(cctvHdTarget.tilesList, cctvHdTarget.index + 1);
+      });
+    }
+    if ($('cctvHdDownloadBtn')) {
+      $('cctvHdDownloadBtn').addEventListener('click', () => {
+        const it = cctvHdTarget && cctvHdTarget.item;
+        const fname = 'Dahua_HD_' + ((it && it.branchName) || 'Cam') + '_CH' + ((it && it.channel) || 1) + '_' + Date.now() + '.jpg';
+        downloadCctvSnapshotUrl(cctvHdLastDataUrl, fname);
+      });
+    }
+
+    // Playback modal bindings
+    ['cctvPlaybackCloseBtn', 'cctvPlaybackCloseTop'].forEach((id) => {
+      if ($(id)) $(id).addEventListener('click', () => $('cctvPlaybackModal').classList.remove('show'));
+    });
+    if ($('cctvPbSearchBtn')) {
+      $('cctvPbSearchBtn').addEventListener('click', async () => {
+        const btn = $('cctvPbSearchBtn');
+        const box = $('cctvPbResultsBox');
+        const dvrId = $('cctvPbBranchSelect') && $('cctvPbBranchSelect').value;
+        const ch = Number(($('cctvPbChannelSelect') && $('cctvPbChannelSelect').value) || 1);
+        const st = toDahuaDateTimeStr($('cctvPbStartInput') && $('cctvPbStartInput').value);
+        const et = toDahuaDateTimeStr($('cctvPbEndInput') && $('cctvPbEndInput').value);
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري البحث...';
+        if (box) box.innerHTML = '⏳ جاري الاستعلام من هارد الـ DVR في الفرع...';
+        try {
+          const res = await callCctvApi('cctvAction', 'cctv_action', {
+            action: 'search_recordings',
+            payload: { dvr_id: dvrId, channel: ch, start_time: st, end_time: et },
+          });
+          if (res && res.ok && Array.isArray(res.items)) {
+            if (!res.items.length) {
+              box.innerHTML = '⚠ لم يتم العثور على ملفات تسجيل في هذه الفترة الزمنية على هارد الـ DVR.';
+            } else {
+              box.innerHTML =
+                '<div style="font-weight:800;margin-bottom:8px;color:#10b981;">✓ تم العثور على ' + res.items.length + ' مقطع مسجل:</div>' +
+                '<div style="display:grid;gap:6px;">' +
+                res.items.map((it) => {
+                  const mb = it.size_bytes > 0 ? ((it.size_bytes / (1024 * 1024)).toFixed(1) + ' MB') : 'تسجيل مستمر';
+                  return (
+                    '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:8px;background:var(--surface);border:1px solid var(--border);">' +
+                      '<div><span class="mono" dir="ltr">' + esc(it.start_time) + ' ⬅ ' + esc(it.end_time) + '</span> <span class="badge gray">' + esc(mb) + '</span></div>' +
+                      '<button type="button" class="btn btn-success btn-sm" data-pb-clip="1" data-pb-dvr="' + esc(dvrId) + '" data-pb-ch="' + ch + '" data-pb-st="' + esc(it.start_time) + '" data-pb-et="' + esc(it.end_time) + '">⬇ سحب أول 60 ثانية</button>' +
+                    '</div>'
+                  );
+                }).join('') +
+                '</div>';
+            }
+          } else {
+            box.innerHTML = '<span style="color:var(--danger);">⚠ ' + esc((res && res.error) || 'تعذر البحث') + '</span>';
+          }
+        } catch (err) {
+          if (box) box.innerHTML = '<span style="color:var(--danger);">⚠ ' + esc(err.message || err) + '</span>';
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+    if ($('cctvPbQuickClipBtn')) {
+      $('cctvPbQuickClipBtn').addEventListener('click', async () => {
+        const dvrId = $('cctvPbBranchSelect') && $('cctvPbBranchSelect').value;
+        const ch = Number(($('cctvPbChannelSelect') && $('cctvPbChannelSelect').value) || 1);
+        const stRaw = $('cctvPbStartInput') && $('cctvPbStartInput').value;
+        if (!dvrId || !stRaw) return;
+        const stDate = new Date(stRaw);
+        const etDate = new Date(stDate.getTime() + 60000);
+        const st = toDahuaDateTimeStr(stRaw);
+        const et = toDahuaDateTimeStr(toLocalDatetimeInputVal(etDate));
+        toast('⏳ جاري سحب مقطع 60 ثانية مباشرة من هارد الـ DVR...');
+        if (isNativeTauriOrigin) {
+          const dlRes = await callCctvApi('cctvAction', 'cctv_action', {
+            action: 'download_clip_local',
+            payload: { dvr_id: dvrId, channel: ch, start_time: st, end_time: et },
+          });
+          if (dlRes && (dlRes.ok || dlRes.success)) {
+            toast('✅ تم حفظ مقطع الفيديو في التنزيلات وفتح المجلد');
+          } else {
+            toast((dlRes && dlRes.error) || 'تعذر سحب المقطع', 'error');
+          }
+        } else {
+          window.open(buildCctvClipUrl(dvrId, ch, st, et), '_blank');
+        }
+      });
+    }
+  })();
+
   /* ---------- Init ---------- */
+  let visibilityHookBound = false;
   async function bootDashboardData() {
-    await loadStatus();
-    await loadSites();
-    await loadConfig();
-    await loadServerInfo();
-    await loadDevices();
+    refreshServerConnectionPill(false);
+    if (connTimer) clearInterval(connTimer);
+    connTimer = setInterval(() => {
+      if (!document.hidden) refreshServerConnectionPill(false);
+    }, 8000);
+
+    await Promise.all([
+      loadStatus(),
+      loadSites(),
+      loadConfig(),
+      loadServerInfo(),
+      loadDevices(),
+      loadRelayConfig(),
+    ]);
+
     if (devicesTimer) clearInterval(devicesTimer);
-    devicesTimer = setInterval(loadDevices, 4000);
-    await loadRelayConfig();
-    loadRelayDevices();
-    loadKpis();
-    loadAdminUsers();
+    devicesTimer = setInterval(() => {
+      if (!document.hidden) loadDevices();
+    }, 4000);
+
+    Promise.all([
+      loadRelayDevices(),
+      loadKpis(),
+      loadAdminUsers(),
+      loadWaBotStatus(true),
+      loadCctvDvrs(false),
+    ]).catch(() => {});
+
     startBlockedAttempts();
+    refreshAdminUpdateUi(false);
+    setInterval(() => {
+      if (!document.hidden) refreshAdminUpdateUi(false);
+    }, 60000);
+
+    if (!visibilityHookBound) {
+      visibilityHookBound = true;
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && isTokenValid(authToken)) {
+          refreshServerConnectionPill(false);
+          loadDevices();
+          if (relayTimer) loadRelayDevices();
+        }
+      });
+    }
   }
 
   (async () => {

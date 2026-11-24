@@ -12,9 +12,11 @@ relay/data/*.db-wal
 relay/data/*.db-shm
 # Large binaries
 *.exe
+*.exe.old
 *.rlib
 *.rmeta
 *.pdb
+relay/wa-session/
 # OS
 Thumbs.db
 .DS_Store

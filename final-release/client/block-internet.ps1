@@ -105,7 +105,13 @@ if ($hadBlock) {
     } catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
 }
 
-# 4. Flush DNS and tell WinINET to reload
+# 4. Ensure local LAN Direct RustDesk port (21118 TCP) is allowed on Private/Domain profiles for fast IT support
+try {
+    netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk Direct" 2>&1 | Out-Null
+    netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk Direct" dir=in action=allow protocol=TCP localport=21118 profile=private,domain 2>&1 | Out-Null
+} catch { }
+
+# 5. Flush DNS and tell WinINET to reload
 ipconfig /flushdns | Out-Null
 
 Add-Type -TypeDefinition @"

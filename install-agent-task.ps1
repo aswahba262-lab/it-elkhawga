@@ -32,6 +32,10 @@ if ($isAdminInstall) {
   try {
     netsh advfirewall firewall delete rule name="IT ELKHAWGA Relay" 2>&1 | Out-Null
     netsh advfirewall firewall add rule name="IT ELKHAWGA Relay" dir=in action=allow protocol=TCP localport=8787-8796 profile=any 2>&1 | Out-Null
+    netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk OSS TCP" 2>&1 | Out-Null
+    netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk OSS TCP" dir=in action=allow protocol=TCP localport=21115-21119 profile=any 2>&1 | Out-Null
+    netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk OSS UDP" 2>&1 | Out-Null
+    netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk OSS UDP" dir=in action=allow protocol=UDP localport=21116 profile=any 2>&1 | Out-Null
   } catch {}
   "admin install-tasks done" | Out-File $log -Append
   exit 0
@@ -59,15 +63,21 @@ try {
   "screen task OK" | Out-File $log -Append
   Start-ScheduledTask -TaskName "IT ELKHAWGA Screen" -ErrorAction SilentlyContinue
 } catch { "screen task ERR: $($_.Exception.Message)" | Out-File $log -Append }
-# Also register HKLM Run so every interactive user session starts both --agent and --capture-agent on login
+# Register HKLM Run ONLY for the interactive user-session screen helper (--capture-agent).
+# Never put --agent in HKLM Run, otherwise a non-elevated user --agent could grab port 8788
+# before the SYSTEM Scheduled Task starts!
 try {
-  Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "IT ELKHAWGA Agent" -Value "`"$exe`" --agent" -Force
+  Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "IT ELKHAWGA Agent" -ErrorAction SilentlyContinue
   Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "IT ELKHAWGA Screen" -Value "`"$exe`" --capture-agent" -Force
 } catch {}
 # firewall
 try {
   netsh advfirewall firewall delete rule name="IT ELKHAWGA Relay" 2>&1 | Out-Null
   netsh advfirewall firewall add rule name="IT ELKHAWGA Relay" dir=in action=allow protocol=TCP localport=8787-8796 profile=any 2>&1 | Out-Null
+  netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk Direct" 2>&1 | Out-Null
+  netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk Direct" dir=in action=allow protocol=TCP localport=21118 profile=private,domain 2>&1 | Out-Null
+  netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk Discovery" 2>&1 | Out-Null
+  netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk Discovery" dir=in action=allow protocol=UDP localport=21116 profile=private,domain 2>&1 | Out-Null
 } catch {}
 # cleanup legacy
 try { Unregister-ScheduledTask -TaskName "InternetBlockerAgent" -Confirm:$false -ErrorAction SilentlyContinue } catch {}

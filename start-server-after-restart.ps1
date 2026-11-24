@@ -59,6 +59,16 @@ $relayScript = "C:\Users\IT APP\Desktop\blockwebsite\relay\server.js"
 $relayData   = Join-Path $env:ProgramData "IT-ELKHAWGA-Relay"
 New-Item -ItemType Directory -Force -Path $relayData | Out-Null
 
+# Lock down NTFS ACLs on sensitive DLP Archive & Relay database directories
+$archiveRoot = "C:\IT-ELKHAWGA-Archive"
+New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
+$svcAcct = if ($env:USERDOMAIN) { "$($env:USERDOMAIN)\$($env:USERNAME):(OI)(CI)F" } else { "$($env:USERNAME):(OI)(CI)F" }
+foreach ($secDir in @($archiveRoot, $relayData)) {
+    if (Test-Path -LiteralPath $secDir) {
+        & icacls $secDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" $svcAcct | Out-Null
+    }
+}
+
 $keyFile = Join-Path $relayData "admin-key.txt"
 $defaultKey = "2a0fa2811eb5acdba9847da8ece72ac29e59352a051e093664ba5fd413da2f8e"
 if (-not (Test-Path -LiteralPath $keyFile)) {
@@ -82,6 +92,7 @@ if ($Action -eq "restart") {
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
     }
+    Get-Process -Name "hbbs","hbbr" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
 }
 
@@ -126,10 +137,30 @@ if (Test-Path -LiteralPath $tailscaleExe) {
     }
 }
 
+$rdServerDir = Join-Path $env:ProgramData "IT-ELKHAWGA-RustDeskServer"
+$hbbsExe = Join-Path $rdServerDir "hbbs.exe"
+$hbbrExe = Join-Path $rdServerDir "hbbr.exe"
+$lanIpForRd = Get-LanIPv4
+if ((Test-Path -LiteralPath $hbbsExe) -and (Test-Path -LiteralPath $hbbrExe)) {
+    if (-not (Test-PortListening -Port 21117)) {
+        Write-Host "Starting RustDesk Server OSS Relay (hbbr :21117)..." -ForegroundColor Cyan
+        if (-not (Start-DetachedProcess -CommandLine "`"$hbbrExe`"" -WorkingDirectory $rdServerDir -Hidden $true)) {
+            Start-Process -FilePath $hbbrExe -WorkingDirectory $rdServerDir -WindowStyle Hidden
+        }
+    }
+    if (-not (Test-PortListening -Port 21116)) {
+        Write-Host "Starting RustDesk Server OSS ID Server (hbbs :21116)..." -ForegroundColor Cyan
+        $hbbsCmd = "`"$hbbsExe`" -r ${lanIpForRd}:21117"
+        if (-not (Start-DetachedProcess -CommandLine $hbbsCmd -WorkingDirectory $rdServerDir -Hidden $true)) {
+            Start-Process -FilePath $hbbsExe -ArgumentList "-r", "${lanIpForRd}:21117" -WorkingDirectory $rdServerDir -WindowStyle Hidden
+        }
+    }
+}
+
 if (-not (Test-PortListening -Port 8787)) {
     Write-Host "Starting Admin Server & Web Dashboard (port 8787)..." -ForegroundColor Cyan
-    if (-not (Start-DetachedProcess -CommandLine "`"$adminExe`"" -WorkingDirectory $adminDir -Hidden $false)) {
-        Start-Process -FilePath $adminExe -WorkingDirectory $adminDir
+    if (-not (Start-DetachedProcess -CommandLine "`"$adminExe`" --server" -WorkingDirectory $adminDir -Hidden $true)) {
+        Start-Process -FilePath $adminExe -ArgumentList "--server" -WorkingDirectory $adminDir -WindowStyle Hidden
     }
 }
 
@@ -175,6 +206,10 @@ for ($j = 0; $j -lt 10; $j++) {
     Start-Sleep -Milliseconds 300
 }
 
+$rdPubKeyPath = Join-Path $rdServerDir "id_ed25519.pub"
+$rdPubKey = if (Test-Path -LiteralPath $rdPubKeyPath) { (Get-Content -LiteralPath $rdPubKeyPath -Raw).Trim() } else { "" }
+$rdOssRunning = (Test-PortListening 21116) -and (Test-PortListening 21117)
+
 Write-Host ""
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host "  IT ELKHAWGA Server Status" -ForegroundColor White
@@ -182,10 +217,15 @@ Write-Host "==================================================" -ForegroundColor
 Write-Host ("  Admin + Web Dashboard (8787): " + $(if ($ready -or (Test-PortListening 8787)) { "RUNNING" } else { "NOT READY" })) -ForegroundColor $(if ($ready -or (Test-PortListening 8787)) { "Green" } else { "Red" })
 Write-Host ("  Cloud Relay Server    (8790): " + $(if ($relayReady -or (Test-PortListening 8790)) { "RUNNING" } else { "STOPPED" })) -ForegroundColor $(if ($relayReady -or (Test-PortListening 8790)) { "Green" } else { "Yellow" })
 Write-Host ("  Local Agent           (8788): " + $(if (Test-PortListening 8788) { "RUNNING" } else { "STOPPED" })) -ForegroundColor $(if (Test-PortListening 8788) { "Green" } else { "Yellow" })
+Write-Host ("  RustDesk Server OSS  (21116): " + $(if ($rdOssRunning) { "RUNNING" } else { "STOPPED" })) -ForegroundColor $(if ($rdOssRunning) { "Green" } else { "Yellow" })
 Write-Host ""
 Write-Host "  Web Dashboard URL : $dashUrl" -ForegroundColor Green
 Write-Host "  Cloud Relay URL   : $publicRelayUrl" -ForegroundColor Green
 Write-Host "  Relay LAN URL     : $relayUrl" -ForegroundColor Gray
+if ($rdOssRunning) {
+    Write-Host "  RustDesk OSS LAN  : ${ip}:21116" -ForegroundColor Green
+    if ($rdPubKey) { Write-Host "  RustDesk OSS Key  : $rdPubKey" -ForegroundColor Gray }
+}
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host ""
 

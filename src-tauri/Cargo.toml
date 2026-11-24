@@ -28,5 +28,4 @@ windows-sys = { version = "0.61", features = ["Win32_Graphics_Gdi", "Win32_UI_Wi
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true

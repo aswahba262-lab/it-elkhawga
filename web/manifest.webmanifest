@@ -1,0 +1,33 @@
+{
+  "name": "IT ELKHAWGA — لوحة الإدارة",
+  "short_name": "IT ELKHAWGA",
+  "description": "نظام إدارة ومراقبة الإنترنت وحماية بيانات الشركة — IT ELKHAWGA",
+  "dir": "rtl",
+  "lang": "ar",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0a1f3d",
+  "theme_color": "#0f4c81",
+  "icons": [
+    {
+      "src": "assets/ipad-icon-167.png",
+      "sizes": "167x167",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/pwa-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

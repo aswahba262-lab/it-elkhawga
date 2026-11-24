@@ -375,50 +375,31 @@ fn extract_url_host(raw: &str) -> String {
         .to_lowercase()
 }
 
-fn host_always_allowed(host: &str) -> bool {
-    let h = normalize_host(host);
+fn host_always_allowed_with(h: &str, snap: &ProxyPolicySnapshot) -> bool {
     // Always allow the local machine and the relay/control plane, otherwise a
     // blocked device could never poll for an unblock command (deadlock) and
     // the admin could not manage it.
     if h == "localhost" || h == "127.0.0.1" || h == "::1" {
         return true;
     }
-    let cfg = read_config();
-    let link = read_client();
-    let sh = extract_url_host(&link.server_url);
-    if host_matches_domain(&h, &sh) {
-        return true;
-    }
-    for relay_candidate in [&cfg.relay_url, &link.relay_url] {
-        let rh = extract_url_host(relay_candidate);
-        if host_matches_domain(&h, &rh) {
-            return true;
-        }
-    }
-    for rd in ["rustdesk.com", "rustdesk.net"] {
-        if host_matches_domain(&h, rd) {
-            return true;
-        }
-    }
-    if !cfg.rustdesk_server.trim().is_empty() {
-        let rs = cfg.rustdesk_server.trim().to_lowercase();
-        if host_matches_domain(&h, &rs) {
-            return true;
-        }
-    }
-    false
+    snap.always_allowed_hosts
+        .iter()
+        .any(|d| host_matches_domain(h, d))
 }
 
-fn host_in_list(host: &str, entries: &[String]) -> bool {
+fn host_always_allowed(host: &str) -> bool {
     let h = normalize_host(host);
-    for entry in entries {
-        let d = clean_domain(entry).unwrap_or_default();
-        let d = d.trim_start_matches("www.").to_lowercase();
-        if host_matches_domain(&h, &d) {
+    let snap = cached_policy_snapshot();
+    host_always_allowed_with(&h, &snap)
+}
+
+fn host_in_cleaned_list(h: &str, cleaned_entries: &[String]) -> bool {
+    for d in cleaned_entries {
+        if host_matches_domain(h, d) {
             return true;
         }
         if (d == "web.whatsapp.com" || d == "whatsapp.com")
-            && (host_matches_domain(&h, "whatsapp.com") || host_matches_domain(&h, "whatsapp.net"))
+            && (host_matches_domain(h, "whatsapp.com") || host_matches_domain(h, "whatsapp.net"))
         {
             return true;
         }
@@ -426,13 +407,22 @@ fn host_in_list(host: &str, entries: &[String]) -> bool {
     false
 }
 
-fn host_explicitly_allowed(host: &str) -> bool {
-    host_always_allowed(host) || host_in_list(host, &read_list(&allowed_path()))
+fn host_explicitly_allowed_with(h: &str, snap: &ProxyPolicySnapshot) -> bool {
+    host_always_allowed_with(h, snap) || host_in_cleaned_list(h, &snap.allowed_domains)
 }
 
-fn host_in_blocked_list(host: &str, include_default_blacklist: bool) -> bool {
+fn host_explicitly_allowed(host: &str) -> bool {
     let h = normalize_host(host);
-    if host_in_list(&h, &read_list(&blocked_path())) {
+    let snap = cached_policy_snapshot();
+    host_explicitly_allowed_with(&h, &snap)
+}
+
+fn host_in_blocked_list_with(
+    h: &str,
+    snap: &ProxyPolicySnapshot,
+    include_default_blacklist: bool,
+) -> bool {
+    if host_in_cleaned_list(h, &snap.blocked_domains) {
         return true;
     }
     if include_default_blacklist {
@@ -453,7 +443,7 @@ fn host_in_blocked_list(host: &str, include_default_blacklist: bool) -> bool {
         ];
         if DEFAULT_DISTRACTIONS
             .iter()
-            .any(|d| host_matches_domain(&h, d))
+            .any(|d| host_matches_domain(h, d))
         {
             return true;
         }
@@ -461,14 +451,25 @@ fn host_in_blocked_list(host: &str, include_default_blacklist: bool) -> bool {
     false
 }
 
+fn host_in_blocked_list(host: &str, include_default_blacklist: bool) -> bool {
+    let h = normalize_host(host);
+    let snap = cached_policy_snapshot();
+    host_in_blocked_list_with(&h, &snap, include_default_blacklist)
+}
+
 fn host_denied_by_policy(host: &str) -> bool {
-    if !is_blocked() || host_always_allowed(host) {
+    if !is_blocked() {
         return false;
     }
-    if read_config().mode == "blacklist" {
-        !host_explicitly_allowed(host) && host_in_blocked_list(host, true)
+    let h = normalize_host(host);
+    let snap = cached_policy_snapshot();
+    if host_always_allowed_with(&h, &snap) {
+        return false;
+    }
+    if snap.mode == "blacklist" {
+        !host_explicitly_allowed_with(&h, &snap) && host_in_blocked_list_with(&h, &snap, true)
     } else {
-        !host_explicitly_allowed(host)
+        !host_explicitly_allowed_with(&h, &snap)
     }
 }
 
@@ -483,8 +484,9 @@ fn is_suspicious_host(host: &str) -> bool {
 }
 
 static LAST_WHATSAPP_SECS: AtomicU64 = AtomicU64::new(0);
-static WHATSAPP_UPLOAD_EVENT: Mutex<Option<(String, u64, Instant)>> = Mutex::new(None);
-static WA_UPLOAD_ACCUM: Mutex<Option<std::collections::HashMap<String, (u64, Instant, Option<Instant>)>>> = Mutex::new(None);
+static WA_UPLOAD_ACCUM: Mutex<
+    Option<std::collections::HashMap<String, (u64, Instant, Instant, Option<Instant>)>>,
+> = Mutex::new(None);
 
 use std::sync::atomic::AtomicU64;
 
@@ -494,19 +496,36 @@ pub fn was_whatsapp_recently_active(within_secs: u64) -> bool {
 }
 
 pub fn take_whatsapp_proxy_upload() -> Option<(String, u64)> {
-    let mut g = WHATSAPP_UPLOAD_EVENT.lock().unwrap();
-    g.take().map(|(h, b, _)| (h, b))
+    let mut guard = WA_UPLOAD_ACCUM.lock().unwrap();
+    let map = guard.as_mut()?;
+    let now = Instant::now();
+    for (host, entry) in map.iter_mut() {
+        let (bytes, first_at, last_at, last_emit) = entry;
+        if *bytes > 0 && now.duration_since(*last_at) > Duration::from_secs(25) {
+            *bytes = 0;
+            continue;
+        }
+        let settled = now.duration_since(*last_at) >= Duration::from_millis(550)
+            || now.duration_since(*first_at) >= Duration::from_secs(6);
+        let cooldown_ok = last_emit.map_or(true, |prev| now.duration_since(prev) >= Duration::from_secs(5));
+        if *bytes >= 10 * 1024 && settled && cooldown_ok {
+            let total = *bytes;
+            *bytes = 0;
+            *first_at = now;
+            *last_at = now;
+            *last_emit = Some(now);
+            return Some((host.clone(), total));
+        }
+    }
+    None
 }
 
 fn is_whatsapp_media_upload_host(host: &str) -> bool {
     let h = normalize_host(host);
-    // Only true WhatsApp media/attachment upload endpoints trigger upload alerts;
-    // regular messaging WebSocket/presence hosts (e.g. web/pps/g.whatsapp.net) do not.
-    if h == "mmg.whatsapp.net" || h.ends_with(".mmg.whatsapp.net") {
-        return true;
-    }
-    let is_media_prefix = h.starts_with("media.") || h.starts_with("media-");
-    is_media_prefix && (h.ends_with(".whatsapp.net") || h.ends_with(".cdn.whatsapp.net"))
+    // Strictly match WhatsApp's Multimedia Upload Gateway (`mmg.whatsapp.net`).
+    // `media-*.cdn.whatsapp.net` and `media.*.fna.whatsapp.net` are download CDNs whose
+    // TLS/HTTP GET handshakes (~4.2 KB) would otherwise cause false fileless alerts.
+    h == "mmg.whatsapp.net" || h.ends_with(".mmg.whatsapp.net")
 }
 
 fn record_whatsapp_upload_bytes(host: &str, bytes: u64) {
@@ -517,23 +536,13 @@ fn record_whatsapp_upload_bytes(host: &str, bytes: u64) {
     let mut guard = WA_UPLOAD_ACCUM.lock().unwrap();
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
     let now = Instant::now();
-    let entry = map.entry(h.clone()).or_insert((0, now, None));
-    if now.duration_since(entry.1) > Duration::from_secs(20) {
+    let entry = map.entry(h).or_insert((0, now, now, None));
+    if entry.0 == 0 || now.duration_since(entry.2) > Duration::from_secs(20) {
         entry.0 = 0;
         entry.1 = now;
     }
     entry.0 = entry.0.saturating_add(bytes);
-    let cooldown_ok = entry
-        .2
-        .map_or(true, |prev| now.duration_since(prev) >= Duration::from_secs(8));
-    if entry.0 >= 4 * 1024 && cooldown_ok {
-        let total = entry.0;
-        entry.0 = 0;
-        entry.1 = now;
-        entry.2 = Some(now);
-        let mut ev = WHATSAPP_UPLOAD_EVENT.lock().unwrap();
-        *ev = Some((h, total, now));
-    }
+    entry.2 = now;
 }
 
 // Per-host upload tracking with a 10-minute window.
@@ -547,8 +556,9 @@ fn track_upload_dir(host: &str, bytes: u64, is_upload: bool) {
     if is_upload {
         record_whatsapp_upload_bytes(host, bytes);
     }
-    let threshold_mb: u64 = read_config().exfil_threshold_mb.max(1);
-    let window_secs: u64 = read_config().exfil_window_secs.max(60);
+    let snap = cached_policy_snapshot();
+    let threshold_mb: u64 = snap.exfil_threshold_mb;
+    let window_secs: u64 = snap.exfil_window_secs;
     let mut guard = UPLOADS.lock().unwrap();
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
     let now = std::time::Instant::now();
@@ -1283,5 +1293,14 @@ mod tests {
 
         srv_handle.join().expect("server thread join");
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn whatsapp_upload_host_filter_ignores_download_cdns() {
+        assert!(is_whatsapp_media_upload_host("mmg.whatsapp.net"));
+        assert!(is_whatsapp_media_upload_host("mmg-fna.mmg.whatsapp.net"));
+        assert!(!is_whatsapp_media_upload_host("media-hbe1-2.cdn.whatsapp.net"));
+        assert!(!is_whatsapp_media_upload_host("media.fcai19-3.fna.whatsapp.net"));
+        assert!(!is_whatsapp_media_upload_host("web.whatsapp.com"));
     }
 }

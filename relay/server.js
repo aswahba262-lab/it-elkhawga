@@ -1,8 +1,19 @@
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
+import { createWhatsAppBot } from './whatsapp-bot.js';
+import { createDahuaCctvManager } from './dahua-cctv.js';
+
+const lanKeepAliveAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 32,
+  keepAliveMsecs: 15000,
+});
 
 const PORT = Number(process.env.PORT || 8787);
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
@@ -75,6 +86,7 @@ try { db.exec("ALTER TABLE devices ADD COLUMN last_event_at INTEGER DEFAULT 0");
 try { db.exec("ALTER TABLE devices ADD COLUMN throttle_kbps INTEGER DEFAULT 0"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN sites TEXT DEFAULT '[]'"); } catch (e) { /* already exists */ }
 try { db.exec("ALTER TABLE devices ADD COLUMN denied TEXT DEFAULT '[]'"); } catch (e) { /* already exists */ }
+try { db.exec("ALTER TABLE devices ADD COLUMN usb_blocked INTEGER DEFAULT 0"); } catch (e) { /* already exists */ }
 try { db.exec("CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, device_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL, meta TEXT DEFAULT '{}', created_at INTEGER NOT NULL, acked_at INTEGER, acked_by TEXT)"); } catch (e) {}
 try { db.exec("CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, result TEXT, meta TEXT DEFAULT '{}', created_at INTEGER NOT NULL)"); } catch (e) {}
 try { db.exec("CREATE TABLE IF NOT EXISTS admin_users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'admin', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"); } catch (e) {}
@@ -92,9 +104,44 @@ for (const colSql of [
 }
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
-const ARCHIVE_ROOT = path.resolve(process.env.ARCHIVE_DIR || 'C:/IT-ELKHAWGA-Archive');
-for (const sub of ['WhatsApp', 'Web-Uploads']) {
-  try { fs.mkdirSync(path.join(ARCHIVE_ROOT, sub), { recursive: true }); } catch (e) {}
+const DEFAULT_ARCHIVE_ROOT = path.resolve(process.env.ARCHIVE_DIR || 'C:/IT-ELKHAWGA-Archive');
+
+function getArchiveRoot() {
+  try {
+    const cfgPath = 'C:/ProgramData/InternetBlocker/config.json';
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, '')) || {};
+      let custom = String(cfg.archive_dir || '').trim().replace(/^"+|"+$/g, '');
+      if (custom) {
+        if (/^[A-Za-z]:\\?$/.test(custom)) {
+          custom = custom.replace(/\\?$/, '\\IT-ELKHAWGA-Archive');
+        }
+        const resolved = path.resolve(custom);
+        fs.mkdirSync(path.join(resolved, 'WhatsApp'), { recursive: true });
+        fs.mkdirSync(path.join(resolved, 'Web-Uploads'), { recursive: true });
+        return resolved;
+      }
+    }
+  } catch (_) {}
+  for (const sub of ['WhatsApp', 'Web-Uploads']) {
+    try { fs.mkdirSync(path.join(DEFAULT_ARCHIVE_ROOT, sub), { recursive: true }); } catch (_) {}
+  }
+  return DEFAULT_ARCHIVE_ROOT;
+}
+getArchiveRoot();
+
+function getDiskSpaceBytes(dirPath) {
+  try {
+    if (typeof fs.statfsSync === 'function') {
+      const st = fs.statfsSync(dirPath);
+      const bsize = Number(st.bsize || st.frsize || 4096);
+      return {
+        free: Number(st.bavail || st.bfree || 0) * bsize,
+        total: Number(st.blocks || 0) * bsize,
+      };
+    }
+  } catch (_) {}
+  return { free: 0, total: 0 };
 }
 
 function sanitizeWinSegment(raw, fallback, maxLen = 70) {
@@ -108,13 +155,14 @@ function sanitizeWinSegment(raw, fallback, maxLen = 70) {
 }
 
 function buildArchiveFilePath({ channel, deviceName, recipientName, recipientPhone, origName, tsMs }) {
+  const archiveRoot = getArchiveRoot();
   const d = new Date(tsMs || Date.now());
   const pad2 = (n) => String(n).padStart(2, '0');
   const dayStr = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
   const timeStr = `${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`;
   const chanDir = String(channel || '').includes('whatsapp') ? 'WhatsApp' : 'Web-Uploads';
   const devDir = sanitizeWinSegment(deviceName, 'Unknown-Device', 60);
-  const dir = path.join(ARCHIVE_ROOT, chanDir, dayStr, devDir);
+  const dir = path.join(archiveRoot, chanDir, dayStr, devDir);
   fs.mkdirSync(dir, { recursive: true });
 
   const recipRaw = recipientPhone || recipientName || '';
@@ -134,23 +182,39 @@ function buildArchiveFilePath({ channel, deviceName, recipientName, recipientPho
 
 function appendArchiveLog(entry) {
   try {
-    fs.mkdirSync(ARCHIVE_ROOT, { recursive: true });
-    fs.appendFileSync(path.join(ARCHIVE_ROOT, 'archive-log.jsonl'), JSON.stringify(entry) + '\n', 'utf8');
+    const archiveRoot = getArchiveRoot();
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    fs.appendFileSync(path.join(archiveRoot, 'archive-log.jsonl'), JSON.stringify(entry) + '\n', 'utf8');
   } catch (e) {}
 }
 
 function readArchiveLogEntries() {
   const out = [];
-  try {
-    const p = path.join(ARCHIVE_ROOT, 'archive-log.jsonl');
-    if (!fs.existsSync(p)) return out;
-    const raw = fs.readFileSync(p, 'utf8');
-    for (const line of raw.split(/\r?\n/)) {
-      const t = line.trim();
-      if (!t) continue;
-      try { out.push(JSON.parse(t)); } catch (_) {}
-    }
-  } catch (_) {}
+  const seen = new Set();
+  const curRoot = getArchiveRoot();
+  const roots = [curRoot];
+  if (curRoot.toLowerCase() !== DEFAULT_ARCHIVE_ROOT.toLowerCase()) {
+    roots.push(DEFAULT_ARCHIVE_ROOT);
+  }
+  for (const r of roots) {
+    try {
+      const p = path.join(r, 'archive-log.jsonl');
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, 'utf8');
+      for (const line of raw.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const parsed = JSON.parse(t);
+          const fid = String((parsed && parsed.file_id) || '');
+          if (!fid || !seen.has(fid)) {
+            if (fid) seen.add(fid);
+            out.push(parsed);
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
   return out;
 }
 
@@ -185,17 +249,275 @@ try { db.exec("ALTER TABLE screens ADD COLUMN error TEXT DEFAULT ''"); } catch (
 db.prepare("DELETE FROM pairing_tokens WHERE token='pair_it_elkhawga_forever'").run();
 db.prepare("UPDATE devices SET label='' WHERE label='permanent'").run();
 
+// Performance indexes + separate alert_media table so listing/counting alerts never scans multi-MB base64 blobs
+db.exec(`
+  CREATE TABLE IF NOT EXISTS alert_media (
+    alert_id TEXT PRIMARY KEY,
+    screenshot TEXT DEFAULT '',
+    camera_photo TEXT DEFAULT '',
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_alerts_unacked ON alerts(acked_at, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_alerts_type_created ON alerts(type, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_alert_media_created ON alert_media(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_commands_dev_pending ON commands(device_id, acked_at, created_at);
+  CREATE INDEX IF NOT EXISTS idx_devices_token_hash ON devices(device_token_hash);
+  CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen DESC);
+  CREATE INDEX IF NOT EXISTS idx_devices_group ON devices(group_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_uploads_created ON uploaded_files(created_at DESC);
+`);
+
+function migrateHeavyAlertBlobsAndPrune() {
+  try {
+    const selIds = db.prepare('SELECT id, created_at FROM alerts WHERE length(meta) > 4096 LIMIT 25');
+    const selOne = db.prepare('SELECT meta FROM alerts WHERE id=?');
+    const insMedia = db.prepare('INSERT OR REPLACE INTO alert_media(alert_id, screenshot, camera_photo, created_at) VALUES(?,?,?,?)');
+    const updMeta = db.prepare('UPDATE alerts SET meta=? WHERE id=?');
+
+    let totalMigrated = 0;
+    while (true) {
+      const batch = selIds.all();
+      if (!batch.length) break;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const item of batch) {
+          const row = selOne.get(item.id);
+          if (!row || typeof row.meta !== 'string') {
+            updMeta.run('{}', item.id);
+            continue;
+          }
+          let obj = null;
+          try { obj = JSON.parse(row.meta); } catch (_) { obj = null; }
+          if (!obj || typeof obj !== 'object') {
+            updMeta.run(row.meta.slice(0, 2048), item.id);
+            continue;
+          }
+          const scr = typeof obj.screenshot === 'string' ? obj.screenshot : '';
+          const cam = typeof obj.camera_photo === 'string' ? obj.camera_photo : '';
+          if (scr || cam) {
+            insMedia.run(item.id, scr, cam, Number(item.created_at || Date.now()));
+            if (scr) { obj.has_screenshot = true; delete obj.screenshot; }
+            if (cam) { obj.has_camera_photo = true; delete obj.camera_photo; }
+          }
+          updMeta.run(JSON.stringify(obj), item.id);
+          totalMigrated++;
+        }
+        db.exec('COMMIT');
+      } catch (innerErr) {
+        try { db.exec('ROLLBACK'); } catch (_) {}
+        break;
+      }
+    }
+    // Prune stale acked commands (> 3 days) and cap alert_media to latest 400 snapshots
+    const threeDaysAgo = Date.now() - 3 * 24 * 3600 * 1000;
+    db.prepare('DELETE FROM commands WHERE acked_at IS NOT NULL AND created_at < ?').run(threeDaysAgo);
+    db.prepare(`DELETE FROM alert_media WHERE alert_id NOT IN (
+      SELECT alert_id FROM alert_media ORDER BY created_at DESC LIMIT 400
+    )`).run();
+    db.prepare(`DELETE FROM audit_log WHERE id NOT IN (
+      SELECT id FROM audit_log ORDER BY created_at DESC LIMIT 4000
+    )`).run();
+    try { db.exec('PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);'); } catch (_) {}
+    if (totalMigrated > 0) {
+      console.log(`Migrated ${totalMigrated} heavy alert media blobs out of alerts table for instant queries.`);
+    }
+  } catch (e) {
+    console.warn('Alert DB optimization warning:', e && e.message);
+  }
+}
+migrateHeavyAlertBlobsAndPrune();
+setInterval(migrateHeavyAlertBlobsAndPrune, 30 * 60 * 1000);
+
+function compactDatabaseIfNeeded() {
+  try {
+    const fc = db.prepare('PRAGMA freelist_count').get();
+    const pc = db.prepare('PRAGMA page_count').get();
+    const freePages = Number((fc && fc.freelist_count) || 0);
+    const totalPages = Number((pc && pc.page_count) || 0);
+    if (freePages > 5000 && totalPages > 0 && (freePages / totalPages) > 0.05) {
+      console.log(`Compacting relay.db (${freePages}/${totalPages} free pages)...`);
+      const t0 = Date.now();
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
+      console.log(`relay.db compacted successfully in ${Date.now() - t0}ms.`);
+    }
+  } catch (e) {
+    console.warn('relay.db VACUUM warning:', e && e.message);
+  }
+}
+compactDatabaseIfNeeded();
+
+const cctv = createDahuaCctvManager({ db });
+const waBot = createWhatsAppBot({ db, dataDir: DATA_DIR, getArchiveRoot, cctv });
+
+function storeAlertWithSeparatedMedia({ id, deviceId, type, severity, message, rawMeta, createdAt, ignoreExisting }) {
+  let obj = {};
+  if (rawMeta && typeof rawMeta === 'object') {
+    obj = { ...rawMeta };
+  } else if (typeof rawMeta === 'string' && rawMeta.trim().startsWith('{')) {
+    try { obj = JSON.parse(rawMeta); } catch (_) { obj = {}; }
+  }
+  const scr = typeof obj.screenshot === 'string' ? obj.screenshot : '';
+  const cam = typeof obj.camera_photo === 'string' ? obj.camera_photo : '';
+  if (scr) { obj.has_screenshot = true; delete obj.screenshot; }
+  if (cam) { obj.has_camera_photo = true; delete obj.camera_photo; }
+  const ts = Number(createdAt) > 0 ? Number(createdAt) : Date.now();
+  const sql = ignoreExisting
+    ? 'INSERT OR IGNORE INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)'
+    : 'INSERT INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)';
+  const info = db.prepare(sql).run(id, deviceId, type, severity, message, JSON.stringify(obj), ts);
+  const insertedNew = !ignoreExisting || info.changes > 0;
+  if ((scr || cam) && insertedNew) {
+    db.prepare('INSERT OR REPLACE INTO alert_media(alert_id, screenshot, camera_photo, created_at) VALUES(?,?,?,?)')
+      .run(id, scr, cam, ts);
+  }
+  if (insertedNew) {
+    waBot.onAlert({
+      id,
+      deviceId,
+      type,
+      severity,
+      message,
+      metaObj: obj,
+      screenshotB64: scr,
+    }).catch(() => {});
+  }
+  return obj;
+}
+
 function now() { return Date.now(); }
 function rid(prefix='') { return prefix + crypto.randomUUID().replace(/-/g,''); }
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
+
+function hashAdminPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const dk = crypto.pbkdf2Sync(Buffer.from(String(pw), 'utf8'), salt, 100000, 32, 'sha256');
+  return `pbkdf2$100000$${salt.toString('hex')}$${dk.toString('hex')}`;
+}
+
+function verifyPasswordHash(supplied, stored) {
+  const s = String(stored || '').trim();
+  if (!s) return true;
+  if (s.startsWith('pbkdf2$')) {
+    const parts = s.split('$');
+    if (parts.length !== 4) return false;
+    const iters = parseInt(parts[1], 10);
+    if (!iters || iters < 10000 || iters > 1000000) return false;
+    try {
+      const salt = Buffer.from(parts[2], 'hex');
+      const expected = Buffer.from(parts[3], 'hex');
+      const actual = crypto.pbkdf2Sync(Buffer.from(String(supplied), 'utf8'), salt, iters, expected.length, 'sha256');
+      return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+    } catch (_) {
+      return false;
+    }
+  }
+  const cand = Buffer.from(sha256(String(supplied)), 'utf8');
+  const exp = Buffer.from(s, 'utf8');
+  return cand.length === exp.length && crypto.timingSafeEqual(cand, exp);
+}
+
+function readLocalHostConfig() {
+  try {
+    const p = 'C:/ProgramData/InternetBlocker/config.json';
+    if (!fs.existsSync(p)) return {};
+    const raw = fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '');
+    return JSON.parse(raw) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function verifyAdminJwtToken(rawTok) {
+  const tok = String(rawTok || '').trim();
+  if (!tok) return null;
+  const parts = tok.split('.');
+  if (parts.length !== 3) return null;
+  const cfg = readLocalHostConfig();
+  const secret = (process.env.AGY_JWT_SECRET && process.env.AGY_JWT_SECRET.trim())
+    ? process.env.AGY_JWT_SECRET.trim()
+    : (cfg.api_token && String(cfg.api_token).trim())
+      ? `ibp-jwt-${String(cfg.api_token).trim()}`
+      : 'it-elkhawga-default-jwt-secret-key';
+  const expectedSig = crypto
+    .createHmac('sha256', secret)
+    .update(`${parts[0]}.${parts[1]}`)
+    .digest('base64url');
+  const sigA = Buffer.from(parts[2], 'utf8');
+  const sigB = Buffer.from(expectedSig, 'utf8');
+  if (sigA.length !== sigB.length || !crypto.timingSafeEqual(sigA, sigB)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!payload || !payload.sub || (payload.exp && payload.exp <= nowSec)) return null;
+    return { claims: payload, dlpSuperOnly: Boolean(cfg.dlp_super_only) };
+  } catch (_) {
+    return null;
+  }
+}
+
+const loginRateBuckets = new Map();
+function checkRelayLoginLockout(key) {
+  const b = loginRateBuckets.get(key);
+  if (!b) return 0;
+  const t = now();
+  if (b.lockedUntil > t) return Math.ceil((b.lockedUntil - t) / 1000);
+  if (t - b.firstFail > 600_000) loginRateBuckets.delete(key);
+  return 0;
+}
+function recordRelayLoginAttempt(key, username, ip, ok) {
+  if (ok) {
+    loginRateBuckets.delete(key);
+    return false;
+  }
+  const t = now();
+  let b = loginRateBuckets.get(key);
+  if (!b || (t - b.firstFail > 600_000)) {
+    b = { fails: 0, firstFail: t, lockedUntil: 0 };
+    loginRateBuckets.set(key, b);
+  }
+  b.fails += 1;
+  if (b.fails >= 5) {
+    b.lockedUntil = t + 600_000;
+    try {
+      const msg = `تحذير أمني: حظر مؤقت بعد 5 محاولات دخول فاشلة لحساب المدير (${username}) من العنوان ${ip || 'بعيد'}`;
+      db.prepare('INSERT INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)')
+        .run(rid('alt_'), 'admin_portal', 'auth_fail', 'high', msg, JSON.stringify({ ip, username }), t);
+    } catch (_) {}
+    return true;
+  }
+  return false;
+}
+
 function json(res, status, body) {
-  const raw = JSON.stringify(body);
-  res.writeHead(status, {
+  if (status === 204) {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': CORS_ORIGIN,
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+    });
+    return res.end();
+  }
+  const raw = Buffer.from(JSON.stringify(body), 'utf8');
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Vary': 'Accept-Encoding',
     'Access-Control-Allow-Origin': CORS_ORIGIN,
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
     'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
-  });
+  };
+  if (res.__acceptGzip && raw.length >= 1024) {
+    const gz = zlib.gzipSync(raw, { level: zlib.constants.Z_BEST_SPEED });
+    headers['Content-Encoding'] = 'gzip';
+    headers['Content-Length'] = gz.length;
+    res.writeHead(status, headers);
+    return res.end(gz);
+  }
+  headers['Content-Length'] = raw.length;
+  res.writeHead(status, headers);
   res.end(raw);
 }
 async function readBody(req, limit=6*1024*1024) {
@@ -235,21 +557,31 @@ function getPolicy() {
 function getGroupPolicy(groupId) {
   if (!groupId) return null;
   const row = db.prepare('SELECT version,data FROM group_policy WHERE group_id=?').get(groupId);
-  return row ? { version: row.version, ...(JSON.parse(row.data)) } : null;
+  if (!row) return null;
+  const gData = JSON.parse(row.data);
+  const globalPol = getPolicy() || {};
+  return {
+    ...globalPol,
+    ...gData,
+    usb_block: Boolean(gData.usb_block || globalPol.usb_block),
+    version: row.version,
+  };
 }
 function groupList() {
   const rows = db.prepare('SELECT id,name,created_at FROM groups ORDER BY created_at ASC').all();
   return rows.map(g => {
-    const pol = getGroupPolicy(g.id) || { version: '', mode: 'whitelist', allowed: [], blocked: [] };
+    const rawRow = db.prepare('SELECT version,data FROM group_policy WHERE group_id=?').get(g.id);
+    const pol = rawRow ? { version: rawRow.version, ...(JSON.parse(rawRow.data)) } : { version: '', mode: 'whitelist', allowed: [], blocked: [] };
     const count = db.prepare('SELECT COUNT(*) AS n FROM devices WHERE group_id=?').get(g.id).n;
     return { id: g.id, name: g.name, created_at: g.created_at, devices: count,
       version: pol.version, mode: pol.mode, allowed: pol.allowed || [], blocked: pol.blocked || [],
-      ephemeral_browser: !!pol.ephemeral_browser };
+      ephemeral_browser: !!pol.ephemeral_browser, usb_block: !!pol.usb_block };
   });
 }
 
 const server = http.createServer(async (req, res) => {
   try {
+    res.__acceptGzip = /\bgzip\b/i.test(String(req.headers['accept-encoding'] || '')) && req.method !== 'HEAD';
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (req.method === 'OPTIONS') return json(res, 204, {});
     // Health
@@ -277,9 +609,59 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Download archived uploaded file copy (DLP evidence)
+    // Authenticated Admin self-update metadata & NSIS installer download
+    if (req.method === 'GET' && (url.pathname === '/api/v1/admin/update-info' || url.pathname === '/api/v1/admin/admin-setup.exe')) {
+      if (!requireAdmin(req, res)) return;
+      const adminCandidates = [
+        path.join(process.cwd(), '..', 'final-release', 'IT ELKHAWGA Admin_1.0.0_x64-setup.exe'),
+        path.join(process.cwd(), 'final-release', 'IT ELKHAWGA Admin_1.0.0_x64-setup.exe'),
+        'C:/Users/IT APP/Desktop/blockwebsite/final-release/IT ELKHAWGA Admin_1.0.0_x64-setup.exe',
+        'C:/Users/IT APP/Desktop/tools/IT ELKHAWGA Admin_1.0.0_x64-setup.exe',
+      ];
+      const foundAdmin = adminCandidates.find((p) => {
+        try { return fs.existsSync(p) && fs.statSync(p).size > 500000; } catch (_) { return false; }
+      });
+      if (!foundAdmin) return json(res, 404, { ok: false, error: 'admin installer not found on relay' });
+      const st = fs.statSync(foundAdmin);
+      if (url.pathname === '/api/v1/admin/update-info') {
+        const cacheKey = `${foundAdmin}|${st.size}|${Math.floor(st.mtimeMs)}`;
+        if (!globalThis.__adminSetupHashCache || globalThis.__adminSetupHashCache.key !== cacheKey) {
+          const digest = crypto.createHash('sha256').update(fs.readFileSync(foundAdmin)).digest('hex');
+          globalThis.__adminSetupHashCache = { key: cacheKey, sha256: digest };
+        }
+        return json(res, 200, {
+          ok: true,
+          available: true,
+          size: st.size,
+          mtime_ms: Math.floor(st.mtimeMs),
+          sha256: globalThis.__adminSetupHashCache.sha256,
+          version: '1.0.0',
+        });
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': st.size,
+        'Content-Disposition': 'attachment; filename="it-elkhawga-admin-setup.exe"',
+        'Access-Control-Allow-Origin': CORS_ORIGIN,
+      });
+      fs.createReadStream(foundAdmin).pipe(res);
+      return;
+    }
+
+    // Download archived uploaded file copy (DLP evidence) — strictly authenticated (ADMIN_KEY or Admin JWT)
     const uploadDlMatch = url.pathname.match(/^\/api(?:\/v1)?\/uploads\/([^/]+)$/);
     if (req.method === 'GET' && uploadDlMatch) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'يرجى تسجيل الدخول بحساب المدير لتحميل الملفات المؤرشفة' });
+      }
+      if (jwtVerified && jwtVerified.dlpSuperOnly && String(jwtVerified.claims.role || '').toLowerCase() !== 'super') {
+        return json(res, 403, { ok: false, error: 'تم حصر تحميل ملفات الأرشيف الحساسة بحساب السوبر أدمن فقط' });
+      }
       const fid = decodeURIComponent(uploadDlMatch[1]).replace(/[^A-Za-z0-9_-]/g, '');
       if (!fid) return json(res, 400, { ok: false, error: 'invalid file_id' });
       const row = db.prepare('SELECT file_name, stored_path FROM uploaded_files WHERE file_id=?').get(fid);
@@ -318,14 +700,116 @@ const server = http.createServer(async (req, res) => {
         : lowerExt.endsWith('.gif') ? 'image/gif'
         : lowerExt.endsWith('.pdf') ? 'application/pdf'
         : 'application/octet-stream';
-      res.writeHead(200, {
+      const dispKind = url.searchParams.get('inline') === '1' ? 'inline' : 'attachment';
+      const dlHeaders = {
         'Content-Type': mime,
         'Content-Length': stat.size,
-        'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+        'Content-Disposition': `${dispKind}; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
         'Access-Control-Allow-Origin': CORS_ORIGIN,
         'Access-Control-Expose-Headers': 'Content-Disposition, Content-Length',
-      });
+      };
+      if (dispKind === 'inline') {
+        dlHeaders['Cache-Control'] = 'private, max-age=86400';
+      }
+      res.writeHead(200, dlHeaders);
       fs.createReadStream(filePath).pipe(res);
+      return;
+    }
+
+    // Proxy authenticated ERP backup file downloads (/api/erp-backups/download/:name or /api/v1/erp-backups/download/:name -> 127.0.0.1:8787)
+    if (req.method === 'GET' && (url.pathname.startsWith('/api/v1/erp-backups/download/') || url.pathname.startsWith('/api/erp-backups/download/'))) {
+      const authCtx = checkUploadDownloadAuth(req, url);
+      if (!authCtx.ok) {
+        return json(res, authCtx.code || 401, { ok: false, error: authCtx.error || 'unauthorized' });
+      }
+      const cfg = readLocalHostConfig();
+      const apiToken = String(cfg.api_token || '').trim();
+      const lanPort = Number(cfg.server_port || 8787) || 8787;
+      const dlReq = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: lanPort,
+          path: url.pathname,
+          method: 'GET',
+          headers: { authorization: `Bearer ${apiToken}` },
+          agent: lanKeepAliveAgent,
+          timeout: 120000,
+        },
+        (dlRes) => {
+          res.writeHead(dlRes.statusCode || 200, {
+            'Content-Type': dlRes.headers['content-type'] || 'application/octet-stream',
+            'Content-Disposition': dlRes.headers['content-disposition'] || 'attachment',
+            'X-Content-Type-Options': 'nosniff',
+            'Access-Control-Allow-Origin': CORS_ORIGIN,
+          });
+          dlRes.pipe(res);
+        }
+      );
+      dlReq.on('error', () => {
+        if (!res.headersSent) json(res, 502, { ok: false, error: 'تعذر تحميل ملف النسخة من السيرفر الرئيسي' });
+      });
+      dlReq.end();
+      return;
+    }
+
+    // Proxy LAN Admin Server endpoints (/api/v1/admin/lan-proxy/* -> http://127.0.0.1:8787/api/admin/*)
+    // so remote IT Engineers outside the company can see and manage company LAN devices & server backups!
+    if (url.pathname.startsWith('/api/v1/admin/lan-proxy/')) {
+      if (!requireAdmin(req, res)) return;
+      const cfg = readLocalHostConfig();
+      const apiToken = String(cfg.api_token || '').trim();
+      const lanPort = Number(cfg.server_port || 8787) || 8787;
+      if (!apiToken) {
+        return json(res, 503, { ok: false, error: 'local LAN server token not initialized' });
+      }
+      const subPath = url.pathname.slice('/api/v1/admin/lan-proxy/'.length);
+      const targetPath = '/api/admin/' + subPath + (url.search || '');
+      const fwdHeaders = {
+        host: `127.0.0.1:${lanPort}`,
+        authorization: `Bearer ${apiToken}`,
+      };
+      if (req.headers['content-type']) fwdHeaders['content-type'] = req.headers['content-type'];
+      if (req.headers['content-length']) fwdHeaders['content-length'] = req.headers['content-length'];
+      const proxyReq = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: lanPort,
+          path: targetPath,
+          method: req.method,
+          headers: fwdHeaders,
+          agent: lanKeepAliveAgent,
+          timeout: 15000,
+        },
+        (proxyRes) => {
+          let chunks = [];
+          proxyRes.on('data', (c) => chunks.push(c));
+          proxyRes.on('end', () => {
+            const rawBuf = Buffer.concat(chunks);
+            const outHeaders = {
+              'Content-Type': proxyRes.headers['content-type'] || 'application/json; charset=utf-8',
+              'X-Content-Type-Options': 'nosniff',
+              'Vary': 'Accept-Encoding',
+              'Access-Control-Allow-Origin': CORS_ORIGIN,
+            };
+            if (res.__acceptGzip && rawBuf.length >= 1024 && !proxyRes.headers['content-encoding']) {
+              const gz = zlib.gzipSync(rawBuf, { level: zlib.constants.Z_BEST_SPEED });
+              outHeaders['Content-Encoding'] = 'gzip';
+              outHeaders['Content-Length'] = gz.length;
+              res.writeHead(proxyRes.statusCode || 200, outHeaders);
+              return res.end(gz);
+            }
+            outHeaders['Content-Length'] = rawBuf.length;
+            res.writeHead(proxyRes.statusCode || 200, outHeaders);
+            res.end(rawBuf);
+          });
+        }
+      );
+      proxyReq.on('error', () => {
+        if (!res.headersSent) json(res, 502, { ok: false, error: 'تعذر الاتصال بالسيرفر المحلي 8787' });
+      });
+      req.pipe(proxyReq);
       return;
     }
 
@@ -362,7 +846,7 @@ const server = http.createServer(async (req, res) => {
       const rawHash = String(body.password_hash || '').trim();
       const role = String(body.role || 'admin').trim() || 'admin';
       if (!username) return json(res, 400, { ok: false, error: 'username required' });
-      const key = rawHash || (password ? sha256(password) : '');
+      const key = rawHash || (password ? hashAdminPassword(password) : '');
       const nowTs = now();
       db.prepare(`INSERT INTO admin_users(username,password_hash,role,created_at,updated_at)
         VALUES(?,?,?,?,?)
@@ -387,15 +871,68 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const username = String(body.username || '').trim();
       const password = String(body.password || '');
+      const clientIp = String(body.client_ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
       if (!username) return json(res, 401, { ok: false, error: 'missing username' });
+      const rateKey = `${clientIp}|${username.toLowerCase()}`;
+      const waitSec = checkRelayLoginLockout(rateKey);
+      if (waitSec > 0) {
+        return json(res, 429, { ok: false, error: `تم حظر المحاولات مؤقتاً لحماية الحساب. حاول بعد ${Math.max(1, Math.ceil(waitSec / 60))} دقيقة` });
+      }
       const row = db.prepare('SELECT username, role, password_hash FROM admin_users WHERE lower(username)=lower(?)').get(username);
-      if (!row) return json(res, 401, { ok: false, error: 'invalid credentials' });
-      const ok = row.password_hash === sha256(password);
-      if (!ok) return json(res, 401, { ok: false, error: 'invalid credentials' });
+      if (!row) {
+        recordRelayLoginAttempt(rateKey, username, clientIp, false);
+        return json(res, 401, { ok: false, error: 'invalid credentials' });
+      }
+      const ok = verifyPasswordHash(password, row.password_hash);
+      if (!ok) {
+        recordRelayLoginAttempt(rateKey, username, clientIp, false);
+        return json(res, 401, { ok: false, error: 'invalid credentials' });
+      }
+      recordRelayLoginAttempt(rateKey, username, clientIp, true);
+      if (password && row.password_hash && !String(row.password_hash).startsWith('pbkdf2$')) {
+        try {
+          db.prepare('UPDATE admin_users SET password_hash=?, updated_at=? WHERE lower(username)=lower(?)')
+            .run(hashAdminPassword(password), now(), username);
+        } catch (_) {}
+      }
       return json(res, 200, { ok: true, success: true, username: row.username, role: row.role, is_super_admin: row.role === 'super' });
     }
 
     // ----- Dashboard KPIs -----
+    if (req.method === 'GET' && url.pathname === '/api/v1/admin/rustdesk-oss') {
+      if (!requireAdmin(req, res)) return;
+      const rdDir = 'C:/ProgramData/IT-ELKHAWGA-RustDeskServer';
+      const hbbsExists = fs.existsSync(path.join(rdDir, 'hbbs.exe')) && fs.existsSync(path.join(rdDir, 'hbbr.exe'));
+      const pubFile = path.join(rdDir, 'id_ed25519.pub');
+      let publicKey = '';
+      try { if (fs.existsSync(pubFile)) publicKey = fs.readFileSync(pubFile, 'utf8').trim(); } catch (_) {}
+      let lanIp = '';
+      try {
+        const nets = os.networkInterfaces();
+        const allv4 = [];
+        for (const list of Object.values(nets)) {
+          for (const net of (list || [])) {
+            if ((net.family === 'IPv4' || net.family === 4) && !net.internal && !String(net.address).startsWith('169.254.')) {
+              allv4.push(String(net.address));
+            }
+          }
+        }
+        lanIp = allv4.find((ip) => /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip))
+          || allv4.find((ip) => !ip.startsWith('100.'))
+          || allv4[0]
+          || '';
+      } catch (_) {}
+      const pol = getPolicy() || {};
+      return json(res, 200, {
+        ok: true,
+        installed: hbbsExists,
+        lan_ip: lanIp,
+        lan_host: lanIp ? `${lanIp}:21116` : '',
+        public_key: publicKey,
+        active_server: pol.rustdesk_server || '',
+        active_key: pol.rustdesk_key || '',
+      });
+    }
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/stats') {
       if (!requireAdmin(req,res)) return;
       const totalUsers = db.prepare('SELECT COUNT(*) AS n FROM devices').get().n;
@@ -413,6 +950,207 @@ const server = http.createServer(async (req, res) => {
           engagement: { value: engagement, growth: 4.4 }
         }
       });
+    }
+
+    // ----- Dahua CCTV Live Center -----
+    if ((req.method === 'GET' || req.method === 'HEAD') && (url.pathname === '/api/cctv/frame' || url.pathname === '/api/v1/cctv/frame')) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const cctvCfg = cctv.getSettings();
+      if (jwtVerified && cctvCfg.super_only && String(jwtVerified.claims.role || '').toLowerCase() !== 'super') {
+        return json(res, 403, { ok: false, error: 'تم حصر مشاهدة الكاميرات بحساب السوبر أدمن فقط' });
+      }
+      const dvrId = String(url.searchParams.get('dvr_id') || '').trim();
+      const channel = Math.max(1, Math.min(64, Number(url.searchParams.get('channel') || 1) || 1));
+      const hd = url.searchParams.get('hd') === '1';
+      try {
+        const frame = await cctv.getFrame({ dvrId, channel, hd, waitMs: 9000 });
+        res.writeHead(200, {
+          'Content-Type': frame.mime || 'image/jpeg',
+          'Content-Length': frame.buf.length,
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+          'Access-Control-Allow-Origin': CORS_ORIGIN,
+          'X-Frame-At': String(frame.at || Date.now()),
+        });
+        if (req.method === 'HEAD') return res.end();
+        return res.end(frame.buf);
+      } catch (e) {
+        return json(res, 502, { ok: false, error: (e && e.message) || 'تعذر جلب إطار الكاميرا' });
+      }
+    }
+    if (req.method === 'GET' && (url.pathname === '/api/cctv/clip' || url.pathname === '/api/v1/cctv/clip')) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const cctvCfg = cctv.getSettings();
+      if (jwtVerified && cctvCfg.super_only && String(jwtVerified.claims.role || '').toLowerCase() !== 'super') {
+        return json(res, 403, { ok: false, error: 'تم حصر الكاميرات بحساب السوبر أدمن فقط' });
+      }
+      try {
+        const clip = await cctv.downloadRecordingClip({
+          dvrId: String(url.searchParams.get('dvr_id') || '').trim(),
+          channel: Number(url.searchParams.get('channel') || 1),
+          startTime: String(url.searchParams.get('start_time') || ''),
+          endTime: String(url.searchParams.get('end_time') || ''),
+        });
+        res.writeHead(200, {
+          'Content-Type': clip.mime,
+          'Content-Length': clip.buf.length,
+          'Content-Disposition': `attachment; filename="${clip.fileName.replace(/[^\x20-\x7E]/g, '_')}"`,
+          'Access-Control-Allow-Origin': CORS_ORIGIN,
+        });
+        return res.end(clip.buf);
+      } catch (e) {
+        return json(res, 502, { ok: false, error: (e && e.message) || 'تعذر تحميل المقطع المسجل' });
+      }
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/admin/cctv/list') {
+      if (!requireAdmin(req, res)) return;
+      return json(res, 200, cctv.listDvrs({
+        actor: url.searchParams.get('actor') || '',
+        role: url.searchParams.get('role') || 'super',
+      }));
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/action') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const out = await cctv.handleAction({
+          action: body.action,
+          payload: body.payload || {},
+          actor: body.actor || '',
+          role: body.role || 'super',
+        });
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 200, { ok: false, error: (e && e.message) || 'تعذر تنفيذ إجراء الكاميرا' });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/save') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const out = cctv.saveDvr(body);
+        audit('admin', 'cctv_save', body.name || body.host || 'dvr', 'ok', {});
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 200, { ok: false, error: (e && e.message) || 'فشل حفظ جهاز الـ DVR' });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/delete') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      const out = cctv.deleteDvr(body.id);
+      audit('admin', 'cctv_delete', String(body.id || ''), 'ok', {});
+      return json(res, 200, out);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/settings') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      const st = cctv.setSettings({ super_only: Boolean(body.super_only) });
+      return json(res, 200, { ok: true, settings: st });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/test') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const out = await cctv.testDvrConnection(body);
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 200, { ok: false, error: (e && e.message) || 'تعذر الاتصال بجهاز الـ DVR' });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/scan') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const bridgeId = String(body.bridge_device_id || '').trim();
+        const out = bridgeId ? await cctv.scanBranchForDahua(bridgeId) : await cctv.scanLocalLanForDahua();
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 200, { ok: false, error: (e && e.message) || 'فشل البحث على الشبكة' });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/cctv/frame-b64') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const frame = await cctv.getFrame({
+          dvrId: body.dvr_id,
+          channel: Number(body.channel || 1),
+          hd: Boolean(body.hd),
+          waitMs: 9000,
+        });
+        return json(res, 200, {
+          ok: true,
+          mime: frame.mime || 'image/jpeg',
+          at: frame.at,
+          image: frame.buf.toString('base64'),
+        });
+      } catch (e) {
+        return json(res, 502, { ok: false, error: (e && e.message) || 'تعذر جلب إطار الكاميرا' });
+      }
+    }
+
+    // ----- WhatsApp Bot Center -----
+    if (req.method === 'GET' && url.pathname === '/api/v1/admin/wa-bot/status') {
+      if (!requireAdmin(req, res)) return;
+      return json(res, 200, waBot.getStatus());
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/wa-bot/config') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      const st = waBot.saveConfig(body);
+      audit('admin', 'wa_bot_config', 'wa_bot', 'ok', { enabled: st.config.enabled });
+      return json(res, 200, st);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/wa-bot/connect') {
+      if (!requireAdmin(req, res)) return;
+      const st = await waBot.connect();
+      audit('admin', 'wa_bot_connect', 'wa_bot', 'ok', {});
+      return json(res, 200, st);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/wa-bot/disconnect') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      const st = await waBot.disconnect({ logout: Boolean(body && body.logout) });
+      audit('admin', 'wa_bot_disconnect', 'wa_bot', 'ok', { logout: Boolean(body && body.logout) });
+      return json(res, 200, st);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/wa-bot/test') {
+      if (!requireAdmin(req, res)) return;
+      try {
+        const out = await waBot.sendTestMessage();
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 400, { ok: false, error: (e && e.message) || 'فشل إرسال الرسالة التجريبية' });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/wa-bot/event') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      if (body && body.kind === 'erp_backup') {
+        waBot.onErpBackupEvent({
+          ok: Boolean(body.ok),
+          fileName: String(body.file_name || ''),
+          sizeBytes: Number(body.size_bytes || 0),
+          formatLabel: String(body.format_label || ''),
+          error: String(body.error || ''),
+          reason: String(body.reason || ''),
+        }).catch(() => {});
+      }
+      return json(res, 200, { ok: true });
     }
 
     // ----- Alerts (Phase 3) -----
@@ -451,6 +1189,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && alertDetailMatch) {
       if (!requireAdmin(req, res)) return;
       const id = decodeURIComponent(alertDetailMatch[1]);
+      const mediaRow = db.prepare('SELECT screenshot, camera_photo FROM alert_media WHERE alert_id=?').get(id);
+      if (mediaRow && (mediaRow.screenshot || mediaRow.camera_photo)) {
+        return json(res, 200, {
+          ok: true,
+          id,
+          screenshot: String(mediaRow.screenshot || ''),
+          camera_photo: String(mediaRow.camera_photo || ''),
+        });
+      }
       const row = db.prepare('SELECT id, meta FROM alerts WHERE id=?').get(id);
       if (!row) return json(res, 404, { ok: false, error: 'alert not found' });
       let metaObj = {};
@@ -484,11 +1231,34 @@ const server = http.createServer(async (req, res) => {
         metaObj.device_name = deviceName;
       }
       const createdAt = Number(body.created_at) > 0 ? Number(body.created_at) : now();
-      db.prepare('INSERT OR IGNORE INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)')
-        .run(id, deviceId, type, severity, message, JSON.stringify(metaObj), createdAt);
+      storeAlertWithSeparatedMedia({
+        id,
+        deviceId,
+        type,
+        severity,
+        message,
+        rawMeta: metaObj,
+        createdAt,
+        ignoreExisting: true,
+      });
       return json(res, 200, { ok: true, id });
     }
     const ackMatch = url.pathname.match(/^\/api\/v1\/admin\/alerts\/([^/]+)\/ack$/);
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/alerts/ack-all') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      const type = String((body && body.type) || '').trim();
+      let info;
+      if (type) {
+        info = db.prepare('UPDATE alerts SET acked_at=?, acked_by=? WHERE acked_at IS NULL AND type=?')
+          .run(now(), 'admin', type);
+      } else {
+        info = db.prepare('UPDATE alerts SET acked_at=?, acked_by=? WHERE acked_at IS NULL')
+          .run(now(), 'admin');
+      }
+      audit('admin', 'alerts_ack_all', type || 'all', 'ok', { count: info.changes });
+      return json(res, 200, { ok: true, count: info.changes });
+    }
     if (req.method === 'POST' && ackMatch) {
       if (!requireAdmin(req,res)) return;
       const id = decodeURIComponent(ackMatch[1]);
@@ -519,6 +1289,7 @@ const server = http.createServer(async (req, res) => {
           allowed: body.allowed||[],
           blocked: body.blocked||[],
           ephemeral_browser: !!body.ephemeral_browser,
+          usb_block: !!body.usb_block,
           rules: [],
         };
         db.prepare('INSERT INTO group_policy(group_id,version,data,updated_at) VALUES(?,?,?,?)')
@@ -538,13 +1309,15 @@ const server = http.createServer(async (req, res) => {
         if (typeof body.name === 'string' && body.name.trim()) {
           db.prepare('UPDATE groups SET name=? WHERE id=?').run(body.name.trim(), gid);
         }
-        if (body.mode !== undefined || body.allowed !== undefined || body.blocked !== undefined || body.ephemeral_browser !== undefined) {
-          const cur = getGroupPolicy(gid) || { mode:'whitelist', allowed:[], blocked:[], ephemeral_browser: false };
+        if (body.mode !== undefined || body.allowed !== undefined || body.blocked !== undefined || body.ephemeral_browser !== undefined || body.usb_block !== undefined) {
+          const rawRow = db.prepare('SELECT data FROM group_policy WHERE group_id=?').get(gid);
+          const cur = rawRow ? JSON.parse(rawRow.data) : { mode:'whitelist', allowed:[], blocked:[], ephemeral_browser: false, usb_block: false };
           const data = {
             mode: body.mode === undefined ? cur.mode : (body.mode === 'blacklist' ? 'blacklist' : 'whitelist'),
             allowed: body.allowed === undefined ? (cur.allowed||[]) : body.allowed,
             blocked: body.blocked === undefined ? (cur.blocked||[]) : body.blocked,
             ephemeral_browser: body.ephemeral_browser === undefined ? !!cur.ephemeral_browser : !!body.ephemeral_browser,
+            usb_block: body.usb_block === undefined ? !!cur.usb_block : !!body.usb_block,
             rules: [],
           };
           const ver = rid('gv_');
@@ -568,6 +1341,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const type = body.command === 'unblock' ? 'unblock'
         : body.command === 'block' ? 'block'
+        : body.command === 'usb_block' ? 'usb_block'
+        : body.command === 'usb_unblock' ? 'usb_unblock'
         : body.command === 'update_client' ? 'update_client'
         : null;
       if (!type) return json(res, 400, {ok:false,error:'invalid command'});
@@ -575,7 +1350,14 @@ const server = http.createServer(async (req, res) => {
       const targets = db.prepare('SELECT device_id FROM devices WHERE group_id=?').all(gid);
       const ins = db.prepare('INSERT INTO commands(id,device_id,type,created_at) VALUES(?,?,?,?)');
       const clear = db.prepare('DELETE FROM commands WHERE device_id=? AND acked_at IS NULL');
-      for (const t of targets) { clear.run(t.device_id); ins.run(rid('cmd_'), t.device_id, type, now()); }
+      for (const t of targets) {
+        clear.run(t.device_id);
+        ins.run(rid('cmd_'), t.device_id, type, now());
+        if (type === 'block') db.prepare('UPDATE devices SET blocked=1 WHERE device_id=?').run(t.device_id);
+        else if (type === 'unblock') db.prepare('UPDATE devices SET blocked=0 WHERE device_id=?').run(t.device_id);
+        else if (type === 'usb_block') db.prepare('UPDATE devices SET usb_blocked=1 WHERE device_id=?').run(t.device_id);
+        else if (type === 'usb_unblock') db.prepare('UPDATE devices SET usb_blocked=0 WHERE device_id=?').run(t.device_id);
+      }
       audit('admin', 'group_' + type, gid, 'ok', {queued: targets.length});
       return json(res, 200, {ok:true, queued: targets.length});
     }
@@ -672,13 +1454,13 @@ const server = http.createServer(async (req, res) => {
     // Admin: devices
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/devices') {
       if (!requireAdmin(req,res)) return;
-      const rows = db.prepare('SELECT device_id,hostname,os,app_version,enrolled_at,last_seen,ip,blocked,mode,policy_version,group_id,label,last_event,last_event_at,throttle_kbps,sites,denied,rustdesk_id,rustdesk_password FROM devices ORDER BY last_seen DESC').all();
+      const rows = db.prepare('SELECT device_id,hostname,os,app_version,enrolled_at,last_seen,ip,blocked,usb_blocked,mode,policy_version,group_id,label,last_event,last_event_at,throttle_kbps,sites,denied,rustdesk_id,rustdesk_password FROM devices ORDER BY last_seen DESC').all();
       const out = rows.map(d => {
         let sites = [];
         let denied = [];
         try { sites = JSON.parse(d.sites || '[]'); } catch (e) { sites = []; }
         try { denied = JSON.parse(d.denied || '[]'); } catch (e) { denied = []; }
-        return {...d, sites, denied, rustdesk_id: d.rustdesk_id || '', rustdesk_password: d.rustdesk_password || '', blocked: !!d.blocked, online: d.last_seen && (now()-d.last_seen < 60_000)};
+        return {...d, sites, denied, rustdesk_id: d.rustdesk_id || '', rustdesk_password: d.rustdesk_password || '', blocked: !!d.blocked, usb_blocked: !!d.usb_blocked, online: d.last_seen && (now()-d.last_seen < 60_000)};
       });
       return json(res, 200, {ok:true, devices: out});
     }
@@ -690,6 +1472,8 @@ const server = http.createServer(async (req, res) => {
       const raw = String(body.command || '');
       const type = raw === 'unblock' ? 'unblock'
         : raw === 'block' ? 'block'
+        : raw === 'usb_block' ? 'usb_block'
+        : raw === 'usb_unblock' ? 'usb_unblock'
         : /^throttle:\d{1,7}$/.test(raw) ? raw
         : (raw === 'restart' || raw === 'shutdown' || raw === 'cancel_power' || raw === 'update_client') ? raw
         : null;
@@ -714,6 +1498,8 @@ const server = http.createServer(async (req, res) => {
           // lag behind the device's next poll.
           if (type === 'block') db.prepare('UPDATE devices SET blocked=1 WHERE device_id=?').run(t);
           else if (type === 'unblock') db.prepare('UPDATE devices SET blocked=0 WHERE device_id=?').run(t);
+          else if (type === 'usb_block') db.prepare('UPDATE devices SET usb_blocked=1 WHERE device_id=?').run(t);
+          else if (type === 'usb_unblock') db.prepare('UPDATE devices SET usb_blocked=0 WHERE device_id=?').run(t);
           count++;
         }
       }
@@ -741,6 +1527,7 @@ const server = http.createServer(async (req, res) => {
         if (typeof body.usb_block === 'boolean') data.usb_block = body.usb_block;
         if (typeof body.rustdesk_server === 'string') data.rustdesk_server = body.rustdesk_server;
         if (typeof body.rustdesk_key === 'string') data.rustdesk_key = body.rustdesk_key;
+        if (Array.isArray(body.erp_domains)) data.erp_domains = body.erp_domains;
         db.prepare('UPDATE policy SET version=?, data=?, updated_at=? WHERE id=1').run(ver, JSON.stringify(data), now());
         audit('admin', 'policy_update', 'default', 'ok', {mode: data.mode});
         return json(res, 200, {ok:true, policy: getPolicy()});
@@ -785,25 +1572,36 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {ok:true});
     }
 
-    // Admin: list archived exact-copy uploaded files
+    // Admin: list archived exact-copy uploaded files (scalable: full summary + daily calendar index + server-side filter & pagination)
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/uploads') {
       if (!requireAdmin(req, res)) return;
       const ch = String(url.searchParams.get('channel') || '').trim().toLowerCase();
-      let sql = `SELECT u.file_id,u.device_id,u.file_name,u.file_size,u.stored_path,u.created_at,
+      const fromMs = Number(url.searchParams.get('from_ms') || 0) || 0;
+      const toMs = Number(url.searchParams.get('to_ms') || 0) || 0;
+      const fileType = String(url.searchParams.get('file_type') || '').trim().toLowerCase();
+      const devFilter = String(url.searchParams.get('device') || '').trim();
+      const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+      const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
+      const pageSize = Math.min(5000, Math.max(10, parseInt(url.searchParams.get('page_size') || '60', 10) || 60));
+      const tzOffsetMins = parseInt(url.searchParams.get('tz_offset') || String(new Date().getTimezoneOffset()), 10) || 0;
+
+      const classifyExt = (fname) => {
+        const lower = String(fname || '').toLowerCase();
+        const dot = lower.lastIndexOf('.');
+        const ext = dot >= 0 ? lower.slice(dot + 1) : '';
+        if (['xls','xlsx','csv','doc','docx','pdf','ppt','pptx','txt','rtf','sql','db','sqlite','accdb','mdb','json','xml'].includes(ext)) return 'docs';
+        if (['jpg','jpeg','png','gif','webp','bmp','svg','heic'].includes(ext)) return 'images';
+        if (['zip','rar','7z','tar','gz','iso'].includes(ext)) return 'archives';
+        return 'other';
+      };
+
+      const rows = db.prepare(`SELECT u.file_id,u.device_id,u.file_name,u.file_size,u.stored_path,u.created_at,
         u.device_name,u.windows_user,u.channel,u.recipient_name,u.recipient_phone,u.page_url,u.sha256,
         COALESCE(NULLIF(u.device_name,''), COALESCE(NULLIF(d.label,''), d.hostname, u.device_id)) AS resolved_device_name
         FROM uploaded_files u
         LEFT JOIN devices d ON d.device_id = u.device_id
-        WHERE 1=1`;
-      const params = [];
-      if (ch === 'whatsapp_web') {
-        sql += " AND lower(COALESCE(NULLIF(u.channel,''),'whatsapp_web')) LIKE '%whatsapp%'";
-      } else if (ch) {
-        sql += " AND lower(COALESCE(u.channel,'')) = ?";
-        params.push(ch);
-      }
-      sql += ' ORDER BY u.created_at DESC LIMIT 400';
-      const rows = db.prepare(sql).all(...params);
+        ORDER BY u.created_at DESC`).all();
+
       const byId = new Map();
       for (const r of rows) {
         byId.set(r.file_id, {
@@ -815,7 +1613,6 @@ const server = http.createServer(async (req, res) => {
           file_name: r.file_name || 'file.bin',
           file_size: Number(r.file_size || 0),
           stored_path: r.stored_path || '',
-          exists_on_disk: Boolean(r.stored_path && fs.existsSync(r.stored_path)),
           recipient_name: r.recipient_name || '',
           recipient_phone: r.recipient_phone || '',
           page_url: r.page_url || '',
@@ -826,9 +1623,6 @@ const server = http.createServer(async (req, res) => {
       for (const entry of readArchiveLogEntries()) {
         const fid = String((entry && entry.file_id) || '').trim();
         if (!fid || byId.has(fid)) continue;
-        const entryChan = String(entry.channel || 'whatsapp_web').toLowerCase();
-        if (ch === 'whatsapp_web' && !entryChan.includes('whatsapp')) continue;
-        if (ch && ch !== 'whatsapp_web' && entryChan !== ch) continue;
         byId.set(fid, {
           file_id: fid,
           device_id: entry.device_id || '',
@@ -838,7 +1632,6 @@ const server = http.createServer(async (req, res) => {
           file_name: entry.file_name || 'file.bin',
           file_size: Number(entry.file_size || 0),
           stored_path: entry.stored_path || '',
-          exists_on_disk: Boolean(entry.stored_path && fs.existsSync(entry.stored_path)),
           recipient_name: entry.recipient_name || '',
           recipient_phone: entry.recipient_phone || '',
           page_url: entry.page_url || '',
@@ -846,10 +1639,127 @@ const server = http.createServer(async (req, res) => {
           created_at: Number(entry.created_at || 0),
         });
       }
-      const files = Array.from(byId.values())
-        .sort((a, b) => b.created_at - a.created_at)
-        .slice(0, 400);
-      return json(res, 200, { ok: true, archive_root: ARCHIVE_ROOT, files });
+
+      const allFiles = Array.from(byId.values()).sort((a, b) => b.created_at - a.created_at);
+      let totalBytes = 0, waCount = 0, sensitiveCount = 0, imagesCount = 0, todayCount = 0;
+      const dayAgo = Date.now() - 86400 * 1000;
+      const perDevice = new Map();
+      const dailyMap = new Map();
+
+      for (const f of allFiles) {
+        const sz = Number(f.file_size || 0);
+        totalBytes += sz;
+        const fChan = String(f.channel || 'whatsapp_web').toLowerCase();
+        if (fChan.includes('whatsapp')) waCount++;
+        const cat = classifyExt(f.file_name);
+        if (cat === 'docs' || cat === 'archives') sensitiveCount++;
+        if (cat === 'images') imagesCount++;
+        if (f.created_at >= dayAgo) todayCount++;
+        const dn = f.device_name || f.device_id || 'غير معروف';
+        perDevice.set(dn, (perDevice.get(dn) || 0) + 1);
+
+        if (f.created_at > 0) {
+          const localDt = new Date(f.created_at - tzOffsetMins * 60000);
+          const dayKey = localDt.toISOString().slice(0, 10);
+          let bucket = dailyMap.get(dayKey);
+          if (!bucket) {
+            bucket = { day: dayKey, total: 0, images: 0, docs: 0, archives: 0, bytes: 0 };
+            dailyMap.set(dayKey, bucket);
+          }
+          bucket.total++;
+          bucket.bytes += sz;
+          if (cat === 'images') bucket.images++;
+          else if (cat === 'docs') bucket.docs++;
+          else if (cat === 'archives') bucket.archives++;
+        }
+      }
+
+      let topDevice = '—', topDeviceCount = 0;
+      const devicesList = [];
+      for (const [name, count] of perDevice.entries()) {
+        devicesList.push({ name, count });
+        if (count > topDeviceCount) { topDeviceCount = count; topDevice = name; }
+      }
+      devicesList.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+      const dailyIndex = Array.from(dailyMap.values())
+        .sort((a, b) => b.day.localeCompare(a.day))
+        .slice(0, 366);
+
+      const matched = allFiles.filter((f) => {
+        const fChan = String(f.channel || 'whatsapp_web').toLowerCase();
+        if (ch === 'whatsapp_web' && !fChan.includes('whatsapp')) return false;
+        if (ch === 'web_upload' && fChan.includes('whatsapp')) return false;
+        if (fromMs > 0 && f.created_at < fromMs) return false;
+        if (toMs > 0 && f.created_at > toMs) return false;
+        if (fileType && classifyExt(f.file_name) !== fileType) return false;
+        const dn = f.device_name || f.device_id || '';
+        if (devFilter && dn !== devFilter && f.device_id !== devFilter) return false;
+        if (q) {
+          const hay = `${f.file_name} ${f.device_name} ${f.device_id} ${f.windows_user} ${f.recipient_name} ${f.recipient_phone} ${f.page_url} ${f.sha256}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+      const totalMatching = matched.length;
+      const totalPages = Math.max(1, Math.ceil(totalMatching / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const offset = (safePage - 1) * pageSize;
+      const files = matched.slice(offset, offset + pageSize).map((f) => ({
+        ...f,
+        exists_on_disk: Boolean(f.stored_path && fs.existsSync(f.stored_path)),
+      }));
+
+      const curArchiveRoot = getArchiveRoot();
+      const disk = getDiskSpaceBytes(curArchiveRoot);
+      return json(res, 200, {
+        ok: true,
+        archive_root: curArchiveRoot,
+        disk_free_bytes: disk.free,
+        disk_total_bytes: disk.total,
+        summary: {
+          total_files: allFiles.length,
+          total_bytes: totalBytes,
+          whatsapp_count: waCount,
+          sensitive_count: sensitiveCount,
+          images_count: imagesCount,
+          today_count: todayCount,
+          top_device: topDevice,
+          top_device_count: topDeviceCount,
+        },
+        devices: devicesList,
+        daily_index: dailyIndex,
+        total_matching: totalMatching,
+        page: safePage,
+        page_size: pageSize,
+        total_pages: totalPages,
+        files,
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/archive-migrate') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req).catch(() => ({}));
+      const oldRoot = String(body.old_root || '').trim().replace(/[\\/]+$/, '');
+      const newRoot = String(body.new_root || '').trim().replace(/[\\/]+$/, '');
+      let updated = 0;
+      if (body.moved && oldRoot && newRoot && oldRoot.toLowerCase() !== newRoot.toLowerCase()) {
+        const rows = db.prepare('SELECT file_id, stored_path FROM uploaded_files').all();
+        const upd = db.prepare('UPDATE uploaded_files SET stored_path=? WHERE file_id=?');
+        for (const r of rows) {
+          const sp = String(r.stored_path || '').replace(/\//g, '\\');
+          const oldNorm = oldRoot.replace(/\//g, '\\');
+          if (sp.length > oldNorm.length && sp.slice(0, oldNorm.length).toLowerCase() === oldNorm.toLowerCase()) {
+            const candidate = newRoot.replace(/\//g, '\\') + sp.slice(oldNorm.length);
+            if (fs.existsSync(candidate)) {
+              upd.run(candidate, r.file_id);
+              updated += 1;
+            }
+          }
+        }
+      }
+      audit('admin', 'archive_dir_change', newRoot || getArchiveRoot(), 'ok', { updated });
+      return json(res, 200, { ok: true, updated, archive_root: getArchiveRoot() });
     }
 
     // ----- Device: upload archived exact copy -----
@@ -943,17 +1853,16 @@ const server = http.createServer(async (req, res) => {
       const type = String(body.type || 'tamper').slice(0, 40);
       const severity = ['low','medium','high','critical'].includes(body.severity) ? body.severity : 'medium';
       const message = String(body.message || '').slice(0, 600);
-      const metaObj = (body.meta && typeof body.meta === 'object') ? body.meta : null;
-      const meta = typeof body.meta === 'string'
-        ? body.meta
-        : (metaObj ? JSON.stringify(metaObj) : '{}');
-      db.prepare('INSERT INTO alerts(id,device_id,type,severity,message,meta,created_at) VALUES(?,?,?,?,?,?,?)')
-        .run(rid('alt_'), dev.device_id, type, severity, message, meta, now());
-
-      let parsedMeta = metaObj;
-      if (!parsedMeta && typeof meta === 'string' && meta.startsWith('{')) {
-        try { parsedMeta = JSON.parse(meta); } catch (_) {}
-      }
+      const parsedMeta = storeAlertWithSeparatedMedia({
+        id: rid('alt_'),
+        deviceId: dev.device_id,
+        type,
+        severity,
+        message,
+        rawMeta: body.meta,
+        createdAt: now(),
+        ignoreExisting: false,
+      });
       if (parsedMeta && parsedMeta.uploaded_file_id) {
         const devName = String(dev.label || dev.hostname || dev.device_id || '');
         db.prepare(`UPDATE uploaded_files SET
@@ -979,6 +1888,63 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {ok:true});
     }
 
+    // Device: upload live Dahua CCTV frame from branch bridge PC
+    if (req.method === 'POST' && url.pathname === '/api/v1/device/cctv-frame') {
+      const dev = getDeviceByToken(bearer(req));
+      if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+      const body = await readBody(req, 8 * 1024 * 1024);
+      cctv.ingestBridgeFrame({
+        deviceId: dev.device_id,
+        dvrId: String(body.dvr_id || ''),
+        channel: Number(body.channel || 1),
+        hd: Boolean(body.hd),
+        imageB64: String(body.image || ''),
+        error: String(body.error || ''),
+      });
+      return json(res, 200, {
+        ok: true,
+        cctv_tasks: cctv.getActiveTaskForDevice(dev.device_id),
+      });
+    }
+
+    // Device: report local subnet Dahua scan results from branch bridge PC
+    if (req.method === 'POST' && url.pathname === '/api/v1/device/cctv-scan') {
+      const dev = getDeviceByToken(bearer(req));
+      if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+      const body = await readBody(req, 512 * 1024);
+      cctv.ingestBranchScanResult(dev.device_id, body && body.found);
+      return json(res, 200, { ok: true });
+    }
+
+    // Device: report on-demand Dahua CGI results from branch bridge PC
+    if (req.method === 'POST' && url.pathname === '/api/v1/device/cctv-cgi') {
+      const dev = getDeviceByToken(bearer(req));
+      if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+      const body = await readBody(req, 14 * 1024 * 1024);
+      cctv.ingestBranchCgiResult(dev.device_id, body);
+      return json(res, 200, { ok: true });
+    }
+
+    // Device: stream live Dahua camera audio micro-chunks from branch bridge PC (0% CPU when muted)
+    if (req.method === 'POST' && url.pathname === '/api/v1/device/cctv-audio') {
+      const dev = getDeviceByToken(bearer(req));
+      if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+      const body = await readBody(req, 512 * 1024);
+      const active = cctv.ingestBridgeAudioChunk({
+        deviceId: dev.device_id,
+        dvrId: String((body && body.dvr_id) || ''),
+        channel: Number((body && body.channel) || 1),
+        contentType: String((body && body.content_type) || ''),
+        dataB64: String((body && body.data_b64) || ''),
+        error: String((body && body.error) || ''),
+      });
+      return json(res, 200, {
+        ok: true,
+        active,
+        cctv_tasks: cctv.getActiveTaskForDevice(dev.device_id),
+      });
+    }
+
     // Device: poll
     if (req.method === 'POST' && url.pathname === '/api/v1/device/poll') {
       const dev = getDeviceByToken(bearer(req));
@@ -988,8 +1954,8 @@ const server = http.createServer(async (req, res) => {
         db.prepare('UPDATE commands SET acked_at=? WHERE id=? AND device_id=? AND acked_at IS NULL')
           .run(now(), body.ack_command_id, dev.device_id);
       }
-      db.prepare("UPDATE devices SET hostname=?,os=COALESCE(NULLIF(?,'') ,os),app_version=?,last_seen=?,ip=?,blocked=?,mode=?,policy_version=? WHERE device_id=?")
-        .run(body.hostname||dev.hostname, body.os||'', body.app_version||dev.app_version, now(), req.socket.remoteAddress||'', body.blocked?1:0, body.mode||dev.mode, body.policy_version||dev.policy_version, dev.device_id);
+      db.prepare("UPDATE devices SET hostname=?,os=COALESCE(NULLIF(?,'') ,os),app_version=?,last_seen=?,ip=?,blocked=?,usb_blocked=?,mode=?,policy_version=? WHERE device_id=?")
+        .run(body.hostname||dev.hostname, body.os||'', body.app_version||dev.app_version, now(), req.socket.remoteAddress||'', body.blocked?1:0, body.usb_blocked?1:0, body.mode||dev.mode, body.policy_version||dev.policy_version, dev.device_id);
       if (Array.isArray(body.sites)) {
         const clean = body.sites
           .filter(function (s) { return typeof s === 'string' && s.length <= 120; })
@@ -1021,15 +1987,21 @@ const server = http.createServer(async (req, res) => {
       let command = pendingCommand(dev.device_id);
       let fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password FROM devices WHERE device_id=?').get(dev.device_id) || dev;
       let streamMode = activeMode(fresh);
-      // Long-poll: keep the request open briefly so a command or screenshot/stream request issued
+      let cctvTasks = cctv.getActiveTaskForDevice(dev.device_id);
+      let cctvScan = cctv.popPendingScanForDevice(dev.device_id);
+      let cctvCgi = cctv.popPendingCgiForDevice(dev.device_id);
+      // Long-poll: keep the request open briefly so a command or screenshot/stream/CCTV request issued
       // right now is delivered within ~300 ms instead of waiting for the next cycle.
-      if (!command && !sendPolicy && !streamMode) {
+      if (!command && !sendPolicy && !streamMode && !cctvTasks && !cctvScan && !cctvCgi) {
         const started = Date.now();
-        while (!command && !streamMode && (Date.now() - started) < LONG_POLL_MS) {
+        while (!command && !streamMode && !cctvTasks && !cctvScan && !cctvCgi && (Date.now() - started) < LONG_POLL_MS) {
           await new Promise(function (r) { setTimeout(r, 300); });
           command = pendingCommand(dev.device_id);
           fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password FROM devices WHERE device_id=?').get(dev.device_id) || fresh;
           streamMode = activeMode(fresh);
+          cctvTasks = cctv.getActiveTaskForDevice(dev.device_id);
+          cctvScan = cctv.popPendingScanForDevice(dev.device_id);
+          cctvCgi = cctv.popPendingCgiForDevice(dev.device_id);
         }
       }
       return json(res, 200, {
@@ -1040,31 +2012,216 @@ const server = http.createServer(async (req, res) => {
         screen: !!streamMode,
         stream_mode: streamMode,
         rustdesk_password: fresh.rustdesk_password || '',
+        cctv_tasks: cctvTasks || null,
+        cctv_scan: Boolean(cctvScan),
+        cctv_cgi: cctvCgi || null,
       });
     }
 
-    // Friendly landing page so the URL can be verified in a browser.
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-      const html = '<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">' +
-        '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-        '<title>IT ELKHAWGA Relay</title><style>' +
-        'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;' +
-        'font-family:Segoe UI,Tahoma,sans-serif;background:linear-gradient(160deg,#eef4ff,#eef7f4)}' +
-        '.card{background:rgba(255,255,255,.72);backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.3);' +
-        'border-radius:22px;padding:36px 40px;box-shadow:0 20px 50px rgba(15,23,42,.12);text-align:center;max-width:420px}' +
-        'h1{margin:0 0 6px;font-size:22px;color:#0f172a}p{margin:6px 0;color:#475569;font-size:14px}' +
-        '.ok{display:inline-flex;align-items:center;gap:8px;margin-top:14px;background:rgba(5,150,105,.12);' +
-        'color:#047857;padding:8px 16px;border-radius:999px;font-weight:700;font-size:13px}' +
-        '.dot{width:9px;height:9px;border-radius:50%;background:#059669}</style></head><body><div class="card">' +
-        '<h1>IT ELKHAWGA Relay</h1><p>الخدمة الوسيطة تعمل بنجاح</p>' +
-        '<p style="font-size:12px;color:#94a3b8">Ahmed Wahba</p>' +
-        '<div class="ok"><span class="dot"></span>متصل · الإصدار ' + RELAY_VERSION + '</div>' +
-        '<p style="margin-top:18px;font-size:12px;color:#94a3b8">ضع هذا الرابط ومفتاح المدير في برنامج IT ELKHAWGA Admin</p>' +
-        '</div></body></html>';
-      res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+    // Executive Video Guides (/guide for Owner iPad & /admin-guide for IT Engineers/Admins)
+    if ((req.method === 'GET' || req.method === 'HEAD') && (url.pathname === '/guide-video.mp4' || url.pathname === '/admin-guide-video.mp4')) {
+      const isAdminGuide = url.pathname === '/admin-guide-video.mp4';
+      const guideMp4 = isAdminGuide
+        ? 'C:\\Users\\IT APP\\Desktop\\tools\\IT-ELKHAWGA-Admin-Engineers-Guide.mp4'
+        : 'C:\\Users\\IT APP\\Desktop\\tools\\IT-ELKHAWGA-iPad-Owner-Guide.mp4';
+      const dlFileName = isAdminGuide
+        ? 'IT-ELKHAWGA-Admin-Engineers-Guide.mp4'
+        : 'IT-ELKHAWGA-iPad-Owner-Guide.mp4';
+      if (!fs.existsSync(guideMp4)) {
+        return json(res, 404, { ok: false, error: 'guide video not found' });
+      }
+      const stat = fs.statSync(guideMp4);
+      const total = stat.size;
+      const range = req.headers.range;
+      if (range) {
+        const parts = String(range).replace(/bytes=/, '').split('-');
+        const start = Math.max(0, parseInt(parts[0], 10) || 0);
+        const end = parts[1] ? Math.min(total - 1, parseInt(parts[1], 10)) : total - 1;
+        if (start >= total || start > end) {
+          res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+          return res.end();
+        }
+        const chunkSize = (end - start) + 1;
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${total}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunkSize,
+          'Content-Type': 'video/mp4',
+          'Cache-Control': 'public, max-age=300',
+        });
+        if (req.method === 'HEAD') return res.end();
+        return fs.createReadStream(guideMp4, { start, end }).pipe(res);
+      }
+      const dl = url.searchParams.get('download') === '1';
+      const headers = {
+        'Content-Length': total,
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=300',
+      };
+      if (dl) {
+        headers['Content-Disposition'] = `attachment; filename="${dlFileName}"`;
+      }
+      res.writeHead(200, headers);
+      if (req.method === 'HEAD') return res.end();
+      return fs.createReadStream(guideMp4).pipe(res);
+    }
+
+    if (req.method === 'GET' && (url.pathname === '/guide' || url.pathname === '/admin-guide')) {
+      const isAdminGuide = url.pathname === '/admin-guide';
+      const pageTitle = isAdminGuide
+        ? 'الدليل الشامل للمهندسين ومسؤولي النظام — IT ELKHAWAGA'
+        : 'دليل تشغيل IT ELKHAWAGA على الـ iPad';
+      const heading = isAdminGuide
+        ? 'الدليل التدريبي التفصيلي الشامل للمهندسين ومسؤولي النظام (22 خطوة مصوّرة بمؤشر إيضاحي)'
+        : 'الدليل التفصيلي المحدّث لصاحب الشركة والإدارة العليا على الـ iPad (15 خطوة مصوّرة بمؤشر إيضاحي)';
+      const subText = isAdminGuide
+        ? 'شرح تفصيلي بالعلامات المضيئة لكل قسم: الدخول والأدوار، مؤشر السيرفر، الأجهزة وRelay، الوضع الهجين لـ RustDesk، التصفح النظيف وحماية ربط سيستم elkhawaga.uk، نقل الأرشيف والباكاب لهارد جديد، والنسخ الاحتياطي الساعي التلقائي لموقع الشركة'
+        : 'شرح تفصيلي خطوة بخطوة بالعلامات المضيئة: تثبيت تطبيق الـ iPad، المتابعة اللحظية، المشاهدة الصامتة، دعم RustDesk، تقارير وسرية أرشيف الملفات، وتأمين موقع elkhawaga.uk بالنسخ الساعي التلقائي';
+      const videoSrc = isAdminGuide ? '/admin-guide-video.mp4' : '/guide-video.mp4';
+      const html = `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>${pageTitle}</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Tahoma,sans-serif;background:radial-gradient(circle at top,#132f5c,#071326 70%);color:#f8fafc;display:flex;flex-direction:column;align-items:center;padding:24px 16px}
+    .wrap{width:100%;max-width:1020px;background:rgba(15,23,42,.84);border:1px solid rgba(227,185,78,.26);border-radius:24px;padding:24px;box-shadow:0 24px 60px rgba(0,0,0,.48)}
+    .head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+    .brand{display:flex;align-items:center;gap:12px}
+    .brand img{width:48px;height:48px;border-radius:12px;background:#fff;padding:4px;object-fit:contain}
+    h1{font-size:20px;margin:0;color:#fff}
+    .sub{font-size:13px;color:#cbd5e1;margin-top:4px;line-height:1.5}
+    video{width:100%;border-radius:16px;background:#000;border:1px solid rgba(148,163,184,.25);box-shadow:0 12px 32px rgba(0,0,0,.4)}
+    .actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px;justify-content:center}
+    .btn{text-decoration:none;padding:12px 22px;border-radius:12px;font-weight:700;font-size:15px;display:inline-flex;align-items:center;gap:8px}
+    .btn-primary{background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;box-shadow:0 8px 20px rgba(37,99,235,.35)}
+    .btn-sec{background:rgba(255,255,255,.09);color:#e2e8f0;border:1px solid rgba(255,255,255,.16)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div class="brand">
+        <img src="/assets/apple-touch-icon.png" alt="IT ELKHAWAGA">
+        <div>
+          <h1>${heading}</h1>
+          <div class="sub">${subText}</div>
+        </div>
+      </div>
+    </div>
+    <video controls playsinline preload="metadata" src="${videoSrc}"></video>
+    <div class="actions">
+      <a class="btn btn-primary" href="/">🚀 فتح لوحة الإدارة الآن</a>
+      <a class="btn btn-sec" href="${videoSrc}?download=1">⬇ تحميل الفيديو (MP4)</a>
+    </div>
+  </div>
+</body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
       return res.end(html);
     }
-    if (req.method === 'GET' && url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+
+    // Reverse-proxy Web Admin Dashboard & iPad PWA routes to local Admin Server (127.0.0.1:8787)
+    // so the company owner (iPad) and remote managers can sign in securely over HTTPS from anywhere.
+    const isWebProxyRoute =
+      (req.method === 'POST' && url.pathname === '/api/rpc') ||
+      ((req.method === 'GET' || req.method === 'HEAD') && (
+        url.pathname === '/' ||
+        url.pathname === '/admin' ||
+        url.pathname === '/admin/' ||
+        url.pathname === '/index.html' ||
+        url.pathname === '/manifest.webmanifest' ||
+        url.pathname === '/sw.js' ||
+        url.pathname === '/theme.js' ||
+        url.pathname === '/tauri-shim.js' ||
+        url.pathname === '/index.inline.js' ||
+        url.pathname === '/favicon.ico' ||
+        url.pathname.startsWith('/styles/') ||
+        url.pathname.startsWith('/assets/')
+      ));
+
+    if (isWebProxyRoute) {
+      const targetPath = (url.pathname === '/admin' || url.pathname === '/admin/')
+        ? ('/' + (url.search || ''))
+        : (url.pathname + (url.search || ''));
+      const fwdHeaders = { host: '127.0.0.1:8787' };
+      if (req.headers['content-type']) fwdHeaders['content-type'] = req.headers['content-type'];
+      if (req.headers['content-length']) fwdHeaders['content-length'] = req.headers['content-length'];
+      if (req.headers['authorization']) fwdHeaders['authorization'] = req.headers['authorization'];
+      const proxyReq = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: 8787,
+          path: targetPath,
+          method: req.method,
+          headers: fwdHeaders,
+          agent: lanKeepAliveAgent,
+          timeout: 25000,
+        },
+        (proxyRes) => {
+          const outHeaders = { ...proxyRes.headers };
+          if (
+            url.pathname === '/' ||
+            url.pathname === '/index.html' ||
+            url.pathname === '/sw.js' ||
+            url.pathname.endsWith('.js') ||
+            url.pathname.endsWith('.css')
+          ) {
+            outHeaders['Cache-Control'] = 'no-cache, must-revalidate';
+          }
+          const ctype = String(outHeaders['content-type'] || '').toLowerCase();
+          const canCompress =
+            res.__acceptGzip &&
+            !outHeaders['content-encoding'] &&
+            (ctype.includes('json') ||
+              ctype.includes('javascript') ||
+              ctype.includes('text/html') ||
+              ctype.includes('text/css') ||
+              ctype.includes('image/svg+xml') ||
+              ctype.includes('manifest'));
+          if (!canCompress) {
+            res.writeHead(proxyRes.statusCode || 200, outHeaders);
+            proxyRes.pipe(res);
+            return;
+          }
+          const chunks = [];
+          proxyRes.on('data', (c) => chunks.push(c));
+          proxyRes.on('end', () => {
+            const rawBuf = Buffer.concat(chunks);
+            outHeaders['Vary'] = 'Accept-Encoding';
+            if (rawBuf.length >= 1024) {
+              const gz = zlib.gzipSync(rawBuf, { level: zlib.constants.Z_BEST_SPEED });
+              outHeaders['Content-Encoding'] = 'gzip';
+              outHeaders['content-length'] = gz.length;
+              delete outHeaders['Content-Length'];
+              res.writeHead(proxyRes.statusCode || 200, outHeaders);
+              res.end(gz);
+            } else {
+              outHeaders['content-length'] = rawBuf.length;
+              delete outHeaders['Content-Length'];
+              res.writeHead(proxyRes.statusCode || 200, outHeaders);
+              res.end(rawBuf);
+            }
+          });
+        }
+      );
+      proxyReq.on('error', () => {
+        if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/admin' || url.pathname === '/index.html')) {
+          const fallbackHtml = '<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">' +
+            '<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="3">' +
+            '<title>IT ELKHAWGA</title><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:Segoe UI,Tahoma,sans-serif;background:#0a1f3d;color:#fff;text-align:center;padding:20px}.box{background:rgba(255,255,255,.08);padding:32px;border-radius:20px;max-width:400px}</style></head><body><div class="box"><h2>IT ELKHAWGA</h2><p>جاري تهيئة لوحة الإدارة، سيتم الفتح تلقائياً خلال لحظات...</p></div></body></html>';
+          if (!res.headersSent) res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(fallbackHtml);
+        } else {
+          if (!res.headersSent) json(res, 502, { ok: false, error: 'لوحة الإدارة قيد إعادة التشغيل، حاول بعد ثوانٍ' });
+        }
+      });
+      req.pipe(proxyReq);
+      return;
+    }
 
     json(res, 404, {ok:false,error:'not found'});
   } catch (e) {
@@ -1073,3 +2230,49 @@ const server = http.createServer(async (req, res) => {
   }
 });
 server.listen(PORT, '0.0.0.0', () => console.log(`relay listening on :${PORT}`));
+
+// Self-healing watchdog: keep local Admin HTTP Server (127.0.0.1:8787) alive 24/7
+let adminMissStreak = 0;
+let adminAlertedDown = false;
+setInterval(() => {
+  const probe = http.get(
+    { hostname: '127.0.0.1', port: 8787, path: '/healthz', timeout: 2500 },
+    (r) => {
+      r.resume();
+      if (r.statusCode === 200) {
+        adminMissStreak = 0;
+        if (adminAlertedDown) {
+          adminAlertedDown = false;
+          waBot.onServerHealthEvent({ kind: 'admin_recovered' }).catch(() => {});
+        }
+      } else {
+        adminMissStreak++;
+      }
+    }
+  );
+  probe.on('error', () => {
+    adminMissStreak++;
+    if (adminMissStreak >= 2) {
+      adminMissStreak = 0;
+      if (!adminAlertedDown) {
+        adminAlertedDown = true;
+        waBot.onServerHealthEvent({ kind: 'admin_down' }).catch(() => {});
+      }
+      const adminCandidate = 'C:\\Users\\IT APP\\Desktop\\blockwebsite\\final-release\\admin\\it-elkhawga-admin.exe';
+      if (fs.existsSync(adminCandidate)) {
+        try {
+          const child = spawn(adminCandidate, ['--server'], {
+            cwd: path.dirname(adminCandidate),
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true,
+          });
+          child.unref();
+        } catch (_) {}
+      }
+    }
+  });
+  probe.on('timeout', () => {
+    probe.destroy();
+  });
+}, 12000);

@@ -27,11 +27,11 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "publisher": "Ahmed Wahba",
-    "copyright": "Copyright (c) Ahmed Wahba",
+    "publisher": "ELKHAWAGA Company - IT Department",
+    "copyright": "Copyright (c) ELKHAWAGA Company. All Rights Reserved. Proprietary Internal System - Developed by Ahmed Wahba",
     "category": "Utility",
-    "shortDescription": "IT ELKHAWGA - Company IT control",
-    "longDescription": "IT ELKHAWGA by Ahmed Wahba for managing company devices and internet access.",
+    "shortDescription": "IT ELKHAWAGA - Proprietary Enterprise Endpoint & DLP System",
+    "longDescription": "Proprietary enterprise device control and DLP security suite owned exclusively by ELKHAWAGA Company. Unauthorized reproduction or distribution is strictly prohibited.",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
     "resources": {
       "../block-internet.ps1": "block-internet.ps1",

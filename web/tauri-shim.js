@@ -4,13 +4,24 @@
   if (window.electronAPI) return;
 
   let authToken = '';
-  try { authToken = sessionStorage.getItem('ibp_auth_token') || ''; } catch (e) {}
+  try {
+    authToken = sessionStorage.getItem('ibp_auth_token') || localStorage.getItem('ibp_auth_token') || '';
+  } catch (e) {}
 
-  function setAuthToken(tok) {
+  function setAuthToken(tok, remember) {
     authToken = tok || '';
     try {
-      if (authToken) sessionStorage.setItem('ibp_auth_token', authToken);
-      else sessionStorage.removeItem('ibp_auth_token');
+      if (authToken) {
+        sessionStorage.setItem('ibp_auth_token', authToken);
+        if (remember !== false) {
+          localStorage.setItem('ibp_auth_token', authToken);
+        } else {
+          localStorage.removeItem('ibp_auth_token');
+        }
+      } else {
+        sessionStorage.removeItem('ibp_auth_token');
+        localStorage.removeItem('ibp_auth_token');
+      }
     } catch (e) {}
   }
 
@@ -67,9 +78,20 @@
       removeSite: (site) => invoke('remove_site', { site }),
       addBlockedSite: (site) => invoke('add_blocked_site', { site }),
       removeBlockedSite: (site) => invoke('remove_blocked_site', { site }),
+      addSitesBulk: (sites, kind) => invoke('add_sites_bulk', { sites: Array.isArray(sites) ? sites : [String(sites || '')], kind: kind || 'allowed' }),
       getLogs: () => invoke('get_logs'),
       getConfig: () => invoke('get_config'),
       setListMode: (mode) => invoke('set_list_mode', { mode }),
+      setDlpConfig: (usbBlock, exfilThresholdMb, exfilWindowSecs, exfilSuspicious, dlpSuperOnly, erpDomains, erpMasterToken) =>
+        invoke('set_dlp_config', {
+          usbBlock: Boolean(usbBlock),
+          exfilThresholdMb: Number(exfilThresholdMb || 50),
+          exfilWindowSecs: Number(exfilWindowSecs || 600),
+          exfilSuspicious: Array.isArray(exfilSuspicious) ? exfilSuspicious : [],
+          dlpSuperOnly: Boolean(dlpSuperOnly),
+          erpDomains: Array.isArray(erpDomains) ? erpDomains : null,
+          erpMasterToken: typeof erpMasterToken === 'string' ? erpMasterToken : null,
+        }),
       toggleAutostart: (enable) => invoke('toggle_autostart', { enable }),
       setPassword: (currentPassword, newPassword) => invoke('set_password', { currentPassword, newPassword }),
       getAdminUsers: () => invoke('get_admin_users'),
@@ -87,14 +109,15 @@
         actorUsername: actorUsername || '',
         actorRole: actorRole || ''
       }),
-      adminLogin: async (username, password) => {
+      adminLogin: async (username, password, remember) => {
         const res = await invoke('admin_login', { username, password });
         if (res && res.success && res.token) {
-          setAuthToken(res.token);
+          setAuthToken(res.token, remember);
         }
         return res;
       },
       getServerInfo: () => invoke('get_server_info'),
+      checkServerConnection: () => invoke('check_server_connection'),
       getDevices: () => invoke('get_devices'),
       sendDeviceCommand: (deviceId, command, actorUsername, actorRole) => invoke('send_device_command', {
         deviceId,
@@ -109,8 +132,8 @@
           relayUrl,
           adminKey: adminKey || null,
           currentPassword: currentPassword || null,
-          rustdeskServer: rustdeskServer || null,
-          rustdeskKey: rustdeskKey || null,
+          rustdeskServer: typeof rustdeskServer === 'string' ? rustdeskServer : null,
+          rustdeskKey: typeof rustdeskKey === 'string' ? rustdeskKey : null,
           rustdeskPassword: rustdeskPassword || null,
         }),
       createPairingToken: (label) => invoke('create_pairing_token', { label: label || null }),
@@ -128,12 +151,66 @@
       getRelayAlerts: (type, acked) => invoke('get_relay_alerts', { alertType: type || null, acked: acked || null }),
       getAlertMedia: (alertId) => invoke('get_alert_media', { alertId }),
       ackAlert: (id) => invoke('ack_alert', { alertId: id }),
-      getUploadedFiles: (channel) => invoke('get_uploaded_files', { channel: channel || null }),
+      ackAllAlerts: (type) => invoke('ack_all_alerts', { alertType: type || null }),
+      getRustdeskOssStatus: () => invoke('get_rustdesk_oss_status'),
+      checkAdminUpdate: () => invoke('check_admin_update'),
+      applyAdminUpdate: isTauri ? () => invoke('apply_admin_update') : null,
+      getUploadedFiles: (opts) => {
+        if (!opts || typeof opts === 'string') {
+          return invoke('get_uploaded_files', { channel: opts || null, tzOffsetMins: new Date().getTimezoneOffset() });
+        }
+        return invoke('get_uploaded_files', {
+          channel: opts.channel || null,
+          fromMs: opts.fromMs || null,
+          toMs: opts.toMs || null,
+          fileType: opts.fileType || null,
+          device: opts.device || null,
+          search: opts.search || null,
+          page: opts.page || 1,
+          pageSize: opts.pageSize || 60,
+          tzOffsetMins: typeof opts.tzOffsetMins === 'number' ? opts.tzOffsetMins : new Date().getTimezoneOffset(),
+        });
+      },
+      getBackupsList: () => invoke('get_backups_list'),
+      createSystemBackup: () => invoke('create_system_backup'),
+      restoreSystemBackup: (backupId) => invoke('restore_system_backup', { backupId }),
+      openBackupsFolder: isTauri ? () => invoke('open_backups_folder') : null,
+      browseBackupFolder: isTauri ? () => invoke('browse_backup_folder') : null,
+      setBackupDir: (newPath, moveExisting) => invoke('set_backup_dir', {
+        newPath: String(newPath || '').trim(),
+        moveExisting: moveExisting !== false,
+      }),
+      getErpBackupsStatus: () => invoke('get_erp_backups_status'),
+      saveErpBackupConfig: (enabled, intervalMins, url, username, password, didCookie, deviceToken) =>
+        invoke('save_erp_backup_config', {
+          enabled: Boolean(enabled),
+          intervalMins: Number(intervalMins || 60),
+          url: String(url || 'https://elkhawaga.uk').trim(),
+          username: String(username || '').trim(),
+          password: password ? String(password) : null,
+          didCookie: typeof didCookie === 'string' ? didCookie.trim() : null,
+          deviceToken: typeof deviceToken === 'string' ? deviceToken.trim() : null,
+        }),
+      runErpBackupNow: () => invoke('run_erp_backup_now'),
+      openErpBackupsFolder: isTauri ? () => invoke('open_erp_backups_folder') : null,
+      browseErpBackupFolder: isTauri ? () => invoke('browse_erp_backup_folder') : null,
+      setErpBackupDir: (newPath, moveExisting) => invoke('set_erp_backup_dir', {
+        newPath: String(newPath || '').trim(),
+        moveExisting: moveExisting !== false,
+      }),
+      browseArchiveFolder: isTauri ? () => invoke('browse_archive_folder') : null,
+      setArchiveDir: (newPath, moveExisting) => invoke('set_archive_dir', {
+        newPath: String(newPath || '').trim(),
+        moveExisting: moveExisting !== false,
+      }),
       saveUploadedFile: isTauri
         ? (fileId, fileName) => invoke('save_uploaded_file', { fileId, fileName: fileName || null })
         : null,
       saveBase64Image: isTauri
         ? (base64Data, fileName) => invoke('save_base64_image', { base64Data, fileName: fileName || null })
+        : null,
+      saveTextFile: isTauri
+        ? (content, fileName) => invoke('save_text_file', { content, fileName })
         : null,
       openArchiveFolder: async (targetPath) => {
         const isLocal = isTauri || location.hostname === '127.0.0.1' || location.hostname === 'localhost';
@@ -147,8 +224,8 @@
         return invoke('open_archive_folder', { targetPath: targetPath || null });
       },
       getAuditLog: () => invoke('get_audit_log'),
-      createRelayGroup: (name, mode, ephemeralBrowser) => invoke('create_relay_group', { name, mode, ephemeralBrowser: Boolean(ephemeralBrowser) }),
-      updateRelayGroup: (groupId, name, mode, allowed, blocked, ephemeralBrowser) => invoke('update_relay_group', { groupId, name, mode, allowed, blocked, ephemeralBrowser: Boolean(ephemeralBrowser) }),
+      createRelayGroup: (name, mode, ephemeralBrowser, usbBlock) => invoke('create_relay_group', { name, mode, ephemeralBrowser: Boolean(ephemeralBrowser), usbBlock: Boolean(usbBlock) }),
+      updateRelayGroup: (groupId, name, mode, allowed, blocked, ephemeralBrowser, usbBlock) => invoke('update_relay_group', { groupId, name, mode, allowed, blocked, ephemeralBrowser: Boolean(ephemeralBrowser), usbBlock: Boolean(usbBlock) }),
       deleteRelayGroup: (groupId) => invoke('delete_relay_group', { groupId }),
       assignDeviceGroup: (deviceId, groupId) => invoke('assign_device_group', { deviceId, groupId: groupId || null }),
       sendGroupCommand: (groupId, command, actorUsername, actorRole) => invoke('send_group_command', {
@@ -160,7 +237,7 @@
       }),
       renameRelayDevice: (deviceId, label) => invoke('rename_relay_device', { deviceId, label }),
       deleteRelayDevice: (deviceId) => invoke('delete_relay_device', { deviceId }),
-      openSupportSession: async (rustdeskId, password, mode) => {
+      openSupportSession: async (rustdeskId, password, mode, deviceIp) => {
         const sessionMode = String(mode || 'support').trim().toLowerCase();
         const isLocalServerHost =
           location.hostname === '127.0.0.1' || location.hostname === 'localhost';
@@ -170,6 +247,7 @@
               rustdeskId,
               password: password || null,
               mode: sessionMode,
+              deviceIp: deviceIp || null,
             });
             if (res && res.success !== false) return res;
             if (isTauri) return res;
@@ -189,8 +267,8 @@
           const timer = setTimeout(() => ctrl.abort(), 900);
           const localRes = await fetch('http://127.0.0.1:8787/api/local/rustdesk-session', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ rustdeskId: id, password: pw, mode: sessionMode }),
+            headers: { 'Content-Type': 'application/json', 'X-ITK-Client': '1' },
+            body: JSON.stringify({ rustdeskId: id, password: pw, mode: sessionMode, deviceIp: deviceIp || '' }),
             signal: ctrl.signal,
           });
           clearTimeout(timer);
@@ -222,6 +300,23 @@
         mode: mode || null,
       }),
       getScreenshot: (deviceId, transport) => invoke('get_screenshot', { deviceId, transport: transport || null }),
+      getWaBotStatus: () => invoke('get_wa_bot_status'),
+      saveWaBotConfig: (config) => invoke('save_wa_bot_config', { config: config || {} }),
+      connectWaBot: () => invoke('connect_wa_bot'),
+      disconnectWaBot: (logout) => invoke('disconnect_wa_bot', { logout: Boolean(logout) }),
+      sendWaBotTest: () => invoke('send_wa_bot_test'),
+      cctvListDvrs: () => invoke('cctv_list_dvrs'),
+      cctvSaveDvr: (dvr) => invoke('cctv_save_dvr', { dvr: dvr || {} }),
+      cctvDeleteDvr: (id) => invoke('cctv_delete_dvr', { id }),
+      cctvTestDvr: (dvr) => invoke('cctv_test_dvr', { dvr: dvr || {} }),
+      cctvScanLan: (bridgeDeviceId) => invoke('cctv_scan_lan', { bridgeDeviceId: bridgeDeviceId || null }),
+      cctvSetSettings: (superOnly) => invoke('cctv_set_settings', { superOnly: Boolean(superOnly) }),
+      cctvGetFrameB64: (dvrId, channel, hd) => invoke('cctv_get_frame_b64', {
+        dvrId,
+        channel: Number(channel || 1),
+        hd: Boolean(hd),
+      }),
+      cctvAction: (action, payload) => invoke('cctv_action', { action, payload: payload || {} }),
       getClientConfig: () => invoke('get_client_config'),
       setClientConfig: (serverUrl, token, password) => invoke('set_client_config', { serverUrl, token, password: password || null }),
       enrollRelay: (relayUrl, pairingToken, password) => invoke('enroll_relay', { relayUrl, pairingToken, password: password || null }),
@@ -437,6 +532,19 @@
     },
     requestScreenshot: async () => ({ success: true }),
     getScreenshot: async () => null,
+    getWaBotStatus: async () => ({ success: true, ok: true, state: 'disconnected', connected: false, config: { enabled: false, recipients: '', max_file_mb: 25, features: {} }, logs: [] }),
+    saveWaBotConfig: async (cfg) => ({ success: true, ok: true, config: cfg }),
+    connectWaBot: async () => ({ success: true, ok: true, state: 'qr_ready' }),
+    disconnectWaBot: async () => ({ success: true, ok: true, state: 'disconnected' }),
+    sendWaBotTest: async () => ({ success: true, ok: true }),
+    cctvListDvrs: async () => ({ ok: true, settings: { super_only: false }, dvrs: [] }),
+    cctvSaveDvr: async () => ({ ok: true, settings: { super_only: false }, dvrs: [] }),
+    cctvDeleteDvr: async () => ({ ok: true, settings: { super_only: false }, dvrs: [] }),
+    cctvTestDvr: async () => ({ ok: true, message: 'Mock OK' }),
+    cctvScanLan: async () => ({ ok: true, found: [] }),
+    cctvSetSettings: async (superOnly) => ({ ok: true, settings: { super_only: Boolean(superOnly) } }),
+    cctvGetFrameB64: async () => ({ ok: false }),
+    cctvAction: async () => ({ ok: true }),
     getClientConfig: async () => ({}),
     setClientConfig: async () => ({ success: true }),
     enrollRelay: async () => ({ success: true }),

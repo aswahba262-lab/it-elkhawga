@@ -35,7 +35,7 @@ impl Transport {
 }
 
 pub enum RelayPollOutcome {
-    Ok(Option<Value>, Option<Value>, bool, String),
+    Ok(Option<Value>, Option<Value>, bool, String, Option<Value>, bool, Option<Value>),
     Unauthorized,
     NetworkError,
 }
@@ -125,6 +125,50 @@ impl RelayClient {
         resp.ok().and_then(|r| r.into_json().ok())
     }
 
+    /// Uploads a live Dahua CCTV JPEG frame (or error) from a branch bridge PC to the Relay.
+    pub fn upload_cctv_frame(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
+        let url = format!("{}/api/v1/device/cctv-frame", relay_url.trim_end_matches('/'));
+        let resp = tls_agent(10)
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(payload.clone());
+        resp.ok().and_then(|r| r.into_json().ok())
+    }
+
+    /// Uploads local subnet Dahua DVR auto-discovery results from a branch bridge PC.
+    pub fn upload_cctv_scan(&self, relay_url: &str, device_token: &str, found: &[Value]) -> Option<Value> {
+        let url = format!("{}/api/v1/device/cctv-scan", relay_url.trim_end_matches('/'));
+        let resp = tls_agent(15)
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(json!({ "found": found }));
+        resp.ok().and_then(|r| r.into_json().ok())
+    }
+
+    /// Uploads an on-demand Dahua CGI response (HDD health, ChannelTitle, playback search/clip, PTZ) from a branch PC.
+    pub fn upload_cctv_cgi(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
+        let url = format!("{}/api/v1/device/cctv-cgi", relay_url.trim_end_matches('/'));
+        let resp = tls_agent(45)
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(payload.clone());
+        resp.ok().and_then(|r| r.into_json().ok())
+    }
+
+    /// Uploads a live micro-chunk of Dahua camera audio (`~1-3 KB` AAC/G.711) while an admin has unmuted a camera.
+    pub fn upload_cctv_audio(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
+        let url = format!("{}/api/v1/device/cctv-audio", relay_url.trim_end_matches('/'));
+        let resp = tls_agent(8)
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", device_token))
+            .set("Content-Type", "application/json")
+            .send_json(payload.clone());
+        resp.ok().and_then(|r| r.into_json().ok())
+    }
+
     pub fn poll_status(
         &self,
         relay_url: &str,
@@ -157,7 +201,10 @@ impl RelayClient {
                         .and_then(|s| s.as_str())
                         .unwrap_or(if screen { "once" } else { "" })
                         .to_string();
-                    RelayPollOutcome::Ok(command, policy, screen, stream_mode)
+                    let cctv_tasks = v.get("cctv_tasks").and_then(|t| if t.is_null() { None } else { Some(t.clone()) });
+                    let cctv_scan = v.get("cctv_scan").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let cctv_cgi = v.get("cctv_cgi").and_then(|c| if c.is_null() { None } else { Some(c.clone()) });
+                    RelayPollOutcome::Ok(command, policy, screen, stream_mode, cctv_tasks, cctv_scan, cctv_cgi)
                 }
                 Err(_) => RelayPollOutcome::NetworkError,
             },
@@ -170,12 +217,14 @@ impl RelayClient {
 /// LAN admin server poll. Carries the same state as the relay poll so LAN devices
 /// get identical features (site log, denied log, events, alerts, throttle, screen).
 pub fn lan_poll(http: &ureq::Agent, link: &ClientLink, ack_command_id: Option<&str>) -> Option<Value> {
+    let cfg = read_config();
     let alert = serde_json::from_str::<Value>(&link.pending_alert).unwrap_or(Value::Null);
     let body = json!({
         "device_id": link.device_id,
         "hostname": hostname(),
         "blocked": is_blocked(),
-        "mode": read_config().mode,
+        "usb_blocked": crate::common::is_usb_effectively_blocked(&cfg, link),
+        "mode": cfg.mode,
         "policy_version": link.policy_version,
         "app_version": APP_VERSION,
         "rustdesk_id": link.rustdesk_id.clone(),

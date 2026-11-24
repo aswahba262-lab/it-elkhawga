@@ -29,7 +29,7 @@ pub fn make_jwt(username: &str, role: &str) -> Result<String, String> {
         sub: username.trim().to_owned(),
         role: crate::common::normalize_admin_role(role),
         iat: now.timestamp().max(0) as usize,
-        exp: (now + Duration::hours(12)).timestamp().max(0) as usize,
+        exp: (now + Duration::days(7)).timestamp().max(0) as usize,
     };
     let secret = jwt_secret();
     encode(
