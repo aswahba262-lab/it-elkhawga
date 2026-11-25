@@ -1,6 +1,6 @@
 [package]
 name = "it-elkhawga"
-version = "1.0.0"
+version = "1.2.0"
 description = "IT ELKHAWGA - Company device and internet control"
 authors = ["Ahmed Wahba"]
 edition = "2021"
@@ -25,7 +25,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 windows-sys = { version = "0.61", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true

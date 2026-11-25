@@ -1,4 +1,4 @@
-﻿# Rust/Tauri build
+# Rust/Tauri build
 src-tauri/target/
 src-tauri/target-*/
 target/

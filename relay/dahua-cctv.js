@@ -1,12 +1,101 @@
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 
+const FFMPEG_CANDIDATES = [
+  'C:\\ProgramData\\IT-ELKHAWGA-Relay\\ffmpeg.exe',
+  'C:\\Users\\IT APP\\.gemini\\antigravity\\brain\\a112d828-8041-4e7c-ae05-3591e36d86fa\\scratch\\video-gen\\node_modules\\ffmpeg-static\\ffmpeg.exe',
+];
+
+let cachedFfmpegBin = null;
+function resolveFfmpegBin() {
+  if (cachedFfmpegBin) return cachedFfmpegBin;
+  for (const p of FFMPEG_CANDIDATES) {
+    try {
+      if (fs.existsSync(p)) {
+        cachedFfmpegBin = p;
+        return p;
+      }
+    } catch (_) {}
+  }
+  return 'ffmpeg';
+}
+
+function isH264AnnexB(buf) {
+  return Boolean(
+    buf &&
+    buf.length >= 512 &&
+    buf[0] === 0x00 &&
+    buf[1] === 0x00 &&
+    ((buf[2] === 0x00 && buf[3] === 0x01) || buf[2] === 0x01)
+  );
+}
+
+function remuxDavBufferToMp4(davBuf) {
+  if (!davBuf || davBuf.length < 1024) return null;
+  if (davBuf.slice(4, 8).toString('ascii') === 'ftyp') return davBuf;
+  const tmpId = crypto.randomUUID().replace(/-/g, '');
+  const inPath = `${os.tmpdir()}\\itk_clip_${tmpId}.dav`;
+  const outPath = `${os.tmpdir()}\\itk_clip_${tmpId}.mp4`;
+  try {
+    fs.writeFileSync(inPath, davBuf);
+    const bin = resolveFfmpegBin();
+    // 1) Fast zero-CPU stream copy (-c:v copy) for H.264/H.265 DAV -> MP4
+    let res = spawnSync(
+      bin,
+      ['-hide_banner', '-loglevel', 'error', '-y', '-i', inPath, '-c:v', 'copy', '-an', '-movflags', '+faststart', outPath],
+      { timeout: 30000, windowsHide: true }
+    );
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
+      // 2) Universal H.264 baseline transcode fallback so iPad / iPhone / Android plays 100% natively
+      res = spawnSync(
+        bin,
+        ['-hide_banner', '-loglevel', 'error', '-y', '-i', inPath, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', outPath],
+        { timeout: 45000, windowsHide: true }
+      );
+    }
+    if (fs.existsSync(outPath)) {
+      const mp4Buf = fs.readFileSync(outPath);
+      if (mp4Buf && mp4Buf.length > 1024 && mp4Buf.slice(4, 8).toString('ascii') === 'ftyp') {
+        return mp4Buf;
+      }
+    }
+  } catch (_) {
+  } finally {
+    try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath); } catch (_) {}
+    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+  }
+  return null;
+}
+
+function transcodeH264KeyframeToJpeg(h264Buf) {
+  try {
+    const bin = resolveFfmpegBin();
+    const res = spawnSync(
+      bin,
+      ['-hide_banner', '-loglevel', 'error', '-f', 'h264', '-i', 'pipe:0', '-frames:v', '1', '-f', 'image2', '-c:v', 'mjpeg', '-q:v', '4', 'pipe:1'],
+      {
+        input: h264Buf,
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 3500,
+        windowsHide: true,
+      }
+    );
+    if (res && res.stdout && res.stdout.length >= 256 && res.stdout[0] === 0xff && res.stdout[1] === 0xd8) {
+      return res.stdout;
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Disable HTTP keep-alive to Dahua DVRs: embedded Dahua HTTP servers (sonia/boa) only have
+// 4-6 worker threads total; holding idle keep-alive sockets open exhausts the DVR's worker pool.
 const dvrHttpAgent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 48,
-  keepAliveMsecs: 15000,
+  keepAlive: false,
+  maxSockets: 16,
 });
 
 function rid(prefix = '') {
@@ -82,9 +171,9 @@ function rawHttpGet({ host, port, pathWithQuery, headers = {}, timeoutMs = 6000 
         path: pathWithQuery,
         method: 'GET',
         headers: {
-          Connection: 'keep-alive',
+          Connection: 'close',
           Accept: '*/*',
-          'User-Agent': 'IT-ELKHAWGA-CCTV/1.0',
+          'User-Agent': 'IT-ELKHAWGA-CCTV/1.1',
           ...headers,
         },
         agent: dvrHttpAgent,
@@ -139,12 +228,17 @@ export function createDahuaCctvManager({ db }) {
     INSERT OR IGNORE INTO cctv_settings(id, super_only) VALUES (1, 0);
   `);
 
-  // Safe schema migrations for v1.1.0+ enterprise CCTV & Live Audio features
+  // Safe schema migrations for v1.1.0+ enterprise CCTV & Live Audio & Router Direct features
   for (const sql of [
     "ALTER TABLE cctv_dvrs ADD COLUMN hidden_channels TEXT DEFAULT '[]'",
     "ALTER TABLE cctv_dvrs ADD COLUMN allowed_admins TEXT DEFAULT ''",
     "ALTER TABLE cctv_dvrs ADD COLUMN health_json TEXT DEFAULT '{}'",
     "ALTER TABLE cctv_dvrs ADD COLUMN audio_channels TEXT DEFAULT ''",
+    "ALTER TABLE cctv_dvrs ADD COLUMN router_host TEXT DEFAULT ''",
+    "ALTER TABLE cctv_dvrs ADD COLUMN router_http_port INTEGER NOT NULL DEFAULT 8081",
+    "ALTER TABLE cctv_dvrs ADD COLUMN router_rtsp_port INTEGER NOT NULL DEFAULT 5540",
+    "ALTER TABLE cctv_dvrs ADD COLUMN backup_bridge_device_id TEXT DEFAULT ''",
+    "ALTER TABLE cctv_dvrs ADD COLUMN remote_channels_json TEXT DEFAULT '{}'",
     "ALTER TABLE cctv_settings ADD COLUMN favorites_json TEXT DEFAULT '[]'",
     "ALTER TABLE cctv_settings ADD COLUMN auto_hide_empty INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE cctv_settings ADD COLUMN schedule_morning TEXT DEFAULT '10:00'",
@@ -189,13 +283,21 @@ export function createDahuaCctvManager({ db }) {
   // Remote branch on-demand Dahua CGI jobs: jobId -> { deviceId, jobPayload, until, resolve, reject }
   const branchCgiJobs = new Map();
 
-  // Latest frames cached in memory: key = `${dvrId}:${channel}:${hd ? 1 : 0}` -> { buf, mime, at, error }
+  // Latest frames cached in memory: key = `${dvrId}:${channel}:${hd ? 1 : 0}` -> { buf, mime, at, error, transport }
   const frameCache = new Map();
+  // Channels that have produced at least 1 valid image frame (never auto-marked dead on transient timeouts!)
+  const verifiedWorkingChannels = new Set();
+  // Consecutive failure counter per `${dvrId}:${channel}` before marking an unplugged BNC port as dead
+  const channelFailCounts = new Map();
   // Temporary cooldown for unplugged/offline channels so bridge PCs never stall on empty BNC/IP slots
   const deadChannelUntil = new Map();
   // Deduplicate concurrent identical direct & bridge fetches
   const inflightDirect = new Map();
   const inflightBridge = new Map();
+  // Router direct reachability cache per dvrId -> { ok, checkedAt, routerHost, routerPort, lastSuccessAt }
+  const routerReachabilityCache = new Map();
+  // Last frame arrival timestamp per bridge deviceId -> ms (for automatic failover to backup branch PC)
+  const bridgeLastFrameAt = new Map();
 
   function getSettings() {
     const row = db.prepare('SELECT * FROM cctv_settings WHERE id=1').get() || {};
@@ -221,7 +323,7 @@ export function createDahuaCctvManager({ db }) {
     const eve = typeof patch.schedule_evening === 'string' && /^\d{2}:\d{2}$/.test(patch.schedule_evening.trim())
       ? patch.schedule_evening.trim()
       : cur.schedule_evening;
-    const favs = Array.isArray(patch.favorites) ? patch.favorites.slice(0, 32) : cur.favorites;
+    const favs = Array.isArray(patch.favorites) ? patch.favorites.slice(0, 64) : cur.favorites;
     db.prepare(`UPDATE cctv_settings
       SET super_only=?, auto_hide_empty=?, schedule_morning=?, schedule_evening=?, favorites_json=?
       WHERE id=1`).run(
@@ -247,6 +349,61 @@ export function createDahuaCctvManager({ db }) {
     return out;
   }
 
+  function isPublicIpv4(ipStr) {
+    const s = String(ipStr || '').trim();
+    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s)) return false;
+    if (s.startsWith('127.') || s.startsWith('10.') || s.startsWith('192.168.') || s.startsWith('169.254.') || s.startsWith('100.')) return false;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(s)) return false;
+    return true;
+  }
+
+  // Automatically selects the best online PC in the branch (primary -> backup -> same branch name prefix)
+  function resolveActiveBridgeDevice(dvr) {
+    if (!dvr) return null;
+    const nowMs = Date.now();
+    const allDevs = db.prepare('SELECT device_id, label, hostname, app_version, last_seen, ip, group_id FROM devices').all();
+    const byId = new Map(allDevs.map((d) => [d.device_id, d]));
+    const isReady = (d) => Boolean(d && d.last_seen && (nowMs - Number(d.last_seen) < 48_000) && isVersionAtLeast(d.app_version, 1, 0, 9));
+
+    const primary = byId.get(String(dvr.bridge_device_id || '').trim());
+    const backup = byId.get(String(dvr.backup_bridge_device_id || '').trim());
+
+    // If primary is online, check if it has stalled while backup is online
+    if (isReady(primary)) {
+      const pLastFrame = bridgeLastFrameAt.get(primary.device_id) || 0;
+      const pLeaseMap = bridgeLeases.get(primary.device_id);
+      const hasActiveLease = Boolean(pLeaseMap && pLeaseMap.size > 0);
+      // If primary is healthy or no backup is ready, use primary
+      if (!isReady(backup) || !hasActiveLease || (nowMs - pLastFrame < 14_000) || pLastFrame === 0) {
+        return primary;
+      }
+    }
+    if (isReady(backup)) {
+      return backup;
+    }
+    // Auto-match another online PC on the exact same Branch Router Public IP!
+    const primaryPublicIp = primary && isPublicIpv4(primary.ip) ? primary.ip : (isPublicIpv4(dvr.router_host) ? dvr.router_host : '');
+    if (primaryPublicIp) {
+      const sameIpMatch = allDevs.find((d) => isReady(d) && d.ip === primaryPublicIp);
+      if (sameIpMatch) return sameIpMatch;
+    }
+    // Auto-match another online PC in the same branch by branch name prefix (e.g. "october", "doki", "zayed", "nozha", "maadi", "helwan")
+    const branchFirstWord = String(dvr.name || '')
+      .trim()
+      .toLowerCase()
+      .split(/[\s_-]+/)[0];
+    if (branchFirstWord && branchFirstWord.length >= 3) {
+      const match = allDevs.find((d) => {
+        if (!isReady(d)) return false;
+        const lbl = String(d.label || d.hostname || '').toLowerCase();
+        return lbl.includes(branchFirstWord);
+      });
+      if (match) return match;
+    }
+    // Fallback to primary record even if offline so caller can display a clear message
+    return primary || backup || null;
+  }
+
   function sanitizeDvrForClient(row, bridgeDevicesMap) {
     let channelNames = {};
     let hiddenChannels = [];
@@ -260,12 +417,25 @@ export function createDahuaCctvManager({ db }) {
     if (!Array.isArray(hiddenChannels)) hiddenChannels = [];
     if (!Array.isArray(audioChannels)) audioChannels = [];
     const bName = row.bridge_device_id && bridgeDevicesMap ? (bridgeDevicesMap.get(row.bridge_device_id) || '') : '';
+    const backupName = row.backup_bridge_device_id && bridgeDevicesMap ? (bridgeDevicesMap.get(row.backup_bridge_device_id) || '') : '';
+    const activeDev = resolveActiveBridgeDevice(row);
+    const activeBridgeId = (activeDev && activeDev.device_id) || row.bridge_device_id || '';
+    const activeBridgeName = (activeDev && (activeDev.label || activeDev.hostname || activeDev.device_id)) || bName;
+    const rCache = routerReachabilityCache.get(row.id);
     return {
       id: row.id,
       name: row.name,
       connection_mode: row.connection_mode || 'direct',
       bridge_device_id: row.bridge_device_id || '',
       bridge_device_name: bName,
+      backup_bridge_device_id: row.backup_bridge_device_id || '',
+      backup_bridge_device_name: backupName,
+      active_bridge_device_id: activeBridgeId,
+      active_bridge_device_name: activeBridgeName,
+      router_host: String(row.router_host || ''),
+      router_http_port: Number(row.router_http_port || 8081) || 8081,
+      router_rtsp_port: Number(row.router_rtsp_port || 5540) || 5540,
+      router_direct_online: Boolean(rCache && rCache.ok && (Date.now() - rCache.checkedAt < 120_000)),
       host: row.host,
       http_port: Number(row.http_port || 80),
       rtsp_port: Number(row.rtsp_port || 554),
@@ -322,16 +492,34 @@ export function createDahuaCctvManager({ db }) {
     const existing = getRawDvr(id);
     const name = String(payload.name || '').trim().slice(0, 100);
     if (!name) throw new Error('يرجى إدخال اسم الفرع أو المخزن');
-    const mode = payload.connection_mode === 'bridge' ? 'bridge' : 'direct';
-    const bridgeDeviceId = mode === 'bridge' ? String(payload.bridge_device_id || '').trim() : '';
-    if (mode === 'bridge' && !bridgeDeviceId) {
+    const rawMode = String(payload.connection_mode || 'bridge').trim().toLowerCase();
+    const mode = rawMode === 'router' ? 'router' : (rawMode === 'direct' ? 'direct' : 'bridge');
+    const bridgeDeviceId = (mode === 'bridge' || mode === 'router')
+      ? String(payload.bridge_device_id || (existing && existing.bridge_device_id) || '').trim()
+      : '';
+    const backupBridgeDeviceId = (mode === 'bridge' || mode === 'router')
+      ? String(payload.backup_bridge_device_id !== undefined ? payload.backup_bridge_device_id : ((existing && existing.backup_bridge_device_id) || '')).trim()
+      : '';
+    if (mode === 'bridge' && !bridgeDeviceId && !backupBridgeDeviceId) {
       throw new Error('يرجى اختيار جهاز الكمبيوتر الوسيط في الفرع عند استخدام وضع الربط عبر جسر الفرع');
     }
-    let host = String(payload.host || '').trim().replace(/^https?:\/\//i, '').split('/')[0] || '';
+    let routerHost = String(payload.router_host !== undefined ? payload.router_host : ((existing && existing.router_host) || ''))
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .split('/')[0] || '';
+    if (routerHost.includes(':')) routerHost = routerHost.split(':')[0];
+    const routerHttpPort = Math.max(1, Math.min(65535, Number(payload.router_http_port || (existing && existing.router_http_port) || 8081) || 8081));
+    const routerRtspPort = Math.max(1, Math.min(65535, Number(payload.router_rtsp_port || (existing && existing.router_rtsp_port) || 5540) || 5540));
+
+    let host = String(payload.host || (existing && existing.host) || '').trim().replace(/^https?:\/\//i, '').split('/')[0] || '';
     if (host.includes(':')) {
       host = host.split(':')[0];
     }
-    if (!host) throw new Error('يرجى إدخال عنوان IP الخاص بجهاز Dahua DVR (مثل 192.168.1.108)');
+    if (!host && routerHost) host = routerHost;
+    if (!host) throw new Error('يرجى إدخال عنوان IP الخاص بجهاز Dahua DVR (مثل 10.10.1.108 أو 192.168.1.108)');
+    if (mode === 'router' && !routerHost && !bridgeDeviceId) {
+      throw new Error('في وضع راوتر الفرع، أدخل الـ Public IP للراوتر أو اختر كمبيوتر الفرع لاكتشاف الـ IP تلقائياً');
+    }
     const httpPort = Math.max(1, Math.min(65535, Number(payload.http_port || 80) || 80));
     const rtspPort = Math.max(1, Math.min(65535, Number(payload.rtsp_port || 554) || 554));
     const username = String(payload.username || 'admin').trim().slice(0, 64) || 'admin';
@@ -358,20 +546,21 @@ export function createDahuaCctvManager({ db }) {
 
     if (existing) {
       db.prepare(`UPDATE cctv_dvrs SET
-        name=?, connection_mode=?, bridge_device_id=?, host=?, http_port=?, rtsp_port=?,
-        username=?, password=?, channels_count=?, channel_names=?, hidden_channels=?, allowed_admins=?, enabled=?, updated_at=?
+        name=?, connection_mode=?, bridge_device_id=?, backup_bridge_device_id=?, router_host=?, router_http_port=?, router_rtsp_port=?,
+        host=?, http_port=?, rtsp_port=?, username=?, password=?, channels_count=?, channel_names=?, hidden_channels=?, allowed_admins=?, enabled=?, updated_at=?
         WHERE id=?`).run(
-        name, mode, bridgeDeviceId, host, httpPort, rtspPort,
-        username, password, channelsCount, JSON.stringify(channelNamesObj), JSON.stringify(hiddenArr), allowedAdmins, enabled, ts, id
+        name, mode, bridgeDeviceId, backupBridgeDeviceId, routerHost, routerHttpPort, routerRtspPort,
+        host, httpPort, rtspPort, username, password, channelsCount, JSON.stringify(channelNamesObj), JSON.stringify(hiddenArr), allowedAdmins, enabled, ts, id
       );
     } else {
       db.prepare(`INSERT INTO cctv_dvrs
-        (id, name, connection_mode, bridge_device_id, host, http_port, rtsp_port, username, password, channels_count, channel_names, hidden_channels, allowed_admins, enabled, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-        id, name, mode, bridgeDeviceId, host, httpPort, rtspPort,
-        username, password, channelsCount, JSON.stringify(channelNamesObj), JSON.stringify(hiddenArr), allowedAdmins, enabled, ts, ts
+        (id, name, connection_mode, bridge_device_id, backup_bridge_device_id, router_host, router_http_port, router_rtsp_port, host, http_port, rtsp_port, username, password, channels_count, channel_names, hidden_channels, allowed_admins, enabled, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        id, name, mode, bridgeDeviceId, backupBridgeDeviceId, routerHost, routerHttpPort, routerRtspPort,
+        host, httpPort, rtspPort, username, password, channelsCount, JSON.stringify(channelNamesObj), JSON.stringify(hiddenArr), allowedAdmins, enabled, ts, ts
       );
     }
+    routerReachabilityCache.delete(id);
     return listDvrs();
   }
 
@@ -380,10 +569,10 @@ export function createDahuaCctvManager({ db }) {
     return listDvrs();
   }
 
-  async function dahuaAuthedGet({ host, port, pathWithQuery, username, password, timeoutMs = 5500 }) {
+  async function dahuaAuthedGet({ host, port, pathWithQuery, username, password, timeoutMs = 4500 }) {
     const cacheKey = `${host}:${port}:${username}`;
     const cached = digestCache.get(cacheKey);
-    if (cached && cached.challenge) {
+    if (cached && cached.challenge && (cached.nc || 1) < 500) {
       cached.nc = (cached.nc || 1) + 1;
       const authHdr = buildDigestAuthorization({
         method: 'GET',
@@ -400,14 +589,33 @@ export function createDahuaCctvManager({ db }) {
         headers: { Authorization: authHdr },
         timeoutMs,
       });
-      if (r1.statusCode !== 401) {
+      const isAuthErrBody = r1.body && r1.body.length <= 256 && r1.body.toString('utf8').includes('Invalid Authority');
+      if (r1.statusCode !== 401 && !isAuthErrBody) {
         return r1;
       }
+      digestCache.delete(cacheKey);
+    } else if (cached) {
       digestCache.delete(cacheKey);
     }
 
     // Initial request to obtain WWW-Authenticate challenge
-    const probe = await rawHttpGet({ host, port, pathWithQuery, timeoutMs });
+    let probe = await rawHttpGet({ host, port, pathWithQuery, timeoutMs });
+    const probeAuthErrBody = probe.body && probe.body.length <= 256 && probe.body.toString('utf8').includes('Invalid Authority');
+    if (probe.statusCode !== 401 && probeAuthErrBody) {
+      // Older Dahua HCVR firmware returns HTTP 200 "Invalid Authority!" on unauthenticated /cgi-bin/snapshot.cgi;
+      // probe ChannelTitle to obtain the HTTP 401 WWW-Authenticate Digest challenge.
+      try {
+        const authProbe = await rawHttpGet({
+          host,
+          port,
+          pathWithQuery: '/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle',
+          timeoutMs,
+        });
+        if (authProbe.statusCode === 401 && authProbe.headers && authProbe.headers['www-authenticate']) {
+          probe = authProbe;
+        }
+      } catch (_) {}
+    }
     if (probe.statusCode !== 401) {
       return probe;
     }
@@ -449,41 +657,279 @@ export function createDahuaCctvManager({ db }) {
     return (buf[0] === 0xff && buf[1] === 0xd8) || (buf[0] === 0x89 && buf[1] === 0x50);
   }
 
-  async function fetchDirectSnapshot(dvr, channel, hd = false) {
+  // Per-DVR HTTP concurrency queue so embedded Dahua web servers (which have only 4-6 worker threads
+  // and 1 hardware JPEG encoder) never deadlock when an admin views 4-16 cameras simultaneously.
+  const dvrHttpQueues = new Map(); // dvrKey -> { active: number, max: number, queue: Array<() => void> }
+
+  function runDvrHttpQueued(dvr, taskFn) {
+    const dvrKey = (dvr && (dvr.id || `${dvr.host}:${dvr.http_port}`)) || 'default';
+    const maxConc = Number((dvr && dvr.channels_count) || 8) <= 4 ? 1 : 2;
+    let qState = dvrHttpQueues.get(dvrKey);
+    if (!qState) {
+      qState = { active: 0, max: maxConc, queue: [] };
+      dvrHttpQueues.set(dvrKey, qState);
+    } else {
+      qState.max = maxConc;
+    }
+    return new Promise((resolve, reject) => {
+      const exec = async () => {
+        qState.active += 1;
+        try {
+          resolve(await taskFn());
+        } catch (err) {
+          reject(err);
+        } finally {
+          qState.active = Math.max(0, qState.active - 1);
+          const next = qState.queue.shift();
+          if (next) next();
+        }
+      };
+      if (qState.active < qState.max) {
+        exec();
+      } else {
+        // Bound queue length so stale snapshot requests never pile up
+        if (qState.queue.length >= 16) {
+          reject(new Error('DVR HTTP queue busy'));
+          return;
+        }
+        qState.queue.push(exec);
+      }
+    });
+  }
+
+  // Continuous on-demand RTSP-to-MJPEG live streaming engine (`8-10 FPS` when port 554 is open, `0% CPU` when closed)
+  const activeRtspStreams = new Map(); // cacheKey -> { proc, dvrId, ch, hd, startedAt, lastFrameAt, frameCount, until }
+  const rtspFailCooldown = new Map();  // `${dvrId}:${ch}` -> timestamp ms
+  const dvrLastRtspSpawnAt = new Map(); // dvrId -> timestamp ms (staggers RTSP handshakes by 450ms so DVR never drops concurrent DESCRIBE)
+  const dvrIpChannelFallbackUntil = new Map(); // `${dvrId}:${ch}` -> timestamp ms when parent DVR HTTP/RTSP failed for a hybrid IP cam
+
+  function ensureRtspLiveStream(dvr, targetHost, rtspPort, channel, hd = false, transportTag = 'router') {
+    if (!dvr || !dvr.id || !targetHost || !rtspPort) return false;
     const ch = Math.max(1, Math.min(64, Number(channel || 1) || 1));
+    const tileKey = `${dvr.id}:${ch}`;
+    const cacheKey = `${dvr.id}:${ch}:${hd ? 1 : 0}`;
+    const nowMs = Date.now();
+
+    const deadInfo = deadChannelUntil.get(tileKey);
+    if (deadInfo && deadInfo.until > nowMs && !verifiedWorkingChannels.has(tileKey)) {
+      return false;
+    }
+    const cooldownUntil = rtspFailCooldown.get(tileKey) || 0;
+    if (cooldownUntil > nowMs) {
+      return false;
+    }
+
+    const existing = activeRtspStreams.get(cacheKey);
+    if (existing) {
+      existing.until = nowMs + 12_000;
+      return existing.frameCount > 0;
+    }
+
+    // Stagger new RTSP connection handshakes to the same DVR by 450ms so the DVR's RTSP daemon
+    // accepts every channel cleanly while HTTP snapshots immediately populate the initial view.
+    const lastSpawn = dvrLastRtspSpawnAt.get(dvr.id) || 0;
+    if (nowMs - lastSpawn < 450) {
+      return false;
+    }
+
+    // Cap concurrent RTSP ffmpeg workers per DVR at 6 so we never saturate branch VDSL upload
+    let dvrStreamCount = 0;
+    for (const st of activeRtspStreams.values()) {
+      if (st.dvrId === dvr.id) dvrStreamCount += 1;
+    }
+    if (dvrStreamCount >= 6) return false;
+
+    dvrLastRtspSpawnAt.set(dvr.id, nowMs);
+    const userEnc = encodeURIComponent(String(dvr.username || 'admin'));
+    const passEnc = encodeURIComponent(String(dvr.password || ''));
     const sub = hd ? 0 : 1;
-    const primaryPath = `/cgi-bin/snapshot.cgi?channel=${ch}&subtype=${sub}`;
-    let resp = await dahuaAuthedGet({
-      host: dvr.host,
-      port: dvr.http_port,
-      pathWithQuery: primaryPath,
-      username: dvr.username,
-      password: dvr.password,
-      timeoutMs: 5500,
+    const rtspUrl = `rtsp://${userEnc}:${passEnc}@${targetHost}:${rtspPort}/cam/realmonitor?channel=${ch}&subtype=${sub}`;
+    const vf = hd ? 'fps=10' : 'fps=8';
+    const qv = hd ? '4' : '5';
+
+    let proc;
+    try {
+      proc = spawn(
+        resolveFfmpegBin(),
+        [
+          '-hide_banner',
+          '-loglevel', 'error',
+          '-rtsp_transport', 'tcp',
+          '-timeout', '5000000',
+          '-i', rtspUrl,
+          '-an',
+          '-vf', vf,
+          '-f', 'image2pipe',
+          '-vcodec', 'mjpeg',
+          '-q:v', qv,
+          'pipe:1',
+        ],
+        { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+    } catch (_) {
+      rtspFailCooldown.set(tileKey, nowMs + 120_000);
+      return false;
+    }
+
+    const state = {
+      proc,
+      dvrId: dvr.id,
+      ch,
+      hd: Boolean(hd),
+      startedAt: nowMs,
+      lastFrameAt: 0,
+      frameCount: 0,
+      until: nowMs + 12_000,
+    };
+    activeRtspStreams.set(cacheKey, state);
+
+    let carry = Buffer.alloc(0);
+    const SOI = Buffer.from([0xff, 0xd8]);
+    const EOI = Buffer.from([0xff, 0xd9]);
+
+    proc.stdout.on('data', (chunk) => {
+      if (Date.now() > state.until) {
+        try { proc.kill(); } catch (_) {}
+        activeRtspStreams.delete(cacheKey);
+        return;
+      }
+      carry = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+      if (carry.length > 2 * 1024 * 1024) {
+        carry = Buffer.alloc(0);
+        return;
+      }
+      while (true) {
+        const soi = carry.indexOf(SOI);
+        if (soi === -1) {
+          carry = Buffer.alloc(0);
+          break;
+        }
+        const eoi = carry.indexOf(EOI, soi + 2);
+        if (eoi === -1) {
+          if (soi > 0) carry = carry.subarray(soi);
+          break;
+        }
+        const jpg = Buffer.from(carry.subarray(soi, eoi + 2));
+        carry = carry.subarray(eoi + 2);
+        // Require complete decoded keyframe/P-frame (>= 5.5 KB) so pre-keyframe H.265 artifacts are never shown
+        if (jpg.length >= 5500) {
+          const ts = Date.now();
+          state.lastFrameAt = ts;
+          state.frameCount += 1;
+          verifiedWorkingChannels.add(tileKey);
+          channelFailCounts.delete(tileKey);
+          deadChannelUntil.delete(tileKey);
+          const rec = { buf: jpg, mime: 'image/jpeg', at: ts, error: '', transport: transportTag };
+          frameCache.set(cacheKey, rec);
+          if (hd) frameCache.set(`${dvr.id}:${ch}:0`, rec);
+        }
+      }
     });
 
-    if (resp.statusCode === 401) {
-      throw new Error('اسم المستخدم أو كلمة مرور جهاز الـ DVR غير صحيحة (HTTP 401)');
-    }
+    const cleanup = () => {
+      activeRtspStreams.delete(cacheKey);
+      if (state.frameCount === 0 && Date.now() <= state.until) {
+        rtspFailCooldown.set(tileKey, Date.now() + 60_000);
+      }
+    };
+    proc.once('exit', cleanup);
+    proc.once('error', cleanup);
+    return false;
+  }
 
-    if ((resp.statusCode !== 200 || !isLikelyImage(resp.body)) && !hd) {
-      // Older Dahua firmware fallback without &subtype=1
-      resp = await dahuaAuthedGet({
-        host: dvr.host,
-        port: dvr.http_port,
-        pathWithQuery: `/cgi-bin/snapshot.cgi?channel=${ch}`,
-        username: dvr.username,
-        password: dvr.password,
-        timeoutMs: 5500,
-      });
+  // Reap idle or stalled RTSP ffmpeg workers every 2.5 seconds
+  setInterval(() => {
+    const nowMs = Date.now();
+    for (const [key, st] of activeRtspStreams.entries()) {
+      const stalledStartup = st.frameCount === 0 && (nowMs - st.startedAt > 7500);
+      const stalledMidstream = st.frameCount > 0 && (nowMs - st.lastFrameAt > 8500);
+      if (nowMs > st.until || stalledStartup || stalledMidstream) {
+        if (stalledStartup) {
+          rtspFailCooldown.set(`${st.dvrId}:${st.ch}`, nowMs + 60_000);
+        }
+        try { st.proc.kill(); } catch (_) {}
+        activeRtspStreams.delete(key);
+      }
     }
+  }, 2500).unref();
 
-    if (resp.statusCode !== 200 || !isLikelyImage(resp.body)) {
-      throw new Error(`تعذر جلب صورة الكاميرا رقم ${ch} (HTTP ${resp.statusCode || 0})`);
-    }
+  async function fetchDirectSnapshot(dvr, channel, hd = false) {
+    return runDvrHttpQueued(dvr, async () => {
+      let ch = Math.max(1, Math.min(64, Number(channel || 1) || 1));
+      let targetHost = dvr.host;
+      let targetPort = dvr.http_port;
+      let targetUser = dvr.username;
+      let targetPass = dvr.password;
+      const tileKey = dvr.id ? `${dvr.id}:${ch}` : '';
+      if (!isPublicIpv4(targetHost) && tileKey && (dvrIpChannelFallbackUntil.get(tileKey) || 0) > Date.now()) {
+        const remCam = parseRemoteChannelsMap(dvr)[String(ch)];
+        if (remCam && remCam.host) {
+          targetHost = remCam.host;
+          targetPort = Number(remCam.http_port || 80) || 80;
+          targetUser = remCam.username || targetUser;
+          if (remCam.password && !/^\*+$/.test(String(remCam.password))) {
+            targetPass = remCam.password;
+          }
+          ch = Number(remCam.remote_channel || 1) || 1;
+        }
+      }
+      const sub = hd ? 0 : 1;
+      const primaryPath = `/cgi-bin/snapshot.cgi?channel=${ch}&subtype=${sub}`;
+      let resp = null;
+      try {
+        resp = await dahuaAuthedGet({
+          host: targetHost,
+          port: targetPort,
+          pathWithQuery: primaryPath,
+          username: targetUser,
+          password: targetPass,
+          timeoutMs: 4200,
+        });
+      } catch (err) {
+        if (hd) throw err;
+      }
 
-    const mime = resp.body[0] === 0x89 ? 'image/png' : 'image/jpeg';
-    return { buf: resp.body, mime, at: Date.now() };
+      if (resp && resp.statusCode === 401) {
+        throw new Error('اسم المستخدم أو كلمة مرور جهاز الـ DVR غير صحيحة (HTTP 401)');
+      }
+
+      if ((!resp || resp.statusCode !== 200 || !isLikelyImage(resp.body)) && !hd) {
+        // Older Dahua firmware / hybrid IP channel fallback without &subtype=1
+        resp = await dahuaAuthedGet({
+          host: targetHost,
+          port: targetPort,
+          pathWithQuery: `/cgi-bin/snapshot.cgi?channel=${ch}`,
+          username: targetUser,
+          password: targetPass,
+          timeoutMs: 4800,
+        });
+      }
+
+      if (!resp || resp.statusCode !== 200 || !isLikelyImage(resp.body)) {
+        const code = (resp && resp.statusCode) || 0;
+        if (tileKey && (code === 400 || code === 404 || code === 500)) {
+          const fails = (channelFailCounts.get(tileKey) || 0) + 1;
+          channelFailCounts.set(tileKey, fails);
+          const remCam = parseRemoteChannelsMap(dvr)[String(channel)];
+          if (remCam && remCam.host) {
+            dvrIpChannelFallbackUntil.set(tileKey, Date.now() + 300_000);
+          } else if (!verifiedWorkingChannels.has(tileKey) && fails >= 2) {
+            deadChannelUntil.set(tileKey, {
+              until: Date.now() + 180_000,
+              error: `القناة رقم ${channel} غير موصلة على الـ DVR (HTTP ${code})`,
+            });
+          }
+        }
+        throw new Error(`تعذر جلب صورة الكاميرا رقم ${channel} (HTTP ${code})`);
+      }
+
+      if (tileKey) {
+        channelFailCounts.delete(tileKey);
+        deadChannelUntil.delete(tileKey);
+      }
+      const mime = resp.body[0] === 0x89 ? 'image/png' : 'image/jpeg';
+      return { buf: resp.body, mime, at: Date.now() };
+    });
   }
 
   function isVersionAtLeast(verStr, minMajor, minMinor, minPatch) {
@@ -496,12 +942,30 @@ export function createDahuaCctvManager({ db }) {
 
   async function testDvrConnection(payload) {
     const existing = payload.id ? getRawDvr(payload.id) : null;
-    const mode = payload.connection_mode === 'bridge' ? 'bridge' : 'direct';
+    const rawMode = String(payload.connection_mode || (existing && existing.connection_mode) || 'bridge').trim().toLowerCase();
+    const mode = rawMode === 'router' ? 'router' : (rawMode === 'direct' ? 'direct' : 'bridge');
     let host = String(payload.host || (existing && existing.host) || '').trim().replace(/^https?:\/\//i, '').split('/')[0];
     if (host.includes(':')) host = host.split(':')[0];
     const httpPort = Number(payload.http_port || (existing && existing.http_port) || 80) || 80;
     const username = String(payload.username || (existing && existing.username) || 'admin').trim();
     const password = payload.password ? String(payload.password) : (existing ? existing.password : '');
+
+    if (mode === 'router') {
+      const rProbe = await detectRouterIpAndProbePort({
+        dvr_id: existing ? existing.id : '',
+        bridge_device_id: payload.bridge_device_id || (existing && existing.bridge_device_id) || '',
+        router_host: payload.router_host || (existing && existing.router_host) || '',
+        router_http_port: payload.router_http_port || (existing && existing.router_http_port) || 8081,
+        host: host || '10.10.1.108',
+        http_port: httpPort,
+        username,
+        password,
+      });
+      if (!rProbe.ok) {
+        throw new Error(rProbe.error || 'تعذر فحص راوتر الفرع');
+      }
+      return rProbe;
+    }
 
     if (!host) throw new Error('يرجى كتابة عنوان IP للـ DVR أولاً (مثل 192.168.1.108 أو 10.10.1.108)');
 
@@ -630,6 +1094,34 @@ export function createDahuaCctvManager({ db }) {
     });
   }
 
+  function getRecommendedConcurrency(dvr) {
+    let model = '';
+    try {
+      const h = JSON.parse((dvr && dvr.health_json) || '{}') || {};
+      model = String(h.device_model || '');
+    } catch (_) {}
+    // Older Dahua HCVR-S2 / HCVR-S3 / DVR04 / DVR08 models use a single hardware JPEG encoder
+    // that responds ~2.5x faster and 100% reliably when queried sequentially (`concurrency = 1`).
+    if (/HCVR|DVR04|DVR08|-S2|-S3/i.test(model) || Number((dvr && dvr.channels_count) || 8) <= 4) {
+      return 1;
+    }
+    return 4;
+  }
+
+  function parseRemoteChannelsMap(dvr) {
+    if (!dvr || !dvr.remote_channels_json) return {};
+    try {
+      const parsed = typeof dvr.remote_channels_json === 'object'
+        ? dvr.remote_channels_json
+        : JSON.parse(dvr.remote_channels_json || '{}');
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  const ipCamDirectFailUntil = new Map();
+
   // Called inside /api/v1/device/poll for employee bridge PCs
   function getActiveTaskForDevice(deviceId) {
     if (!deviceId) return null;
@@ -647,10 +1139,40 @@ export function createDahuaCctvManager({ db }) {
           map.delete(k);
           continue;
         }
-        const deadInfo = deadChannelUntil.get(`${dvr.id}:${item.channel}`);
-        if (deadInfo && deadInfo.until > nowMs) {
+        const chKey = `${dvr.id}:${item.channel}`;
+        const deadInfo = deadChannelUntil.get(chKey);
+        if (deadInfo && deadInfo.until > nowMs && !verifiedWorkingChannels.has(chKey)) {
           continue;
         }
+        const remoteMap = parseRemoteChannelsMap(dvr);
+        const remCam = remoteMap[String(item.channel)];
+        const directIpSkipUntil = ipCamDirectFailUntil.get(chKey) || 0;
+        const parentDvrFailedForIpCam = (dvrIpChannelFallbackUntil.get(chKey) || 0) > nowMs;
+        const hasValidRemPass = Boolean(remCam && remCam.password && !/^\*+$/.test(String(remCam.password)));
+        // Only query the IP camera's individual LAN IP directly if the parent DVR itself failed on that channel
+        // (e.g. Dokki Ch4 Imou IPC-A12 where the old HCVR returns HTTP 500 on snapshot.cgi), whereas in all standard
+        // branches (October, Maadi, etc.) the DVR itself streams all added IP cameras directly!
+        if (remCam && remCam.host && hasValidRemPass && parentDvrFailedForIpCam && directIpSkipUntil <= nowMs) {
+          const vId = `${dvr.id}__ipch_${item.channel}`;
+          const rCh = Number(remCam.remote_channel || 1) || 1;
+          byDvr.set(vId, {
+            dvr_id: vId,
+            host: remCam.host,
+            http_port: Number(remCam.http_port || 80),
+            username: remCam.username || dvr.username || 'admin',
+            password: remCam.password || dvr.password || '',
+            channels: [rCh],
+            hd: Boolean(item.hd),
+            concurrency: 1,
+            until: item.until,
+            ttl_ms: Math.max(2000, item.until - nowMs),
+            audio_channel: 0,
+            audio_until: 0,
+            audio_ttl_ms: 0,
+          });
+          continue;
+        }
+
         let entry = byDvr.get(dvr.id);
         if (!entry) {
           entry = {
@@ -661,15 +1183,21 @@ export function createDahuaCctvManager({ db }) {
             password: dvr.password || '',
             channels: [],
             hd: false,
+            concurrency: getRecommendedConcurrency(dvr),
             until: item.until,
+            ttl_ms: Math.max(2000, item.until - nowMs),
             audio_channel: 0,
             audio_until: 0,
+            audio_ttl_ms: 0,
           };
           byDvr.set(dvr.id, entry);
         }
         if (!entry.channels.includes(item.channel)) entry.channels.push(item.channel);
         if (item.hd) entry.hd = true;
-        if (item.until > entry.until) entry.until = item.until;
+        if (item.until > entry.until) {
+          entry.until = item.until;
+          entry.ttl_ms = Math.max(2000, item.until - nowMs);
+        }
       }
       if (map.size === 0) bridgeLeases.delete(deviceId);
     }
@@ -686,25 +1214,42 @@ export function createDahuaCctvManager({ db }) {
         audioLeases.delete(aDvrId);
         continue;
       }
-      let entry = byDvr.get(dvr.id);
+      const remoteMap = parseRemoteChannelsMap(dvr);
+      const remCam = remoteMap[String(aLease.channel)];
+      const targetTaskId = (remCam && remCam.host) ? `${dvr.id}__ipch_${aLease.channel}` : dvr.id;
+      const targetHost = (remCam && remCam.host) ? remCam.host : dvr.host;
+      const targetPort = (remCam && remCam.http_port) ? Number(remCam.http_port) : Number(dvr.http_port || 80);
+      const targetUser = (remCam && remCam.username) ? remCam.username : (dvr.username || 'admin');
+      const targetPass = (remCam && remCam.password) ? remCam.password : (dvr.password || '');
+      const targetAudioCh = (remCam && remCam.host) ? (Number(remCam.remote_channel || 1) || 1) : aLease.channel;
+
+      let entry = byDvr.get(targetTaskId);
+      const aTtl = Math.max(2000, aLease.until - nowMs);
       if (!entry) {
         entry = {
-          dvr_id: dvr.id,
-          host: dvr.host,
-          http_port: Number(dvr.http_port || 80),
-          username: dvr.username || 'admin',
-          password: dvr.password || '',
+          dvr_id: targetTaskId,
+          host: targetHost,
+          http_port: targetPort,
+          username: targetUser,
+          password: targetPass,
           channels: [],
           hd: false,
+          concurrency: (remCam && remCam.host) ? 1 : getRecommendedConcurrency(dvr),
           until: aLease.until,
-          audio_channel: aLease.channel,
+          ttl_ms: aTtl,
+          audio_channel: targetAudioCh,
           audio_until: aLease.until,
+          audio_ttl_ms: aTtl,
         };
-        byDvr.set(dvr.id, entry);
+        byDvr.set(targetTaskId, entry);
       } else {
-        entry.audio_channel = aLease.channel;
+        entry.audio_channel = targetAudioCh;
         entry.audio_until = aLease.until;
-        if (aLease.until > entry.until) entry.until = aLease.until;
+        entry.audio_ttl_ms = aTtl;
+        if (aLease.until > entry.until) {
+          entry.until = aLease.until;
+          entry.ttl_ms = Math.max(entry.ttl_ms, aTtl);
+        }
       }
     }
 
@@ -713,27 +1258,66 @@ export function createDahuaCctvManager({ db }) {
   }
 
   function ingestBridgeFrame({ deviceId, dvrId, channel, hd, imageB64, error }) {
-    const isTestProbe = String(dvrId || '').startsWith('test_');
-    const dvr = isTestProbe ? { id: String(dvrId), bridge_device_id: deviceId } : getRawDvr(dvrId);
-    if (!dvr || dvr.bridge_device_id !== deviceId) return false;
-    const ch = Math.max(1, Math.min(64, Number(channel || 1) || 1));
+    let realDvrId = String(dvrId || '');
+    let realChannel = Number(channel || 1);
+    const ipchMatch = realDvrId.match(/^(.+)__ipch_(\d+)$/);
+    const isDirectIpCamTask = Boolean(ipchMatch);
+    if (ipchMatch) {
+      realDvrId = ipchMatch[1];
+      realChannel = parseInt(ipchMatch[2], 10) || 1;
+    }
+    const isTestProbe = realDvrId.startsWith('test_');
+    const dvr = isTestProbe ? { id: realDvrId, bridge_device_id: deviceId } : getRawDvr(realDvrId);
+    if (!dvr) return false;
+    const ch = Math.max(1, Math.min(64, realChannel || 1));
+    const chKey = `${dvr.id}:${ch}`;
     const key = `${dvr.id}:${ch}:${hd ? 1 : 0}`;
     const fallbackKey = `${dvr.id}:${ch}:0`;
     if (error) {
+      if (isDirectIpCamTask) {
+        // Alternate to querying the parent DVR for this channel for 30s if direct IP cam failed
+        ipCamDirectFailUntil.set(chKey, Date.now() + 30_000);
+      } else {
+        // If parent DVR failed for a hybrid channel, enable direct IP cam fallback for 5 minutes!
+        ipCamDirectFailUntil.delete(chKey);
+        const remCam = parseRemoteChannelsMap(dvr)[String(ch)];
+        if (remCam && remCam.host) {
+          dvrIpChannelFallbackUntil.set(chKey, Date.now() + 300_000);
+        }
+      }
       const errMsg = String(error).slice(0, 200);
-      frameCache.set(key, { buf: null, mime: 'image/jpeg', at: Date.now(), error: errMsg });
-      deadChannelUntil.set(`${dvr.id}:${ch}`, { until: Date.now() + 20_000, error: errMsg });
+      const prev = frameCache.get(key) || frameCache.get(fallbackKey);
+      const fails = (channelFailCounts.get(chKey) || 0) + 1;
+      channelFailCounts.set(chKey, fails);
+      // NEVER wipe a working camera's last good frame on transient DVR timeout,
+      // and NEVER mark a channel dead if it has ever produced a valid image!
+      if (!prev || !prev.buf) {
+        frameCache.set(key, { buf: null, mime: 'image/jpeg', at: Date.now(), error: errMsg, transport: 'bridge' });
+      }
+      if (!verifiedWorkingChannels.has(chKey) && fails >= 6) {
+        deadChannelUntil.set(chKey, { until: Date.now() + 30_000, error: errMsg });
+      }
       return true;
     }
-    deadChannelUntil.delete(`${dvr.id}:${ch}`);
+    if (isDirectIpCamTask) {
+      ipCamDirectFailUntil.delete(chKey);
+    }
+    channelFailCounts.delete(chKey);
+    deadChannelUntil.delete(chKey);
     let clean = String(imageB64 || '').trim();
     const idx = clean.indexOf(';base64,');
     if (idx !== -1) clean = clean.slice(idx + 8);
     if (!clean) return false;
-    const buf = Buffer.from(clean, 'base64');
+    let buf = Buffer.from(clean, 'base64');
+    if (isH264AnnexB(buf)) {
+      const jpg = transcodeH264KeyframeToJpeg(buf);
+      if (jpg) buf = jpg;
+    }
     if (!isLikelyImage(buf)) return false;
+    verifiedWorkingChannels.add(chKey);
+    bridgeLastFrameAt.set(deviceId, Date.now());
     const mime = buf[0] === 0x89 ? 'image/png' : 'image/jpeg';
-    const record = { buf, mime, at: Date.now(), error: '' };
+    const record = { buf, mime, at: Date.now(), error: '', transport: 'bridge' };
     frameCache.set(key, record);
     if (hd) frameCache.set(fallbackKey, record);
     if (frameCache.size > 160) {
@@ -743,28 +1327,325 @@ export function createDahuaCctvManager({ db }) {
     return true;
   }
 
+  // Queries a branch PC for its external Public WAN IP (even behind Tailscale Funnel!)
+  async function discoverBranchPublicIp(bridgeDeviceId) {
+    const devId = String(bridgeDeviceId || '').trim();
+    if (!devId) return '';
+    const dev = db.prepare('SELECT device_id, ip, last_seen, app_version, label, hostname FROM devices WHERE device_id=?').get(devId);
+    if (dev && isPublicIpv4(dev.ip)) {
+      return String(dev.ip).trim();
+    }
+    if (!dev || !dev.last_seen || Date.now() - Number(dev.last_seen) > 60_000) {
+      return '';
+    }
+    if (!isVersionAtLeast(dev.app_version, 1, 1, 0)) {
+      return '';
+    }
+    for (const [svcHost, svcPath] of [['api.ipify.org', '/'], ['checkip.amazonaws.com', '/']]) {
+      try {
+        const jobId = rid('ip_');
+        const ipTxt = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            branchCgiJobs.delete(jobId);
+            reject(new Error('timeout'));
+          }, 6500);
+          branchCgiJobs.set(jobId, {
+            deviceId: devId,
+            dispatched: false,
+            until: Date.now() + 6500,
+            payload: {
+              job_id: jobId,
+              host: svcHost,
+              http_port: 80,
+              username: '',
+              password: '',
+              path: svcPath,
+              max_bytes: 512,
+              timeout_ms: 4500,
+            },
+            resolve: (val) => {
+              clearTimeout(timer);
+              resolve(val && val.body ? val.body.toString('utf8').trim() : '');
+            },
+            reject: (err) => {
+              clearTimeout(timer);
+              reject(err);
+            },
+          });
+        });
+        const cleanIp = String(ipTxt || '').split(/\r?\n/)[0].trim();
+        if (isPublicIpv4(cleanIp)) {
+          try { db.prepare('UPDATE devices SET ip=? WHERE device_id=?').run(cleanIp, devId); } catch (_) {}
+          return cleanIp;
+        }
+      } catch (_) {}
+    }
+    return '';
+  }
+
+  const inflightRouterProbe = new Map();
+
+  // Checks if a DVR configured in 'router' (or hybrid) mode has its forwarded router port open AND verified as a Dahua DVR
+  async function ensureRouterDirectStatus(dvr, forceProbe = false) {
+    if (!dvr) return { ok: false, routerHost: '', routerPort: 8085 };
+    let rHost = String(dvr.router_host || '').trim();
+    const rPort = Number(dvr.router_http_port || 8085) || 8085;
+    if (!rHost) {
+      const activeDev = resolveActiveBridgeDevice(dvr);
+      if (activeDev && isPublicIpv4(activeDev.ip)) {
+        rHost = String(activeDev.ip).trim();
+        if (dvr.id && !String(dvr.id).startsWith('test_')) {
+          try { db.prepare('UPDATE cctv_dvrs SET router_host=? WHERE id=?').run(rHost, dvr.id); } catch (_) {}
+        }
+      }
+    }
+    if (!rHost) return { ok: false, routerHost: '', routerPort: rPort };
+
+    const cached = routerReachabilityCache.get(dvr.id);
+    const nowMs = Date.now();
+    if (!forceProbe && cached && cached.routerHost === rHost && cached.routerPort === rPort) {
+      const ttl = cached.ok ? 60_000 : 15_000;
+      if (nowMs - cached.checkedAt < ttl) {
+        return cached;
+      }
+    }
+
+    const probeKey = dvr.id || `${rHost}:${rPort}`;
+    if (!forceProbe && inflightRouterProbe.has(probeKey)) {
+      return inflightRouterProbe.get(probeKey);
+    }
+
+    const probePromise = (async () => {
+      try {
+        const prefRtspPort = Number(dvr.router_rtsp_port || 554) || 554;
+        const [tcpOpen, rtsp554Open, rtspPrefOpen] = await Promise.all([
+          probeTcpPort(rHost, rPort, 2600),
+          probeTcpPort(rHost, 554, 1800),
+          prefRtspPort !== 554 ? probeTcpPort(rHost, prefRtspPort, 1800) : Promise.resolve(false),
+        ]);
+        const activeRtspPort = rtspPrefOpen ? prefRtspPort : (rtsp554Open ? 554 : 0);
+        let verifiedDahua = false;
+        if (tcpOpen) {
+          try {
+            const snap = await fetchDirectSnapshot(
+              { id: dvr.id, channels_count: dvr.channels_count, host: rHost, http_port: rPort, username: dvr.username || 'admin', password: dvr.password || '' },
+              1,
+              false
+            );
+            if (snap && snap.buf) {
+              verifiedDahua = true;
+              if (dvr.id) {
+                verifiedWorkingChannels.add(`${dvr.id}:1`);
+                frameCache.set(`${dvr.id}:1:0`, { buf: snap.buf, mime: snap.mime, at: snap.at, error: '', transport: 'router' });
+              }
+            }
+          } catch (_) {}
+        }
+        const state = {
+          ok: tcpOpen && verifiedDahua,
+          tcpOpen,
+          rtspOpen: activeRtspPort > 0,
+          rtspPort: activeRtspPort || 554,
+          checkedAt: Date.now(),
+          routerHost: rHost,
+          routerPort: rPort,
+          failStreak: 0,
+          lastSuccessAt: (tcpOpen && verifiedDahua) ? Date.now() : ((cached && cached.lastSuccessAt) || 0),
+        };
+        if (dvr.id) routerReachabilityCache.set(dvr.id, state);
+        return state;
+      } finally {
+        inflightRouterProbe.delete(probeKey);
+      }
+    })();
+    inflightRouterProbe.set(probeKey, probePromise);
+    return probePromise;
+  }
+
+  async function detectRouterIpAndProbePort(payload = {}) {
+    const dvr = payload.dvr_id ? getRawDvr(payload.dvr_id) : null;
+    const bridgeId = String(payload.bridge_device_id || (dvr && dvr.bridge_device_id) || '').trim();
+    let routerHost = String(payload.router_host || (dvr && dvr.router_host) || '').trim().replace(/^https?:\/\//i, '').split('/')[0];
+    if (routerHost.includes(':')) routerHost = routerHost.split(':')[0];
+    const routerPort = Math.max(1, Math.min(65535, Number(payload.router_http_port || (dvr && dvr.router_http_port) || 8081) || 8081));
+    const internalHost = String(payload.host || (dvr && dvr.host) || '10.10.1.108').trim();
+    const internalPort = Number(payload.http_port || (dvr && dvr.http_port) || 80) || 80;
+    const username = String(payload.username || (dvr && dvr.username) || 'admin').trim();
+    const password = payload.password ? String(payload.password) : ((dvr && dvr.password) || '');
+
+    let autoDiscoveredIp = '';
+    if (bridgeId) {
+      autoDiscoveredIp = await discoverBranchPublicIp(bridgeId);
+      if (autoDiscoveredIp) {
+        routerHost = autoDiscoveredIp;
+        if (dvr) {
+          try { db.prepare('UPDATE cctv_dvrs SET router_host=? WHERE id=?').run(routerHost, dvr.id); } catch (_) {}
+        }
+      }
+    }
+
+    if (!routerHost) {
+      return {
+        ok: false,
+        router_host: '',
+        router_http_port: routerPort,
+        port_open: false,
+        error: 'لم يتم العثور على الـ IP الخارجي للراوتر بعد — تأكد من اختيار كمبيوتر متصل حالياً في الفرع أو اكتب الـ Public IP / DDNS للراوتر يدوياً.',
+      };
+    }
+
+    const portOpen = await probeTcpPort(routerHost, routerPort, 2200);
+    let dvrVerified = false;
+    let detectedChannels = 0;
+    let channelNames = null;
+    let authError = '';
+
+    if (portOpen) {
+      try {
+        const snap = await fetchDirectSnapshot(
+          { host: routerHost, http_port: routerPort, username, password },
+          1,
+          false
+        );
+        if (snap && snap.buf) dvrVerified = true;
+      } catch (e) {
+        authError = String((e && e.message) || '');
+      }
+      try {
+        const titleResp = await dahuaAuthedGet({
+          host: routerHost,
+          port: routerPort,
+          pathWithQuery: '/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle',
+          username,
+          password,
+          timeoutMs: 3500,
+        });
+        if (titleResp.statusCode === 200) {
+          dvrVerified = true;
+          const names = {};
+          for (const ln of titleResp.body.toString('utf8').split(/\r?\n/)) {
+            const m = ln.match(/table\.ChannelTitle\[(\d+)\]\.Name=(.+)$/);
+            if (m) {
+              const idx1 = parseInt(m[1], 10) + 1;
+              if (idx1 > detectedChannels) detectedChannels = idx1;
+              if (m[2].trim()) names[String(idx1)] = m[2].trim();
+            }
+          }
+          if (Object.keys(names).length) channelNames = names;
+        }
+      } catch (_) {}
+    }
+
+    if (dvr) {
+      routerReachabilityCache.set(dvr.id, {
+        ok: portOpen && dvrVerified,
+        tcpOpen: portOpen,
+        checkedAt: Date.now(),
+        routerHost,
+        routerPort,
+        lastSuccessAt: (portOpen && dvrVerified) ? Date.now() : 0,
+      });
+    }
+
+    return {
+      ok: true,
+      router_host: routerHost,
+      auto_discovered: Boolean(autoDiscoveredIp),
+      router_http_port: routerPort,
+      internal_host: internalHost,
+      internal_port: internalPort,
+      port_open: portOpen && dvrVerified,
+      tcp_open_only: portOpen && !dvrVerified,
+      dvr_verified: dvrVerified,
+      detected_channels: detectedChannels || undefined,
+      channel_names: channelNames || undefined,
+      auth_error: authError || undefined,
+      message: (portOpen && dvrVerified)
+        ? `✅ ممتاز! البورت ${routerPort} مفتوح في راوتر الفرع (${routerHost}) والسيرفر متصل بالـ DVR مباشرةً بسرعة فائقة (يعمل 24 ساعة حتى بعد إغلاق كمبيوترات الفرع)!`
+        : (portOpen && authError.includes('401'))
+          ? `🟢 البورت ${routerPort} مفتوح ووصل للـ DVR على راوتر الفرع (${routerHost})! تأكد فقط من كلمة مرور الـ DVR ثم اضغط حفظ.`
+          : `📡 تم اكتشاف الـ IP الخارجي لراوتر الفرع بنجاح (${routerHost})، ولكن البورت الخارجي (${routerPort}) غير موجّه للـ DVR بعد في الراوتر.\n💡 افتح صفحة راوتر الفرع ⬅ Port Forwarding ⬅ وجّه البورت الخارجي ${routerPort} إلى الـ IP الداخلي ${internalHost} بورت ${internalPort} (TCP).\n(ملاحظة: سيعمل البث تلقائياً عبر جسر كمبيوتر الفرع بدون توقف حتى تفتح البورت في الراوتر!)`,
+    };
+  }
+
   async function getFrame({ dvrId, channel = 1, hd = false, waitMs = 3500, overrideDvr = null }) {
     const dvr = overrideDvr || getRawDvr(dvrId);
     if (!dvr) throw new Error('جهاز الـ DVR غير موجود');
     const ch = Math.max(1, Math.min(64, Number(channel || 1) || 1));
+    const tileKey = `${dvr.id}:${ch}`;
     const cacheKey = `${dvr.id}:${ch}:${hd ? 1 : 0}`;
+    const nowMs = Date.now();
 
-    if (dvr.connection_mode === 'bridge') {
-      const dev = db.prepare('SELECT last_seen, label, hostname, app_version FROM devices WHERE device_id=?').get(dvr.bridge_device_id);
-      const devLabel = (dev && (dev.label || dev.hostname)) || dvr.bridge_device_id;
-      if (!dev || !dev.last_seen || Date.now() - Number(dev.last_seen) > 60_000) {
+    const remCamForCh = parseRemoteChannelsMap(dvr)[String(ch)];
+    const hasValidRemCam = Boolean(
+      remCamForCh &&
+      remCamForCh.host &&
+      remCamForCh.password &&
+      !/^\*+$/.test(String(remCamForCh.password))
+    );
+    const useBridgeForHybridIp = hasValidRemCam && ((dvrIpChannelFallbackUntil.get(tileKey) || 0) > nowMs);
+
+    // 1) If mode === 'router', always try the DVR itself via Branch Router first (works for all analog & IP cameras added to the DVR!)
+    // Only fall back to bridge PC for a channel if the DVR itself failed on that specific channel (`useBridgeForHybridIp`).
+    if (dvr.connection_mode === 'router' && !useBridgeForHybridIp) {
+      const rState = await ensureRouterDirectStatus(dvr, false);
+      if (rState.ok && rState.routerHost) {
+        if (rState.rtspOpen) {
+          ensureRtspLiveStream(dvr, rState.routerHost, rState.rtspPort || 554, ch, hd, 'router');
+        }
+        const cachedR = frameCache.get(cacheKey);
+        if (cachedR && cachedR.buf && Date.now() - cachedR.at < 140) {
+          return cachedR;
+        }
+        if (inflightDirect.has(cacheKey)) {
+          return inflightDirect.get(cacheKey);
+        }
+        try {
+          const routerDvr = { ...dvr, host: rState.routerHost, http_port: rState.routerPort };
+          const p = fetchDirectSnapshot(routerDvr, ch, hd).finally(() => inflightDirect.delete(cacheKey));
+          inflightDirect.set(cacheKey, p);
+          const res = await p;
+          const rec = { buf: res.buf, mime: res.mime, at: res.at, error: '', transport: 'router' };
+          verifiedWorkingChannels.add(tileKey);
+          frameCache.set(cacheKey, rec);
+          return rec;
+        } catch (err) {
+          const msg = String((err && err.message) || '');
+          const isNetDown = /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|timeout|انتهت مهلة|socket hang up/i.test(msg) && !/HTTP\s*\d+/i.test(msg);
+          if (isNetDown) {
+            rState.failStreak = (rState.failStreak || 0) + 1;
+            if (rState.failStreak >= 3) {
+              routerReachabilityCache.set(dvr.id, { ...rState, ok: false, checkedAt: Date.now() });
+            }
+          }
+          if (!dvr.bridge_device_id && !dvr.backup_bridge_device_id) {
+            throw err;
+          }
+        }
+      } else if (!dvr.bridge_device_id && !dvr.backup_bridge_device_id) {
+        throw new Error(`بورت راوتر الفرع (${dvr.router_host || 'غير محدد'}:${dvr.router_http_port || 8081}) غير مفتوح بعد ولم يتم تحديد كمبيوتر بديل في الفرع`);
+      }
+    }
+
+    if (dvr.connection_mode === 'bridge' || dvr.connection_mode === 'router') {
+      const activeDev = resolveActiveBridgeDevice(dvr);
+      const activeDevId = (activeDev && activeDev.device_id) || dvr.bridge_device_id;
+      const devLabel = (activeDev && (activeDev.label || activeDev.hostname)) || activeDevId || 'غير محدد';
+      if (!activeDev || !activeDev.last_seen || Date.now() - Number(activeDev.last_seen) > 60_000) {
         throw new Error(`كمبيوتر الفرع (${devLabel}) غير متصل حالياً`);
       }
-      if (!isVersionAtLeast(dev.app_version, 1, 0, 9)) {
-        throw new Error(`كمبيوتر الفرع (${devLabel}) يعمل بالإصدار v${dev.app_version || '1.0.0'} ويحتاج التحديث إلى v1.0.10`);
+      if (!isVersionAtLeast(activeDev.app_version, 1, 0, 9)) {
+        throw new Error(`كمبيوتر الفرع (${devLabel}) يعمل بالإصدار v${activeDev.app_version || '1.0.0'} ويحتاج التحديث`);
       }
-      const deadInfo = deadChannelUntil.get(`${dvr.id}:${ch}`);
-      if (deadInfo && deadInfo.until > Date.now()) {
+      const chKey = `${dvr.id}:${ch}`;
+      const deadInfo = deadChannelUntil.get(chKey);
+      if (deadInfo && deadInfo.until > Date.now() && !verifiedWorkingChannels.has(chKey)) {
         throw new Error(deadInfo.error || `القناة ${ch} غير متصلة`);
       }
       const existing = frameCache.get(cacheKey) || (!hd ? frameCache.get(`${dvr.id}:${ch}:1`) : frameCache.get(`${dvr.id}:${ch}:0`));
+      const routedDvr = { ...dvr, bridge_device_id: activeDevId };
       if (existing && existing.buf && Date.now() - existing.at < 1800) {
-        registerBridgeLease(dvr, ch, hd, 12_000, overrideDvr);
+        registerBridgeLease(routedDvr, ch, hd, 12_000, overrideDvr ? { ...overrideDvr, bridge_device_id: activeDevId } : null);
         return existing;
       }
       if (inflightBridge.has(cacheKey)) {
@@ -772,22 +1653,22 @@ export function createDahuaCctvManager({ db }) {
       }
       const bp = (async () => {
         try {
-          registerBridgeLease(dvr, ch, hd, 14_000, overrideDvr);
+          registerBridgeLease(routedDvr, ch, hd, 16_000, overrideDvr ? { ...overrideDvr, bridge_device_id: activeDevId } : null);
           const started = Date.now();
           const prevAt = existing ? existing.at : 0;
           while (Date.now() - started < waitMs) {
-            await new Promise((r) => setTimeout(r, 150));
-            const deadNow = deadChannelUntil.get(`${dvr.id}:${ch}`);
-            if (deadNow && deadNow.until > Date.now()) {
+            await new Promise((r) => setTimeout(r, 140));
+            const deadNow = deadChannelUntil.get(chKey);
+            if (deadNow && deadNow.until > Date.now() && !verifiedWorkingChannels.has(chKey)) {
               throw new Error(deadNow.error || `القناة ${ch} غير متصلة`);
             }
             const cur = frameCache.get(cacheKey) || (!hd ? frameCache.get(`${dvr.id}:${ch}:1`) : null);
             if (cur && cur.at > prevAt) {
-              if (cur.error) throw new Error(cur.error);
               if (cur.buf) return cur;
+              if (cur.error) throw new Error(cur.error);
             }
           }
-          if (existing && existing.buf && Date.now() - existing.at < 25_000) {
+          if (existing && existing.buf && Date.now() - existing.at < 90_000) {
             return existing;
           }
           if (existing && existing.error) {
@@ -802,7 +1683,8 @@ export function createDahuaCctvManager({ db }) {
       return bp;
     }
 
-    // Direct mode (with 120ms micro-coalescing if multiple admins view the exact same camera simultaneously)
+    // Direct mode (with continuous RTSP stream + 120ms micro-coalescing)
+    ensureRtspLiveStream(dvr, dvr.host, Number(dvr.rtsp_port || 554) || 554, ch, hd, 'direct');
     const cached = frameCache.get(cacheKey);
     if (cached && cached.buf && Date.now() - cached.at < 120) {
       return cached;
@@ -813,7 +1695,8 @@ export function createDahuaCctvManager({ db }) {
     const p = (async () => {
       try {
         const res = await fetchDirectSnapshot(dvr, ch, hd);
-        const rec = { buf: res.buf, mime: res.mime, at: res.at, error: '' };
+        verifiedWorkingChannels.add(`${dvr.id}:${ch}`);
+        const rec = { buf: res.buf, mime: res.mime, at: res.at, error: '', transport: 'direct' };
         frameCache.set(cacheKey, rec);
         return rec;
       } finally {
@@ -822,6 +1705,149 @@ export function createDahuaCctvManager({ db }) {
     })();
     inflightDirect.set(cacheKey, p);
     return p;
+  }
+
+  // Non-blocking single-request batch frame fetcher for the CCTV Wall (returns in <5ms, zero browser socket lockup!)
+  async function pollWallFrames({ items = [], actor = '', role = 'super' } = {}) {
+    if (!Array.isArray(items) || !items.length) {
+      return { ok: true, frames: {} };
+    }
+    const nowMs = Date.now();
+    const outFrames = {};
+    const dvrCache = new Map();
+
+    for (const it of items.slice(0, 24)) {
+      const dvrId = String((it && it.dvr_id) || '').trim();
+      const ch = Math.max(1, Math.min(64, Number((it && it.channel) || 1) || 1));
+      const hd = Boolean(it && it.hd);
+      const sinceAt = Number((it && it.since_at) || 0);
+      if (!dvrId) continue;
+
+      let dvr = dvrCache.get(dvrId);
+      if (dvr === undefined) {
+        dvr = getRawDvr(dvrId);
+        dvrCache.set(dvrId, dvr);
+      }
+      if (!dvr || !canAdminAccessDvr(dvr, actor, role)) continue;
+
+      const tileKey = `${dvr.id}:${ch}`;
+      const cacheKey = `${dvr.id}:${ch}:${hd ? 1 : 0}`;
+      const fallbackKey = `${dvr.id}:${ch}:${hd ? 0 : 1}`;
+
+      const deadCheck = deadChannelUntil.get(tileKey);
+      const isCurrentlyDead = Boolean(deadCheck && deadCheck.until > nowMs && !verifiedWorkingChannels.has(tileKey));
+
+      const remCamForCh = parseRemoteChannelsMap(dvr)[String(ch)];
+      const hasValidRemCam = Boolean(
+        remCamForCh &&
+        remCamForCh.host &&
+        remCamForCh.password &&
+        !/^\*+$/.test(String(remCamForCh.password))
+      );
+      const useBridgeForHybridIp = hasValidRemCam && ((dvrIpChannelFallbackUntil.get(tileKey) || 0) > nowMs);
+
+      // Trigger background refresh without blocking the HTTP response!
+      if (!isCurrentlyDead) {
+        if (dvr.connection_mode === 'direct') {
+          const rtspStreaming = ensureRtspLiveStream(dvr, dvr.host, Number(dvr.rtsp_port || 554) || 554, ch, hd, 'direct');
+          const cur = frameCache.get(cacheKey);
+          if (!rtspStreaming && (!cur || nowMs - cur.at > 220) && !inflightDirect.has(cacheKey)) {
+            getFrame({ dvrId: dvr.id, channel: ch, hd, waitMs: 3000 }).catch(() => {});
+          }
+        } else if (dvr.connection_mode === 'router' && !useBridgeForHybridIp) {
+          const rCached = routerReachabilityCache.get(dvr.id);
+          if (!rCached || (nowMs - rCached.checkedAt > (rCached.ok ? 40_000 : 18_000))) {
+            ensureRouterDirectStatus(dvr, false).catch(() => {});
+          }
+          if (rCached && rCached.ok && rCached.routerHost) {
+            const rtspStreaming = rCached.rtspOpen
+              ? ensureRtspLiveStream(dvr, rCached.routerHost, rCached.rtspPort || 554, ch, hd, 'router')
+              : false;
+            const cur = frameCache.get(cacheKey);
+            // If RTSP is already actively streaming frames, skip HTTP snapshot polling completely!
+            // While RTSP is warming up (first ~2.5s) or if RTSP is unavailable, use the per-DVR queued HTTP snapshot pump.
+            if (!rtspStreaming && (!cur || nowMs - cur.at > 280) && !inflightDirect.has(cacheKey)) {
+              const p = fetchDirectSnapshot(
+                { ...dvr, host: rCached.routerHost, http_port: rCached.routerPort },
+                ch,
+                hd
+              )
+                .then((res) => {
+                  verifiedWorkingChannels.add(tileKey);
+                  rCached.failStreak = 0;
+                  frameCache.set(cacheKey, { buf: res.buf, mime: res.mime, at: res.at, error: '', transport: 'router' });
+                })
+                .catch((err) => {
+                  const msg = String((err && err.message) || '');
+                  const isNetDown = /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|timeout|انتهت مهلة|socket hang up/i.test(msg) && !/HTTP\s*\d+/i.test(msg);
+                  if (isNetDown) {
+                    rCached.failStreak = (rCached.failStreak || 0) + 1;
+                    if (rCached.failStreak >= 4) {
+                      routerReachabilityCache.set(dvr.id, { ...rCached, ok: false, checkedAt: Date.now() });
+                    }
+                  }
+                })
+                .finally(() => {
+                  inflightDirect.delete(cacheKey);
+                });
+              inflightDirect.set(cacheKey, p);
+            }
+          } else {
+            const activeDev = resolveActiveBridgeDevice(dvr);
+            if (activeDev && activeDev.last_seen && (nowMs - Number(activeDev.last_seen) < 48_000)) {
+              registerBridgeLease({ ...dvr, bridge_device_id: activeDev.device_id }, ch, hd, 14_000);
+            }
+          }
+        } else {
+          const activeDev = resolveActiveBridgeDevice(dvr);
+          if (activeDev && activeDev.last_seen && (nowMs - Number(activeDev.last_seen) < 48_000)) {
+            registerBridgeLease({ ...dvr, bridge_device_id: activeDev.device_id }, ch, hd, 14_000);
+          }
+        }
+      }
+
+      const hit = frameCache.get(cacheKey) || frameCache.get(fallbackKey);
+      const deadInfo = deadChannelUntil.get(tileKey);
+      if (hit && hit.buf) {
+        if (hit.at > sinceAt) {
+          outFrames[tileKey] = {
+            ok: true,
+            changed: true,
+            at: hit.at,
+            mime: hit.mime || 'image/jpeg',
+            transport: hit.transport || dvr.connection_mode,
+            image: hit.buf.toString('base64'),
+          };
+        } else {
+          outFrames[tileKey] = {
+            ok: true,
+            changed: false,
+            at: hit.at,
+            transport: hit.transport || dvr.connection_mode,
+          };
+        }
+      } else if (deadInfo && deadInfo.until > nowMs && !verifiedWorkingChannels.has(tileKey)) {
+        outFrames[tileKey] = {
+          ok: false,
+          dead: true,
+          error: deadInfo.error || `القناة ${ch} غير متصلة`,
+        };
+      } else {
+        const activeDev = (dvr.connection_mode === 'bridge' || dvr.connection_mode === 'router')
+          ? resolveActiveBridgeDevice(dvr)
+          : null;
+        const devOnline = Boolean(activeDev && activeDev.last_seen && (nowMs - Number(activeDev.last_seen) < 48_000));
+        outFrames[tileKey] = {
+          ok: false,
+          waiting: true,
+          error: (dvr.connection_mode === 'bridge' && !devOnline)
+            ? `كمبيوتر الفرع (${(activeDev && (activeDev.label || activeDev.hostname)) || dvr.name}) غير متصل حالياً`
+            : ((hit && hit.error) || '⏳ جاري استلام البث المباشر...'),
+        };
+      }
+    }
+
+    return { ok: true, frames: outFrames };
   }
 
   function probeTcpPort(host, port, timeoutMs = 650) {
@@ -962,13 +1988,58 @@ export function createDahuaCctvManager({ db }) {
 
   async function executeDvrCgi(dvr, pathWithQuery, { timeoutMs = 9000, maxBytes = 262144 } = {}) {
     if (!dvr) throw new Error('جهاز الـ DVR غير موجود');
-    if (dvr.connection_mode !== 'bridge') {
+    let effectiveDvr = dvr;
+    let effectivePath = pathWithQuery;
+    // If executing PTZ or direct camera CGI on a hybrid IP camera channel, route directly only when remCam has http_online
+    if (/\/cgi-bin\/(ptz|snapshot|audio)\.cgi/i.test(pathWithQuery) && !dvr._no_remote_redirect) {
+      const chMatch = pathWithQuery.match(/([?&]channel=)(\d+)/i);
+      if (chMatch) {
+        const reqCh = chMatch[2];
+        const remCam = parseRemoteChannelsMap(dvr)[String(reqCh)];
+        if (remCam && remCam.host && remCam.http_online) {
+          effectiveDvr = {
+            ...dvr,
+            connection_mode: dvr.connection_mode === 'direct' ? 'direct' : 'bridge',
+            host: remCam.host,
+            http_port: Number(remCam.http_port || 80) || 80,
+            username: remCam.username || dvr.username || 'admin',
+            password: remCam.password || dvr.password || '',
+          };
+          effectivePath = pathWithQuery.replace(/([?&]channel=)\d+/i, `$1${Number(remCam.remote_channel || 1) || 1}`);
+        }
+      }
+    }
+    if (effectiveDvr.connection_mode === 'router') {
+      const rState = await ensureRouterDirectStatus(effectiveDvr, false);
+      if (rState.ok && rState.routerHost) {
+        try {
+          const resp = await dahuaAuthedGet({
+            host: rState.routerHost,
+            port: rState.routerPort,
+            pathWithQuery: effectivePath,
+            username: effectiveDvr.username,
+            password: effectiveDvr.password,
+            timeoutMs,
+          });
+          return {
+            statusCode: resp.statusCode,
+            contentType: String((resp.headers && resp.headers['content-type']) || 'text/plain'),
+            body: resp.body.length > maxBytes ? resp.body.subarray(0, maxBytes) : resp.body,
+          };
+        } catch (e) {
+          if (!effectiveDvr.bridge_device_id && !effectiveDvr.backup_bridge_device_id) throw e;
+        }
+      } else if (!effectiveDvr.bridge_device_id && !effectiveDvr.backup_bridge_device_id) {
+        throw new Error(`بورت راوتر الفرع (${effectiveDvr.router_host || ''}:${effectiveDvr.router_http_port || 8081}) غير مفتوح بعد`);
+      }
+    }
+    if (effectiveDvr.connection_mode === 'direct') {
       const resp = await dahuaAuthedGet({
-        host: dvr.host,
-        port: dvr.http_port,
-        pathWithQuery,
-        username: dvr.username,
-        password: dvr.password,
+        host: effectiveDvr.host,
+        port: effectiveDvr.http_port,
+        pathWithQuery: effectivePath,
+        username: effectiveDvr.username,
+        password: effectiveDvr.password,
         timeoutMs,
       });
       return {
@@ -978,8 +2049,9 @@ export function createDahuaCctvManager({ db }) {
       };
     }
 
-    const devId = String(dvr.bridge_device_id || '').trim();
-    const dev = db.prepare('SELECT last_seen, label, hostname, app_version FROM devices WHERE device_id=?').get(devId);
+    const activeDev = resolveActiveBridgeDevice(effectiveDvr);
+    const devId = String((activeDev && activeDev.device_id) || effectiveDvr.bridge_device_id || '').trim();
+    const dev = activeDev || db.prepare('SELECT last_seen, label, hostname, app_version FROM devices WHERE device_id=?').get(devId);
     const devLabel = (dev && (dev.label || dev.hostname)) || devId;
     if (!dev || !dev.last_seen || Date.now() - Number(dev.last_seen) > 60_000) {
       throw new Error(`كمبيوتر الفرع (${devLabel}) غير متصل حالياً`);
@@ -994,7 +2066,7 @@ export function createDahuaCctvManager({ db }) {
       const timer = setTimeout(() => {
         if (branchCgiJobs.has(jobId)) {
           branchCgiJobs.delete(jobId);
-          reject(new Error(`تأخر رد جهاز الـ DVR في فرع ${dvr.name}`));
+          reject(new Error(`تأخر رد جهاز الـ DVR في فرع ${effectiveDvr.name}`));
         }
       }, waitLimit);
       branchCgiJobs.set(jobId, {
@@ -1003,11 +2075,11 @@ export function createDahuaCctvManager({ db }) {
         until: Date.now() + waitLimit,
         payload: {
           job_id: jobId,
-          host: dvr.host,
-          http_port: Number(dvr.http_port || 80),
-          username: dvr.username || 'admin',
-          password: dvr.password || '',
-          path: pathWithQuery,
+          host: effectiveDvr.host,
+          http_port: Number(effectiveDvr.http_port || 80),
+          username: effectiveDvr.username || 'admin',
+          password: effectiveDvr.password || '',
+          path: effectivePath,
           max_bytes: maxBytes,
           timeout_ms: timeoutMs,
         },
@@ -1030,7 +2102,7 @@ export function createDahuaCctvManager({ db }) {
     return map;
   }
 
-  // Phase 1: Pull Camera Names from DVR (works for both Direct & Remote Bridge!)
+  // Phase 1: Pull Camera Names + Hybrid RemoteDevice IP Cameras from DVR
   async function pullChannelNames(dvrId) {
     const dvr = getRawDvr(dvrId);
     if (!dvr) throw new Error('جهاز الـ DVR غير موجود');
@@ -1041,10 +2113,13 @@ export function createDahuaCctvManager({ db }) {
     let existingNames = {};
     try { existingNames = JSON.parse(dvr.channel_names || '{}') || {}; } catch (_) {}
     let count = 0;
+    let maxIdx = 0;
     for (const ln of txt.split(/\r?\n/)) {
       const m = ln.match(/table\.ChannelTitle\[(\d+)\]\.Name=(.+)$/);
       if (m) {
-        const ch = String(parseInt(m[1], 10) + 1);
+        const chNum = parseInt(m[1], 10) + 1;
+        if (chNum > maxIdx) maxIdx = chNum;
+        const ch = String(chNum);
         const title = m[2].trim();
         if (title) {
           existingNames[ch] = title;
@@ -1052,18 +2127,85 @@ export function createDahuaCctvManager({ db }) {
         }
       }
     }
-    db.prepare('UPDATE cctv_dvrs SET channel_names=?, updated_at=? WHERE id=?').run(
+
+    // Also inspect RemoteDevice table for hybrid IP cameras connected to the DVR (e.g. Dokki Channel 4 -> 10.10.1.8 IPC-A12)
+    const remoteChannels = parseRemoteChannelsMap(dvr);
+    const ipAudioChans = [];
+    try {
+      const remResp = await executeDvrCgi(dvr, '/cgi-bin/configManager.cgi?action=getConfig&name=RemoteDevice', { timeoutMs: 7500 });
+      if (remResp.statusCode === 200 && remResp.body) {
+        const remKv = parseDahuaKvLines(remResp.body.toString('utf8'));
+        const byPrefix = new Map();
+        for (const [k, v] of Object.entries(remKv)) {
+          const m = k.match(/^(table\.RemoteDevice\.[^.]+)\.(.+)$/);
+          if (m) {
+            const pfx = m[1];
+            const prop = m[2];
+            if (!byPrefix.has(pfx)) byPrefix.set(pfx, {});
+            byPrefix.get(pfx)[prop] = v;
+          }
+        }
+        for (const [pfx, info] of byPrefix.entries()) {
+          const idxMatch = pfx.match(/_(\d+)$/) || pfx.match(/\[(\d+)\]$/);
+          if (!idxMatch) continue;
+          const ch1 = parseInt(idxMatch[1], 10) + 1;
+          const enabled = String(info.Enable || '').toLowerCase() === 'true' || info.Enable === '1';
+          const addr = String(info.Address || '').trim();
+          if (enabled && addr && addr !== '0.0.0.0' && addr !== '192.168.0.0') {
+            if (ch1 > maxIdx) maxIdx = ch1;
+            const model = String(info.DeviceType || 'IP-Cam').trim();
+            const rawPass = String(info.Password || '').trim();
+            const prevEntry = remoteChannels[String(ch1)];
+            const resolvedPass = (rawPass && !/^\*+$/.test(rawPass))
+              ? rawPass
+              : ((prevEntry && prevEntry.password && !/^\*+$/.test(String(prevEntry.password)))
+                  ? prevEntry.password
+                  : (dvr.password || ''));
+            remoteChannels[String(ch1)] = {
+              host: addr,
+              http_port: Number(info.HttpPort || 80) || 80,
+              rtsp_port: Number(info.RtspPort || 554) || 554,
+              username: String(info.UserName || 'admin').trim() || 'admin',
+              password: resolvedPass,
+              remote_channel: 1,
+              model,
+            };
+            ipAudioChans.push(ch1);
+            if (!existingNames[String(ch1)] || /^CAM\s*\d+$/i.test(existingNames[String(ch1)])) {
+              existingNames[String(ch1)] = `IP ${model} (${addr})`;
+            }
+            deadChannelUntil.delete(`${dvr.id}:${ch1}`);
+          }
+        }
+      }
+    } catch (_) {}
+
+    const nextChCount = (maxIdx > 0 && maxIdx !== dvr.channels_count) ? maxIdx : dvr.channels_count;
+    db.prepare('UPDATE cctv_dvrs SET channel_names=?, channels_count=?, remote_channels_json=?, updated_at=? WHERE id=?').run(
       JSON.stringify(existingNames),
+      nextChCount,
+      JSON.stringify(remoteChannels),
       Date.now(),
       dvr.id
     );
-    try { await detectAudioChannels(dvr.id); } catch (_) {}
+    try {
+      const audRes = await detectAudioChannels(dvr.id);
+      if (ipAudioChans.length && audRes && Array.isArray(audRes.audio_channels)) {
+        const mergedAud = Array.from(new Set([...audRes.audio_channels, ...ipAudioChans])).sort((a, b) => a - b);
+        db.prepare('UPDATE cctv_dvrs SET audio_channels=? WHERE id=?').run(JSON.stringify(mergedAud), dvr.id);
+      }
+    } catch (_) {
+      if (ipAudioChans.length) {
+        db.prepare('UPDATE cctv_dvrs SET audio_channels=? WHERE id=?').run(JSON.stringify(ipAudioChans), dvr.id);
+      }
+    }
     return {
       ok: true,
       pulled_count: count,
       channel_names: existingNames,
+      remote_channels: remoteChannels,
       dvrs: listDvrs().dvrs,
-      message: count > 0 ? `✓ تم سحب أسماء ${count} كاميرا وكشف الكاميرات المزوّدة بصوت بنجاح` : 'تم الاتصال ولكن لم تُسجّل أسماء مخصّصة داخل الـ DVR',
+      message: count > 0 ? `✓ تم سحب أسماء ${count} كاميرا وكشف كاميرات الـ IP والصوت بنجاح` : 'تم الاتصال وسحب إعدادات القنوات بنجاح',
     };
   }
 
@@ -1133,8 +2275,43 @@ export function createDahuaCctvManager({ db }) {
             if (/error|damage|bad|abnormal|unformatted/i.test(v)) hasErr = true;
           }
         }
-        if (!hasAnyDiskEntry) {
-          hddStatus = 'missing';
+        if (!hasAnyDiskEntry || /^Error/i.test(txt.trim())) {
+          // Legacy Dahua HCVR-S2 / HCVR-S3 fallback (`factory.getCollect` -> `/dev/sda`)
+          try {
+            const colResp = await executeDvrCgi(dvr, '/cgi-bin/storageDevice.cgi?action=factory.getCollect', { timeoutMs: 6000 });
+            if (colResp.statusCode === 200) {
+              const colKv = parseDahuaKvLines(colResp.body.toString('utf8'));
+              const devPaths = Object.values(colKv).filter((v) => v && v.startsWith('/dev/'));
+              if (devPaths.length > 0) {
+                hasAnyDiskEntry = true;
+                for (const dp of devPaths.slice(0, 4)) {
+                  const pResp = await executeDvrCgi(dvr, `/cgi-bin/storageDevice.cgi?action=getPartInfo&name=${encodeURIComponent(dp)}`, { timeoutMs: 6000 }).catch(() => null);
+                  if (pResp && pResp.statusCode === 200) {
+                    const pKv = parseDahuaKvLines(pResp.body.toString('utf8'));
+                    for (const [pk, pv] of Object.entries(pKv)) {
+                      if (/TotalBytes$/i.test(pk)) {
+                        const n = parseFloat(pv);
+                        if (Number.isFinite(n) && n > 0) totalBytes += n;
+                      }
+                      if (/UsedBytes$/i.test(pk)) {
+                        const u = parseFloat(pv);
+                        if (Number.isFinite(u) && u >= 0) usedBytes += u;
+                      }
+                      if (/IsError$/i.test(pk) && String(pv).toLowerCase() === 'true') hasErr = true;
+                    }
+                  }
+                }
+                hddStatus = hasErr ? 'error' : 'ok';
+                hddStateRaw = hddStateRaw || 'Active';
+              } else {
+                hddStatus = 'missing';
+              }
+            } else {
+              hddStatus = 'missing';
+            }
+          } catch (_) {
+            hddStatus = 'missing';
+          }
         } else {
           hddStatus = hasErr ? 'error' : (totalBytes > 0 ? 'ok' : 'missing');
         }
@@ -1223,28 +2400,33 @@ export function createDahuaCctvManager({ db }) {
           `&condition.Channel=${condCh}` +
           `&condition.StartTime=${encodeURIComponent(st)}` +
           `&condition.EndTime=${encodeURIComponent(et)}`;
-        const fResp = await executeDvrCgi(dvr, findUrl, { timeoutMs: 8000 });
+        const fResp = await executeDvrCgi(dvr, findUrl, { timeoutMs: 9000 });
         const fTxt = fResp.body.toString('utf8').trim();
         if (fResp.statusCode === 200 && /ok/i.test(fTxt)) {
-          const nextResp = await executeDvrCgi(
-            dvr,
-            `/cgi-bin/mediaFileFind.cgi?action=findNextFile&object=${encodeURIComponent(objId)}&count=40`,
-            { timeoutMs: 9000 }
-          );
-          const kv = parseDahuaKvLines(nextResp.body.toString('utf8'));
-          const foundCount = parseInt(kv.found || '0', 10) || 0;
-          for (let i = 0; i < foundCount; i++) {
-            const pfx = `items[${i}]`;
-            if (kv[`${pfx}.StartTime`] || kv[`${pfx}.FilePath`]) {
-              items.push({
-                channel: ch,
-                start_time: kv[`${pfx}.StartTime`] || st,
-                end_time: kv[`${pfx}.EndTime`] || et,
-                size_bytes: Number(kv[`${pfx}.Length`] || 0) || 0,
-                file_path: kv[`${pfx}.FilePath`] || '',
-                type: kv[`${pfx}.Type`] || 'dav',
-              });
+          // Loop through up to 3 pages of 100 items so long multi-hour searches return all segments
+          for (let page = 0; page < 3; page++) {
+            const nextResp = await executeDvrCgi(
+              dvr,
+              `/cgi-bin/mediaFileFind.cgi?action=findNextFile&object=${encodeURIComponent(objId)}&count=100`,
+              { timeoutMs: 10000 }
+            );
+            const kv = parseDahuaKvLines(nextResp.body.toString('utf8'));
+            const foundCount = parseInt(kv.found || '0', 10) || 0;
+            if (foundCount <= 0) break;
+            for (let i = 0; i < foundCount; i++) {
+              const pfx = `items[${i}]`;
+              if (kv[`${pfx}.StartTime`] || kv[`${pfx}.FilePath`]) {
+                items.push({
+                  channel: ch,
+                  start_time: kv[`${pfx}.StartTime`] || st,
+                  end_time: kv[`${pfx}.EndTime`] || et,
+                  size_bytes: Number(kv[`${pfx}.Length`] || 0) || 0,
+                  file_path: kv[`${pfx}.FilePath`] || '',
+                  type: kv[`${pfx}.Type`] || 'dav',
+                });
+              }
             }
+            if (foundCount < 100) break;
           }
           if (items.length > 0) break;
         }
@@ -1272,15 +2454,22 @@ export function createDahuaCctvManager({ db }) {
         `&startTime=${encodeURIComponent(st)}` +
         `&endTime=${encodeURIComponent(et)}` +
         `&subtype=${sub}`;
-      const resp = await executeDvrCgi(dvr, loadPath, { timeoutMs: 28_000, maxBytes: 8 * 1024 * 1024 });
+      const resp = await executeDvrCgi(dvr, loadPath, { timeoutMs: 95_000, maxBytes: 45 * 1024 * 1024 });
       if (resp.statusCode === 200 && resp.body && resp.body.length > 1024) {
         const safeTime = st.replace(/[^0-9]/g, '').slice(0, 14);
-        // Check if MP4 ('ftyp') or Dahua DAV ('DHAV')
-        const isMp4 = resp.body.slice(4, 8).toString('ascii') === 'ftyp';
+        let outBuf = resp.body;
+        let isMp4 = outBuf.slice(4, 8).toString('ascii') === 'ftyp';
+        if (!isMp4) {
+          const converted = remuxDavBufferToMp4(outBuf);
+          if (converted) {
+            outBuf = converted;
+            isMp4 = true;
+          }
+        }
         const ext = isMp4 ? 'mp4' : 'dav';
         const mime = isMp4 ? 'video/mp4' : 'application/octet-stream';
         return {
-          buf: resp.body,
+          buf: outBuf,
           mime,
           fileName: `Dahua_${dvr.name.replace(/[^\w\u0600-\u06FF-]+/g, '_')}_CH${ch}_${safeTime}.${ext}`,
         };
@@ -1441,18 +2630,23 @@ export function createDahuaCctvManager({ db }) {
       const combined = st.adtsCarry.length ? Buffer.concat([st.adtsCarry, inner]) : inner;
       const capped = combined.length > 65536 ? combined.subarray(combined.length - 65536) : combined;
       const parsed = extractCompleteAdtsFrames(capped);
-      st.adtsCarry = parsed.remainder;
-      if (parsed.framesBuf && parsed.frameCount > 0) {
+      const nowTs = Date.now();
+      // Coalesce at least 8 ADTS frames (~512ms @ 16kHz) or 400ms elapsed so Web Audio plays a silky continuous stream
+      if (parsed.framesBuf && parsed.frameCount > 0 && (parsed.frameCount >= 8 || !st.lastEmitAt || (nowTs - st.lastEmitAt >= 400))) {
+        st.adtsCarry = parsed.remainder;
+        st.lastEmitAt = nowTs;
         st.seq += 1;
         st.chunks.push({
           seq: st.seq,
-          at: Date.now(),
+          at: nowTs,
           format: 'aac',
           sample_rate: parsed.sampleRate,
           frame_count: parsed.frameCount,
           data_b64: parsed.framesBuf.toString('base64'),
         });
-        if (st.chunks.length > 28) st.chunks.splice(0, st.chunks.length - 28);
+        if (st.chunks.length > 32) st.chunks.splice(0, st.chunks.length - 32);
+      } else {
+        st.adtsCarry = capped;
       }
       return;
     }
@@ -1483,9 +2677,16 @@ export function createDahuaCctvManager({ db }) {
   }
 
   function ingestBridgeAudioChunk({ deviceId, dvrId, channel, contentType, dataB64, error }) {
-    const dvr = getRawDvr(dvrId);
-    if (!dvr || dvr.bridge_device_id !== deviceId) return false;
-    const ch = Math.max(1, Math.min(64, Number(channel || 1) || 1));
+    let realDvrId = String(dvrId || '');
+    let realChannel = Number(channel || 1);
+    const ipchMatch = realDvrId.match(/^(.+)__ipch_(\d+)$/);
+    if (ipchMatch) {
+      realDvrId = ipchMatch[1];
+      realChannel = parseInt(ipchMatch[2], 10) || 1;
+    }
+    const dvr = getRawDvr(realDvrId);
+    if (!dvr) return false;
+    const ch = Math.max(1, Math.min(64, realChannel || 1));
     const lease = audioLeases.get(dvr.id);
     const isActive = Boolean(lease && lease.channel === ch && lease.until > Date.now());
     const st = getOrCreateAudioStream(`${dvr.id}:${ch}`);
@@ -1629,16 +2830,33 @@ export function createDahuaCctvManager({ db }) {
       }
     }
 
+    let useDirectRouterAudio = false;
+    let routerDvrForAudio = dvr;
+    if (dvr.connection_mode === 'router') {
+      const rState = await ensureRouterDirectStatus(dvr, false);
+      if (rState.ok && rState.routerHost) {
+        useDirectRouterAudio = true;
+        routerDvrForAudio = { ...dvr, host: rState.routerHost, http_port: rState.routerPort };
+      }
+    }
+
+    const activeBridgeDev = (dvr.connection_mode === 'bridge' || (dvr.connection_mode === 'router' && !useDirectRouterAudio))
+      ? resolveActiveBridgeDevice(dvr)
+      : null;
+    const activeBridgeId = (activeBridgeDev && activeBridgeDev.device_id) || String(dvr.bridge_device_id || '');
+
     audioLeases.set(dvr.id, {
       dvrId: dvr.id,
-      bridgeDeviceId: dvr.connection_mode === 'bridge' ? String(dvr.bridge_device_id || '') : '',
+      bridgeDeviceId: (dvr.connection_mode === 'bridge' || (dvr.connection_mode === 'router' && !useDirectRouterAudio))
+        ? activeBridgeId
+        : '',
       channel: ch,
       until: Date.now() + 7500,
     });
 
-    if (dvr.connection_mode === 'bridge') {
-      const dev = db.prepare('SELECT last_seen, label, hostname, app_version FROM devices WHERE device_id=?').get(dvr.bridge_device_id);
-      const devLabel = (dev && (dev.label || dev.hostname)) || dvr.bridge_device_id;
+    if (dvr.connection_mode === 'bridge' || (dvr.connection_mode === 'router' && !useDirectRouterAudio)) {
+      const dev = activeBridgeDev || db.prepare('SELECT last_seen, label, hostname, app_version FROM devices WHERE device_id=?').get(activeBridgeId);
+      const devLabel = (dev && (dev.label || dev.hostname)) || activeBridgeId;
       if (!dev || !dev.last_seen || Date.now() - Number(dev.last_seen) > 60_000) {
         throw new Error(`كمبيوتر الفرع (${devLabel}) غير متصل حالياً`);
       }
@@ -1666,7 +2884,7 @@ export function createDahuaCctvManager({ db }) {
           });
       }
     } else {
-      ensureDirectAudioStream(dvr, ch).catch(() => {});
+      ensureDirectAudioStream(routerDvrForAudio, ch).catch(() => {});
     }
 
     if (st.error && (!st.chunks.length || Date.now() - st.errorAt < 5000)) {
@@ -1711,6 +2929,37 @@ export function createDahuaCctvManager({ db }) {
 
   async function handleAction({ action, payload = {}, actor = '', role = 'super' }) {
     switch (String(action || '')) {
+      case 'poll_wall_frames':
+        return pollWallFrames({
+          items: payload.items || [],
+          actor,
+          role,
+        });
+      case 'detect_router_ip':
+        return detectRouterIpAndProbePort(payload);
+      case 'raw_cgi': {
+        const dvr = getRawDvr(payload.dvr_id);
+        const overrideHost = payload.override_host ? String(payload.override_host).trim() : '';
+        const targetDvr = {
+          ...dvr,
+          connection_mode: (overrideHost && !isPublicIpv4(overrideHost)) ? 'bridge' : dvr.connection_mode,
+          host: overrideHost || dvr.host,
+          http_port: Number(payload.override_port || dvr.http_port || 80),
+          username: payload.override_user ? String(payload.override_user) : dvr.username,
+          password: payload.override_pass ? String(payload.override_pass) : dvr.password,
+        };
+        const r = await executeDvrCgi(targetDvr, String(payload.path || '/cgi-bin/magicBox.cgi?action=getSystemInfo'), {
+          timeoutMs: Number(payload.timeout_ms || 8000),
+        });
+        return {
+          ok: true,
+          status: r.statusCode,
+          content_type: r.contentType,
+          text: String(r.contentType || '').includes('image') ? '' : (r.body ? r.body.toString('utf8') : ''),
+          b64: String(r.contentType || '').includes('image') && r.body ? r.body.toString('base64').slice(0, 80) : '',
+          len: r.body ? r.body.length : 0,
+        };
+      }
       case 'pull_names':
         return pullChannelNames(payload.dvr_id);
       case 'detect_audio':

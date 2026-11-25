@@ -861,8 +861,9 @@ fn get_server_info_inner(server: Option<&ServerHandle>, include_token: bool) -> 
             "port": s.port,
             "token": if include_token { s.token.as_str() } else { "" },
             "ip": local_ip(),
+            "app_version": APP_VERSION,
         }),
-        None => json!({ "port": 0, "token": "", "ip": local_ip() }),
+        None => json!({ "port": 0, "token": "", "ip": local_ip(), "app_version": APP_VERSION }),
     }
 }
 
@@ -958,6 +959,8 @@ fn device_to_json(d: &DeviceView) -> Value {
         "last_event": d.device.last_event,
         "last_event_at": d.device.last_event_at,
         "screen_requested": d.device.screen_requested,
+        "pending_command": d.pending_command,
+        "latest_client_version": APP_VERSION,
         "transport": "lan",
     })
 }
@@ -1132,7 +1135,9 @@ pub async fn set_relay_config(
 }
 
 static LOCAL_RELAY_PROBE: Mutex<(u64, bool)> = Mutex::new((0, false));
+static STATIC_IP_RELAY_PROBE: Mutex<(u64, bool)> = Mutex::new((0, false));
 static RELAY_HTTP_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+static CCTV_HTTP_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
 
 fn is_local_relay_listening() -> bool {
     let now = now_ms();
@@ -1152,14 +1157,38 @@ fn is_local_relay_listening() -> bool {
     alive
 }
 
+fn is_static_ip_relay_listening() -> bool {
+    let now = now_ms();
+    if let Ok(g) = STATIC_IP_RELAY_PROBE.lock() {
+        if g.0 > 0 && now.saturating_sub(g.0) < 45_000 {
+            return g.1;
+        }
+    }
+    let alive = "41.33.137.210:8790"
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(220)).is_ok())
+        .unwrap_or(false);
+    if let Ok(mut g) = STATIC_IP_RELAY_PROBE.lock() {
+        *g = (now, alive);
+    }
+    alive
+}
+
 fn relay_http_agent() -> &'static ureq::Agent {
     RELAY_HTTP_AGENT.get_or_init(|| tls_agent(15))
+}
+
+fn cctv_http_agent() -> &'static ureq::Agent {
+    CCTV_HTTP_AGENT.get_or_init(|| tls_agent(12))
 }
 
 fn relay_base_urls(cfg: &Config) -> Vec<String> {
     let mut bases = Vec::new();
     if is_local_relay_listening() {
         bases.push("http://127.0.0.1:8790".to_string());
+    } else if is_static_ip_relay_listening() {
+        bases.push("http://41.33.137.210:8790".to_string());
     }
     let configured = cfg.relay_url.trim().trim_end_matches('/').to_string();
     if !configured.is_empty() && !bases.iter().any(|b| b == &configured) {
@@ -1178,7 +1207,8 @@ fn relay_request(path: &str, method: &str, body: Option<&Value>) -> Result<Value
     if bases.is_empty() {
         return Err("لم يتم ضبط عنوان الـ Relay".into());
     }
-    let http = relay_http_agent();
+    let is_cctv = path.contains("/cctv/");
+    let http = if is_cctv { cctv_http_agent() } else { relay_http_agent() };
     let mut last_err = String::from("تعذر الاتصال بالـ Relay");
     for base in bases {
         let url = format!("{}{}", base, path);
@@ -1506,7 +1536,7 @@ fn get_alert_media_inner(server: Option<&ServerHandle>, alert_id: String) -> Val
     if safe_id.is_empty() {
         return json!({"ok": false, "error": "معرّف التنبيه غير صالح"});
     }
-    let http = tls_agent(30);
+    let http = relay_http_agent();
     for base in bases {
         let url = format!("{}/api/v1/admin/alerts/{}", base, safe_id);
         let Ok(resp) = http
@@ -1694,14 +1724,17 @@ fn check_admin_update_sync() -> Value {
     let remote_sha = v["sha256"].as_str().unwrap_or("").trim().to_string();
     let remote_mtime = v["mtime_ms"].as_u64().unwrap_or(0);
     let remote_size = v["size"].as_u64().unwrap_or(0);
+    let remote_ver = v["version"].as_str().unwrap_or("").trim().to_string();
     let installed_sha = read_installed_admin_sha256();
 
-    let update_available = if host_server || local_mtime_ms.saturating_add(90_000) >= remote_mtime {
+    let update_available = if host_server {
         false
+    } else if !remote_ver.is_empty() && remote_ver != APP_VERSION {
+        true
     } else if !installed_sha.is_empty() && !remote_sha.is_empty() {
         installed_sha != remote_sha
     } else {
-        true
+        local_mtime_ms.saturating_add(90_000) < remote_mtime
     };
 
     json!({
@@ -1709,6 +1742,8 @@ fn check_admin_update_sync() -> Value {
         "available": true,
         "update_available": update_available,
         "is_host_server": host_server,
+        "version": remote_ver,
+        "local_version": APP_VERSION,
         "remote_sha256": remote_sha,
         "installed_sha256": installed_sha,
         "remote_mtime_ms": remote_mtime,
@@ -2158,13 +2193,18 @@ fn get_uploaded_files_inner(params: ArchiveFilterParams) -> Value {
     let total_pages = ((total_matching + page_size - 1) / page_size).max(1);
     let safe_page = page.min(total_pages);
     let offset = (safe_page - 1) * page_size;
+    let local_relay_here = is_local_relay_listening();
     let files: Vec<Value> = matched
         .into_iter()
         .skip(offset)
         .take(page_size)
         .map(|mut item| {
-            let sp = item["stored_path"].as_str().unwrap_or("");
-            item["exists_on_disk"] = json!(!sp.is_empty() && std::path::Path::new(sp).is_file());
+            if local_relay_here {
+                let sp = item["stored_path"].as_str().unwrap_or("");
+                item["exists_on_disk"] = json!(!sp.is_empty() && std::path::Path::new(sp).is_file());
+            } else if item.get("exists_on_disk").is_none() {
+                item["exists_on_disk"] = json!(true);
+            }
             item
         })
         .collect();
@@ -2199,11 +2239,7 @@ fn get_uploaded_files_inner(params: ArchiveFilterParams) -> Value {
 }
 
 fn is_local_relay_server() -> bool {
-    "127.0.0.1:8790"
-        .parse::<std::net::SocketAddr>()
-        .ok()
-        .map(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(40)).is_ok())
-        .unwrap_or(false)
+    is_local_relay_listening()
 }
 
 fn browse_folder_dialog_sync(current_dir: String, title: &str, default_subfolder: &str) -> Value {
@@ -3354,6 +3390,12 @@ fn get_client_config_sync() -> Value {
         .as_ref()
         .and_then(|v| v["blocked"].as_bool())
         .unwrap_or_else(is_blocked);
+    let live_ver = status
+        .as_ref()
+        .and_then(|v| v["version"].as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(APP_VERSION)
+        .to_string();
     let enrolled = !link.device_token.is_empty();
     json!({
         "server_url": link.server_url,
@@ -3367,6 +3409,8 @@ fn get_client_config_sync() -> Value {
         "connected": connected,
         "blocked": blocked,
         "rustdesk_id": link.rustdesk_id,
+        "app_version": live_ver,
+        "ui_version": APP_VERSION,
     })
 }
 

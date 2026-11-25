@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
-const ONLINE_WINDOW_MS: u64 = 45_000;
+const ONLINE_WINDOW_MS: u64 = 120_000;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -43,6 +43,7 @@ pub struct DeviceView {
     #[serde(flatten)]
     pub device: Device,
     pub online: bool,
+    pub pending_command: String,
 }
 
 #[derive(Default)]
@@ -558,25 +559,51 @@ pub fn normalize_backup_dir_path(raw: &str) -> Result<std::path::PathBuf, String
     normalize_custom_storage_dir(raw, "IT-ELKHAWGA-Backups")
 }
 
+static DRIVES_CACHE: Mutex<(u64, Vec<serde_json::Value>)> = Mutex::new((0, Vec::new()));
+
 pub fn list_server_drives() -> Vec<serde_json::Value> {
+    let now_t = now_ms();
+    if let Ok(g) = DRIVES_CACHE.lock() {
+        if g.0 > 0 && now_t.saturating_sub(g.0) < 60_000 {
+            return g.1.clone();
+        }
+    }
     let mut out = Vec::new();
     #[cfg(windows)]
     {
-        for letter in b'C'..=b'Z' {
-            let root_str = format!("{}:\\", letter as char);
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLogicalDrives() -> u32;
+            fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+        }
+        const DRIVE_FIXED: u32 = 3;
+        const DRIVE_REMOVABLE: u32 = 2;
+        let mask = unsafe { GetLogicalDrives() };
+        for idx in 2u32..26u32 {
+            if (mask & (1u32 << idx)) == 0 {
+                continue;
+            }
+            let letter = (b'A' + idx as u8) as char;
+            let root_str = format!("{}:\\", letter);
+            let wide: Vec<u16> = format!("{}\0", root_str).encode_utf16().collect();
+            let dtype = unsafe { GetDriveTypeW(wide.as_ptr()) };
+            if dtype != DRIVE_FIXED && dtype != DRIVE_REMOVABLE {
+                continue;
+            }
             let p = std::path::Path::new(&root_str);
-            if p.exists() {
-                let (free_b, total_b) = disk_space_for_path(p);
-                if total_b > 0 {
-                    out.push(json!({
-                        "letter": format!("{}:", letter as char),
-                        "root": root_str,
-                        "free_bytes": free_b,
-                        "total_bytes": total_b,
-                    }));
-                }
+            let (free_b, total_b) = disk_space_for_path(p);
+            if total_b > 0 {
+                out.push(json!({
+                    "letter": format!("{}:", letter),
+                    "root": root_str,
+                    "free_bytes": free_b,
+                    "total_bytes": total_b,
+                }));
             }
         }
+    }
+    if let Ok(mut g) = DRIVES_CACHE.lock() {
+        *g = (now_t, out.clone());
     }
     out
 }
@@ -851,15 +878,41 @@ fn append_local_archive_log(entry: &serde_json::Value) {
     }
 }
 
+static LOCAL_ARCHIVE_CACHE: Mutex<(String, Vec<serde_json::Value>)> =
+    Mutex::new((String::new(), Vec::new()));
+
 pub fn read_local_archive_entries() -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let primary = archive_log_path();
     let legacy = std::path::PathBuf::from(r"C:\IT-ELKHAWGA-Archive\archive-log.jsonl");
     let mut paths = vec![primary.clone()];
     if !primary.to_string_lossy().eq_ignore_ascii_case(&legacy.to_string_lossy()) {
         paths.push(legacy);
     }
+    let sig: String = paths
+        .iter()
+        .map(|p| match std::fs::metadata(p) {
+            Ok(m) => {
+                let mt = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                format!("{}:{}:{}", p.to_string_lossy(), m.len(), mt)
+            }
+            Err(_) => format!("{}:0:0", p.to_string_lossy()),
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+
+    if let Ok(g) = LOCAL_ARCHIVE_CACHE.lock() {
+        if !g.0.is_empty() && g.0 == sig {
+            return g.1.clone();
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for p in paths {
         let Ok(raw) = std::fs::read_to_string(&p) else { continue };
         for line in raw.lines() {
@@ -874,6 +927,9 @@ pub fn read_local_archive_entries() -> Vec<serde_json::Value> {
                 }
             }
         }
+    }
+    if let Ok(mut g) = LOCAL_ARCHIVE_CACHE.lock() {
+        *g = (sig, out.clone());
     }
     out
 }
@@ -2187,79 +2243,138 @@ pub fn run_erp_site_backup_blocking(
             return Err("فشل تسجيل الدخول في موقع elkhawaga.uk — تأكد من اسم مستخدم وكلمة مرور الأدمن (أو قيود الجهاز/OTP)".into());
         }
 
-        // 2. Snapshot pre-existing backup links so we never re-download old 1-year-old backups
+        // 2. Snapshot pre-existing backup links & check if an ITK_Auto_ backup is already running or just completed
         set_erp_stage("تم تسجيل الدخول ✓ — جاري فحص قائمة النسخ الحالية...");
         let mut pre_downloads: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut pre_details: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for list_path in ["/backup-system/", "/backup-system/backups/"] {
+        let mut ordered_details: Vec<String> = Vec::new();
+        for list_path in ["/backup-system/backups/", "/backup-system/"] {
             if let Ok((_, h)) = sess.get_html(list_path) {
                 let (dls, dets) = extract_erp_backup_links(&h);
                 pre_downloads.extend(dls);
-                pre_details.extend(dets);
+                for d in dets {
+                    if !ordered_details.contains(&d) {
+                        ordered_details.push(d.clone());
+                    }
+                    pre_details.insert(d);
+                }
             }
         }
 
-        // 3. Open /backup-system/backups/create/ and trigger new full backup
-        let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-        let marker_title = format!("ITK_Auto_{}", stamp);
-        set_erp_stage(&format!("جاري إنشاء نسخة احتياطية كاملة جديدة ({})...", marker_title));
+        let local_saved_titles: std::collections::HashSet<String> = read_erp_backup_entries(&erp_backups_root_dir())
+            .into_iter()
+            .filter_map(|v| v["remote_title"].as_str().map(String::from))
+            .collect();
 
-        let (create_url, create_html) = sess.get_html("/backup-system/backups/create/")?;
-        if create_url.contains("/accounts/login") {
-            return Err("انتهت جلسة الموقع أو لا يملك هذا الحساب صلاحية دخول لوحة النسخ الاحتياطي".into());
-        }
-        let (form_action, form_fields) = extract_create_backup_form(&create_html, "/backup-system/backups/create/", &marker_title);
-        let (create_status, after_create_url, after_create_body) =
-            sess.post_form(&form_action, &create_url, &form_fields)?;
-        if create_status >= 400 {
-            return Err(format!("رفض الموقع طلب إنشاء النسخة الاحتياطية (HTTP {})", create_status));
-        }
-
-        // Check if JSON response directly returned download_url or detail url
+        let mut stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+        let mut marker_title = format!("ITK_Auto_{}", stamp);
         let mut direct_download_url: Option<String> = None;
         let mut candidate_detail_urls: Vec<String> = Vec::new();
-        if let Ok(jv) = serde_json::from_str::<serde_json::Value>(after_create_body.trim()) {
-            if let Some(dl) = jv["download_url"].as_str().or_else(|| jv["file_url"].as_str()) {
-                if !dl.is_empty() {
-                    direct_download_url = Some(dl.to_string());
+        let mut attached_existing = false;
+
+        // Check top 2 recent backups on elkhawaga.uk: if one is currently in-progress ("قيد التنفيذ"),
+        // or if an automatic ITK_Auto_ backup already completed on the site (has a real /download/ link) but wasn't downloaded yet, attach to it!
+        for top_det in ordered_details.iter().take(2) {
+            if let Ok((_, det_html)) = sess.get_html(top_det) {
+                let (dls, _) = extract_erp_backup_links(&det_html);
+                let has_real_download_link = !dls.is_empty();
+                let is_in_progress = !has_real_download_link && det_html.contains("قيد التنفيذ");
+                let found_itk_title = det_html
+                    .find("ITK_Auto_")
+                    .and_then(|idx| det_html.get(idx..idx.saturating_add(40)))
+                    .and_then(|s| s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-').next())
+                    .filter(|s| s.len() >= 20)
+                    .map(String::from);
+
+                if is_in_progress {
+                    if let Some(t) = found_itk_title {
+                        if let Some(st_part) = t.strip_prefix("ITK_Auto_") {
+                            stamp = st_part.to_string();
+                        }
+                        marker_title = t;
+                    }
+                    pre_details.remove(top_det);
+                    let guessed_dl = format!("{}/download/", top_det.trim_end_matches('/'));
+                    pre_downloads.remove(&guessed_dl);
+                    candidate_detail_urls.push(top_det.clone());
+                    attached_existing = true;
+                    set_erp_stage(&format!("تم ربط النسخة الجارية على الموقع ({})...", marker_title));
+                    break;
+                } else if has_real_download_link && reason == "auto_hourly" {
+                    if let Some(t) = found_itk_title {
+                        if !local_saved_titles.contains(&t) {
+                            if let Some(st_part) = t.strip_prefix("ITK_Auto_") {
+                                stamp = st_part.to_string();
+                            }
+                            marker_title = t;
+                            direct_download_url = dls.into_iter().next();
+                            attached_existing = true;
+                            set_erp_stage(&format!("تم العثور على نسخة مكتملة حديثاً على الموقع ({}) — جاري سحبها...", marker_title));
+                            break;
+                        }
+                    }
                 }
-            }
-            if let Some(id_val) = jv.get("id").or_else(|| jv.get("backup_id")) {
-                let id_str = id_val.as_str().map(String::from).unwrap_or_else(|| id_val.to_string());
-                let id_clean = id_str.trim_matches('"');
-                if !id_clean.is_empty() && id_clean != "null" {
-                    candidate_detail_urls.push(format!("/backup-system/backups/{}/", id_clean));
-                    candidate_detail_urls.push(format!("/backup-system/backups/{}/download/", id_clean));
-                }
-            }
-        }
-        if after_create_url.contains("/backup-system/backups/") && !after_create_url.contains("/create") {
-            candidate_detail_urls.push(after_create_url.clone());
-        }
-        let (imm_dls, imm_dets) = extract_erp_backup_links(&after_create_body);
-        for d in imm_dls {
-            if !pre_downloads.contains(&d) {
-                direct_download_url = Some(d);
-                break;
-            }
-        }
-        for det in imm_dets {
-            if !pre_details.contains(&det) && !candidate_detail_urls.contains(&det) {
-                candidate_detail_urls.push(det);
             }
         }
 
-        // 4. Poll up to 60 * 3s (3 minutes) until the new backup finishes compressing and exposes its download link
+        // 3. Open /backup-system/backups/create/ and trigger new full backup (if not already running/completed)
+        if !attached_existing {
+            set_erp_stage(&format!("جاري إنشاء نسخة احتياطية كاملة جديدة ({})...", marker_title));
+
+            let (create_url, create_html) = sess.get_html("/backup-system/backups/create/")?;
+            if create_url.contains("/accounts/login") {
+                return Err("انتهت جلسة الموقع أو لا يملك هذا الحساب صلاحية دخول لوحة النسخ الاحتياطي".into());
+            }
+            let (form_action, form_fields) = extract_create_backup_form(&create_html, "/backup-system/backups/create/", &marker_title);
+            let (create_status, after_create_url, after_create_body) =
+                sess.post_form(&form_action, &create_url, &form_fields)?;
+            if create_status >= 400 {
+                return Err(format!("رفض الموقع طلب إنشاء النسخة الاحتياطية (HTTP {})", create_status));
+            }
+
+            if let Ok(jv) = serde_json::from_str::<serde_json::Value>(after_create_body.trim()) {
+                if let Some(dl) = jv["download_url"].as_str().or_else(|| jv["file_url"].as_str()) {
+                    if !dl.is_empty() {
+                        direct_download_url = Some(dl.to_string());
+                    }
+                }
+                if let Some(id_val) = jv.get("id").or_else(|| jv.get("backup_id")) {
+                    let id_str = id_val.as_str().map(String::from).unwrap_or_else(|| id_val.to_string());
+                    let id_clean = id_str.trim_matches('"');
+                    if !id_clean.is_empty() && id_clean != "null" {
+                        candidate_detail_urls.push(format!("/backup-system/backups/{}/", id_clean));
+                        candidate_detail_urls.push(format!("/backup-system/backups/{}/download/", id_clean));
+                    }
+                }
+            }
+            if after_create_url.contains("/backup-system/backups/") && !after_create_url.contains("/create") {
+                candidate_detail_urls.push(after_create_url.clone());
+            }
+            let (imm_dls, imm_dets) = extract_erp_backup_links(&after_create_body);
+            for d in imm_dls {
+                if !pre_downloads.contains(&d) {
+                    direct_download_url = Some(d);
+                    break;
+                }
+            }
+            for det in imm_dets {
+                if !pre_details.contains(&det) && !candidate_detail_urls.contains(&det) {
+                    candidate_detail_urls.push(det);
+                }
+            }
+        }
+
+        // 4. Poll up to 180 * 4s (12 minutes) until the new backup finishes compressing (~4.5 mins for 1.1 GB / 1.46M records)
         let mut resolved_download = direct_download_url;
-        for attempt in 0..60 {
+        for attempt in 0..180 {
             if resolved_download.is_some() {
                 break;
             }
             if attempt > 0 {
-                set_erp_stage(&format!("جاري ضغط النسخة على الموقع... ({} ثانية)", attempt * 3));
-                std::thread::sleep(Duration::from_secs(3));
+                set_erp_stage(&format!("جاري ضغط النسخة على الموقع (1.1 GB)... ({} ثانية)", attempt * 4));
+                std::thread::sleep(Duration::from_secs(4));
             }
-            // Check any discovered detail page first
+            // Check any discovered detail page first (only accept when Django actually renders the /download/ link!)
             for det_url in candidate_detail_urls.clone() {
                 if det_url.contains("download") {
                     continue;
@@ -2291,12 +2406,6 @@ pub fn run_erp_site_backup_blocking(
                             let (dls, _) = extract_erp_backup_links(&det_html);
                             if let Some(dl) = dls.into_iter().next() {
                                 resolved_download = Some(dl);
-                                break;
-                            }
-                            // Try standard Django convention <detail>/download/ if detail shows completed
-                            if det_html.contains("مكتمل") || det_html.to_ascii_lowercase().contains("completed") {
-                                let guessed = format!("{}/download/", det.trim_end_matches('/'));
-                                resolved_download = Some(guessed);
                                 break;
                             }
                         }
@@ -2684,6 +2793,33 @@ fn mime_for_filename(name: &str) -> &'static [u8] {
     }
 }
 
+static UPLOAD_FETCH_HTTP: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+static SERVER_LOCAL_RELAY_PROBE: Mutex<(u64, bool)> = Mutex::new((0, false));
+
+fn is_server_local_relay_up() -> bool {
+    let now_t = now_ms();
+    if let Ok(g) = SERVER_LOCAL_RELAY_PROBE.lock() {
+        if g.0 > 0 && now_t.saturating_sub(g.0) < 15_000 {
+            return g.1;
+        }
+    }
+    let alive = "127.0.0.1:8790"
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(50)).is_ok())
+        .unwrap_or(false);
+    if let Ok(mut g) = SERVER_LOCAL_RELAY_PROBE.lock() {
+        *g = (now_t, alive);
+    }
+    alive
+}
+
+fn admin_upload_disk_cache_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("itk-admin-upload-cache");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 pub(crate) fn fetch_uploaded_file_bytes(fid: &str) -> Option<(String, Vec<u8>)> {
     if let Some(hit) = find_local_uploaded_file(fid) {
         if !hit.1.is_empty() {
@@ -2698,13 +2834,9 @@ pub(crate) fn fetch_uploaded_file_bytes(fid: &str) -> Option<(String, Vec<u8>)> 
         return None;
     }
     let cfg = read_config();
+    let local_relay = is_server_local_relay_up();
     let mut bases: Vec<String> = Vec::new();
-    if "127.0.0.1:8790"
-        .parse::<std::net::SocketAddr>()
-        .ok()
-        .map(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(60)).is_ok())
-        .unwrap_or(false)
-    {
+    if local_relay {
         bases.push("http://127.0.0.1:8790".to_string());
     }
     let configured = if cfg.relay_url.trim().is_empty() {
@@ -2716,7 +2848,7 @@ pub(crate) fn fetch_uploaded_file_bytes(fid: &str) -> Option<(String, Vec<u8>)> 
         bases.push(configured);
     }
 
-    let http = tls_agent(60);
+    let http = UPLOAD_FETCH_HTTP.get_or_init(|| tls_agent(60));
     for base in bases {
         let url = format!("{}/api/v1/uploads/{}", base, safe_id);
         let mut req_builder = http.get(&url);
@@ -2751,6 +2883,25 @@ pub(crate) fn fetch_uploaded_file_bytes(fid: &str) -> Option<(String, Vec<u8>)> 
         }
         let mut buf = Vec::new();
         if resp.into_reader().take(70 * 1024 * 1024).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            if !local_relay && buf.len() <= 20 * 1024 * 1024 {
+                let safe_fn: String = fname
+                    .chars()
+                    .map(|c| {
+                        if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() {
+                            '_'
+                        } else {
+                            c
+                        }
+                    })
+                    .take(100)
+                    .collect();
+                let cache_path = admin_upload_disk_cache_dir().join(format!(
+                    "{}__{}",
+                    safe_id,
+                    if safe_fn.is_empty() { "file.bin" } else { &safe_fn }
+                ));
+                let _ = std::fs::write(&cache_path, &buf);
+            }
             return Some((fname, buf));
         }
     }
@@ -2797,6 +2948,7 @@ fn find_local_uploaded_file(file_id: &str) -> Option<(String, Vec<u8>)> {
     let dirs = [
         uploaded_files_dir(),
         std::path::PathBuf::from(r"C:\ProgramData\IT-ELKHAWGA-Relay\uploads"),
+        admin_upload_disk_cache_dir(),
     ];
     for dir in dirs {
         if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -2818,12 +2970,8 @@ pub(crate) fn serve_web_asset(path: &str) -> Option<(Vec<u8>, &'static [u8], u16
         "/" | "/index.html" | "/admin" | "/admin/" => {
             let html = include_str!("../../web/index.html")
                 .replace(
-                    "<script src=\"tauri-shim.js\"></script>",
-                    "<script>window.__ITK_WEB_ADMIN__=true;</script><script src=\"tauri-shim.js?v=117\"></script>",
-                )
-                .replace(
-                    "<script src=\"index.inline.js\"></script>",
-                    "<script src=\"index.inline.js?v=117\"></script>",
+                    "<script src=\"tauri-shim.js",
+                    "<script>window.__ITK_WEB_ADMIN__=true;</script><script src=\"tauri-shim.js",
                 );
             Some((html.into_bytes(), b"text/html; charset=utf-8", 200))
         }
@@ -2871,40 +3019,55 @@ fn current_policy_full(cfg: &Config) -> serde_json::Value {
     policy
 }
 
-fn read_client_installer_bytes() -> Option<Vec<u8>> {
-    let name = "IT ELKHAWGA Client_1.0.0_x64-setup.exe";
-    let candidates = [
-        std::path::PathBuf::from(r"C:\Users\IT APP\Desktop\blockwebsite\final-release").join(name),
-        std::path::PathBuf::from(r"C:\Users\IT APP\Desktop\tools").join(name),
-        resource_dir().join(name),
-        data_dir().join(name),
+fn find_newest_installer_in_dirs(prefix: &str, exact_name: &str) -> Option<std::path::PathBuf> {
+    let dirs = [
+        std::path::PathBuf::from(r"C:\Users\IT APP\Desktop\blockwebsite\final-release"),
+        std::path::PathBuf::from(r"C:\Users\IT APP\Desktop\tools"),
+        resource_dir(),
+        data_dir(),
     ];
-    for p in candidates {
-        if let Ok(bytes) = std::fs::read(&p) {
-            if bytes.len() > 500_000 && bytes.starts_with(b"MZ") {
-                return Some(bytes);
+    for d in &dirs {
+        let exact = d.join(exact_name);
+        if let Ok(m) = std::fs::metadata(&exact) {
+            if m.is_file() && m.len() > 500_000 {
+                return Some(exact);
             }
         }
     }
-    None
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for d in &dirs {
+        let Ok(rd) = std::fs::read_dir(d) else { continue };
+        for ent in rd.flatten() {
+            let fname = ent.file_name().to_string_lossy().to_string();
+            if fname.starts_with(prefix) && fname.ends_with("_x64-setup.exe") {
+                if let Ok(m) = ent.metadata() {
+                    if m.is_file() && m.len() > 500_000 {
+                        let mtime = m.modified().unwrap_or(std::time::UNIX_EPOCH);
+                        if best.as_ref().map_or(true, |(bt, _)| mtime > *bt) {
+                            best = Some((mtime, ent.path()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn read_client_installer_bytes() -> Option<Vec<u8>> {
+    let exact = format!("IT ELKHAWGA Client_{}_x64-setup.exe", APP_VERSION);
+    let path = find_newest_installer_in_dirs("IT ELKHAWGA Client_", &exact)?;
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 500_000 && bytes.starts_with(b"MZ") {
+        Some(bytes)
+    } else {
+        None
+    }
 }
 
 fn find_admin_installer_path() -> Option<std::path::PathBuf> {
-    let name = "IT ELKHAWGA Admin_1.0.0_x64-setup.exe";
-    let candidates = [
-        std::path::PathBuf::from(r"C:\Users\IT APP\Desktop\blockwebsite\final-release").join(name),
-        std::path::PathBuf::from(r"C:\Users\IT APP\Desktop\tools").join(name),
-        resource_dir().join(name),
-        data_dir().join(name),
-    ];
-    for p in candidates {
-        if let Ok(m) = std::fs::metadata(&p) {
-            if m.is_file() && m.len() > 500_000 {
-                return Some(p);
-            }
-        }
-    }
-    None
+    let exact = format!("IT ELKHAWGA Admin_{}_x64-setup.exe", APP_VERSION);
+    find_newest_installer_in_dirs("IT ELKHAWGA Admin_", &exact)
 }
 
 fn handle_request(mut req: Request, registry: &Arc<Mutex<Registry>>, token: &str, port: u16) {
@@ -3032,7 +3195,30 @@ fn handle_request(mut req: Request, registry: &Arc<Mutex<Registry>>, token: &str
             .strip_prefix("/api/v1/uploads/")
             .or_else(|| path.strip_prefix("/api/uploads/"))
             .unwrap_or("");
+        let safe_etag_id: String = fid
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let etag_val = format!("\"{}\"", safe_etag_id);
         let inline_mode = url.contains("inline=1");
+        if !safe_etag_id.is_empty()
+            && req
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("If-None-Match") && h.value.as_str().contains(&etag_val))
+        {
+            let mut not_mod = Response::empty(304);
+            if let Ok(et) = Header::from_bytes(&b"ETag"[..], etag_val.as_bytes()) {
+                not_mod = not_mod.with_header(et);
+            }
+            if inline_mode {
+                if let Ok(cc) = Header::from_bytes(&b"Cache-Control"[..], &b"private, max-age=604800, immutable"[..]) {
+                    not_mod = not_mod.with_header(cc);
+                }
+            }
+            let _ = req.respond(not_mod);
+            return;
+        }
         if let Some((orig_name, bytes)) = fetch_uploaded_file_bytes(fid) {
             let safe_ascii: String = orig_name
                 .chars()
@@ -3058,8 +3244,13 @@ fn handle_request(mut req: Request, registry: &Arc<Mutex<Registry>>, token: &str
                 .with_header(cors)
                 .with_header(nosniff)
                 .with_header(refpol);
+            if !safe_etag_id.is_empty() {
+                if let Ok(et) = Header::from_bytes(&b"ETag"[..], etag_val.as_bytes()) {
+                    resp_out = resp_out.with_header(et);
+                }
+            }
             if inline_mode {
-                if let Ok(cc) = Header::from_bytes(&b"Cache-Control"[..], &b"private, max-age=86400"[..]) {
+                if let Ok(cc) = Header::from_bytes(&b"Cache-Control"[..], &b"private, max-age=604800, immutable"[..]) {
                     resp_out = resp_out.with_header(cc);
                 }
             }
@@ -3159,7 +3350,7 @@ fn handle_request(mut req: Request, registry: &Arc<Mutex<Registry>>, token: &str
                     let mime = resp.header("Content-Type").unwrap_or("application/octet-stream").to_string();
                     let cd_opt = resp.header("Content-Disposition").map(str::to_string);
                     let mut buf = Vec::new();
-                    if resp.into_reader().take(12 * 1024 * 1024).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                    if resp.into_reader().take(48 * 1024 * 1024).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
                         let ct = Header::from_bytes(&b"Content-Type"[..], mime.as_bytes()).unwrap();
                         let cc = Header::from_bytes(&b"Cache-Control"[..], &b"no-store, no-cache, must-revalidate"[..]).unwrap();
                         let cors = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
@@ -3194,7 +3385,14 @@ fn handle_request(mut req: Request, registry: &Arc<Mutex<Registry>>, token: &str
     // Web Admin dashboard static assets (gated client-side + server-side via JWT login on /api/rpc)
     if method == Method::Get {
         if let Some((bytes, ct, status)) = serve_web_asset(&path) {
-            let _ = req.respond(bytes_response(bytes, ct, status));
+            let mut resp = bytes_response(bytes, ct, status);
+            if let Ok(cc) = Header::from_bytes(&b"Cache-Control"[..], &b"no-store, no-cache, must-revalidate, max-age=0"[..]) {
+                resp = resp.with_header(cc);
+            }
+            if let Ok(pr) = Header::from_bytes(&b"Pragma"[..], &b"no-cache"[..]) {
+                resp = resp.with_header(pr);
+            }
+            let _ = req.respond(resp);
             return;
         }
     }
@@ -3866,6 +4064,8 @@ fn handle_admin(mut req: Request, registry: &Arc<Mutex<Registry>>, url: &str, me
                 "rustdesk_id": d.rustdesk_id,
                 "rustdesk_password": d.rustdesk_password,
                 "screen_requested": d.screen_requested,
+                "pending_command": reg.pending.get(&d.device_id).cloned().unwrap_or_default(),
+                "latest_client_version": APP_VERSION,
                 "online": now_ms().saturating_sub(d.last_seen) < ONLINE_WINDOW_MS,
             })
         }).collect();
@@ -4205,7 +4405,11 @@ impl ServerHandle {
         let mut list: Vec<DeviceView> = reg
             .devices
             .values()
-            .map(|d| DeviceView { online: now.saturating_sub(d.last_seen) < ONLINE_WINDOW_MS, device: d.clone() })
+            .map(|d| DeviceView {
+                online: now.saturating_sub(d.last_seen) < ONLINE_WINDOW_MS,
+                pending_command: reg.pending.get(&d.device_id).cloned().unwrap_or_default(),
+                device: d.clone(),
+            })
             .collect();
         list.sort_by(|a, b| a.device.hostname.to_lowercase().cmp(&b.device.hostname.to_lowercase()));
         list

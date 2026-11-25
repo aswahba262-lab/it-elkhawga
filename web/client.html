@@ -36,6 +36,7 @@
         </div>
       </div>
       <div class="head-actions">
+        <span class="badge blue mono" id="clientVersionBadge" dir="ltr" style="font-weight:800;padding:5px 10px;" title="رقم إصدار برنامج الحماية المثبّت على هذا الجهاز">v1.1.4</span>
         <span class="badge gray" id="linkBadge"><span class="dot offline" style="width:7px;height:7px;"></span> غير مربوط</span>
         <button class="theme-toggle" data-theme-toggle type="button">
           <svg class="moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
@@ -52,6 +53,7 @@
         <div class="client-chips">
           <span class="client-chip" id="chipInternet"><i></i><span>الإنترنت: مفتوح</span></span>
           <span class="client-chip" id="chipLink"><i></i><span>المدير: غير مربوط</span></span>
+          <span class="client-chip ok" id="chipVersion"><i></i><span dir="rtl">الإصدار: <b dir="ltr">v1.1.4</b></span></span>
         </div>
         <div class="hero-actions">
           <button class="btn btn-danger" id="blockBtn">قفل الإنترنت</button>
@@ -122,6 +124,7 @@
       © جميع الحقوق محفوظة ومملوكة حصرياً لشركة الخواجة (ELKHAWAGA) — نظام أمني داخلي، يُحظر النسخ أو التعديل أو الاستخدام غير المصرّح به
     </div>
     <div class="credit-row"><span class="credit-label">Owner</span><span class="credit-name">ELKHAWAGA Company</span></div>
+    <div class="credit-row"><span class="credit-label">Version</span><span class="credit-name mono" id="clientFooterVer" dir="ltr">v1.1.4</span></div>
     <div class="credit-row"><span class="credit-label">Developer</span><span class="credit-name">Ahmed Wahba</span></div>
     <div class="credit-row"><span class="credit-label">Idea by</span><span class="credit-name">Zakee Tahawi</span></div>
   </div>
@@ -199,6 +202,20 @@
     }
     $('sitesSearch').addEventListener('input', renderSites);
 
+    function renderClientVersion(verStr, agentRunning) {
+      const cleanVer = String(verStr || '1.1.3').replace(/^v/i, '');
+      const vb = $('clientVersionBadge');
+      if (vb) vb.textContent = 'v' + cleanVer;
+      const fv = $('clientFooterVer');
+      if (fv) fv.textContent = 'v' + cleanVer;
+      const cv = $('chipVersion');
+      if (cv) {
+        cv.className = 'client-chip ' + (agentRunning ? 'ok' : 'muted');
+        cv.lastElementChild.innerHTML = 'الإصدار: <b class="mono" dir="ltr">v' + esc(cleanVer) + '</b>';
+      }
+      document.title = 'IT ELKHAWGA Client v' + cleanVer + ' | Ahmed Wahba';
+    }
+
     async function loadLink(fill) {
       try {
         const c = await api.getClientConfig();
@@ -206,6 +223,7 @@
           $('serverUrlInput').value = c.server_url || '';
           $('tokenInput').value = c.token || '';
         }
+        renderClientVersion(c.app_version || c.ui_version || '1.1.3', !!c.agent_running);
         const isLan = c.transport === 'lan' && !!c.server_url;
         renderLink(isLan ? !!c.connected : (!!c.connected && !c.server_url), c.server_url || c.relay_url, !!c.agent_running);
       } catch (e) {

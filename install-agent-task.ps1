@@ -40,17 +40,24 @@ if ($isAdminInstall) {
   "admin install-tasks done" | Out-File $log -Append
   exit 0
 }
-# Agent (SYSTEM, at boot AND on user logon so Fast Startup never skips it)
+# Agent (SYSTEM, at boot, on user logon, AND every 5 minutes with auto-restart so it never stays offline)
 try {
   Unregister-ScheduledTask -TaskName "IT ELKHAWGA Agent" -Confirm:$false -ErrorAction SilentlyContinue
   $a = New-ScheduledTaskAction -Execute $exe -Argument "--agent"
   $t1 = New-ScheduledTaskTrigger -AtStartup
   $t2 = New-ScheduledTaskTrigger -AtLogOn
+  $t3 = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(-1)) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
   $p = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-  Register-ScheduledTask -TaskName "IT ELKHAWGA Agent" -Action $a -Trigger @($t1, $t2) -Principal $p -Settings $s -Force | Out-Null
+  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+  Register-ScheduledTask -TaskName "IT ELKHAWGA Agent" -Action $a -Trigger @($t1, $t2, $t3) -Principal $p -Settings $s -Force | Out-Null
   "agent task OK" | Out-File $log -Append
   Start-ScheduledTask -TaskName "IT ELKHAWGA Agent" -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 900
+  $agentRunning = Get-CimInstance Win32_Process -Filter "Name = 'it-elkhawga.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '--agent' }
+  if (-not $agentRunning) {
+    Start-Process -FilePath $exe -ArgumentList "--agent" -WindowStyle Hidden -ErrorAction SilentlyContinue
+    "agent fallback direct start OK" | Out-File $log -Append
+  }
 } catch { "agent task ERR: $($_.Exception.Message)" | Out-File $log -Append }
 # Screen capture (interactive user, on logon for ALL users, not just the UAC admin)
 try {
@@ -58,7 +65,7 @@ try {
   $a = New-ScheduledTaskAction -Execute $exe -Argument "--capture-agent"
   $t = New-ScheduledTaskTrigger -AtLogOn
   $p = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
-  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
   Register-ScheduledTask -TaskName "IT ELKHAWGA Screen" -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null
   "screen task OK" | Out-File $log -Append
   Start-ScheduledTask -TaskName "IT ELKHAWGA Screen" -ErrorAction SilentlyContinue

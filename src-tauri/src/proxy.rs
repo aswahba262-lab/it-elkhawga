@@ -57,7 +57,7 @@ impl ProxyState {
     }
 
     pub fn record(&self, host: &str) {
-        if host.is_empty() {
+        if host.is_empty() || is_background_noise_host(host) {
             return;
         }
         let mut log = self.sites.lock().unwrap();
@@ -77,7 +77,7 @@ impl ProxyState {
     }
 
     pub fn record_denied(&self, host: &str) {
-        if host.is_empty() {
+        if host.is_empty() || is_background_noise_host(host) {
             return;
         }
         let mut log = self.sites.lock().unwrap();
@@ -296,15 +296,53 @@ fn is_background_noise_host(host: &str) -> bool {
         "do.dsp.mp.microsoft.com",
         "telecommandsvc.microsoft.com",
         "officeclient.microsoft.com",
+        "microsoft.com",
+        "windows.com",
+        "windows.net",
+        "bing.com",
+        "msn.com",
+        "live.com",
+        "officeapps.live.com",
+        "skype.com",
+        "office.com",
+        "office.net",
         "ecs.office.com",
         "c2r.ts.cdn.office.net",
         "msftconnecttest.com",
         "msftncsi.com",
         "sfx.ms",
+        "gfx.ms",
+        "onestore.ms",
         "azureedge.net",
+        "azure.com",
         "trafficmanager.net",
         "msedge.net",
+        "b-msedge.net",
+        "a-msedge.net",
+        "spo-msedge.net",
+        "l-msedge.net",
+        "s-msedge.net",
+        "t-msedge.net",
+        "edge.microsoft.com",
+        "microsoftedgeservices.com",
+        "nelreports.net",
+        "smartscreen.microsoft.com",
+        "smartscreen-prod.microsoft.com",
+        "footprintdns.com",
+        "msidentity.com",
+        "msauth.net",
+        "msftauth.net",
+        "passport.net",
+        "microsoftonline.com",
         "virtualearth.net",
+        "googleapis.com",
+        "accounts.google.com",
+        "clients1.google.com",
+        "clients2.google.com",
+        "clients3.google.com",
+        "clients4.google.com",
+        "clients5.google.com",
+        "clients6.google.com",
         "update.googleapis.com",
         "safebrowsing.googleapis.com",
         "optimizationguide-pa.googleapis.com",
@@ -328,6 +366,18 @@ fn is_background_noise_host(host: &str) -> bool {
         "doubleclick.net",
         "googlesyndication.com",
         "googleadservices.com",
+        "scorecardresearch.com",
+        "criteo.com",
+        "taboola.com",
+        "outbrain.com",
+        "adsrvr.org",
+        "adnxs.com",
+        "rubiconproject.com",
+        "pubmatic.com",
+        "casalemedia.com",
+        "openx.net",
+        "moatads.com",
+        "amazon-adsystem.com",
         "facebook.net",
         "fbcdn.net",
         "fbsbx.com",
@@ -352,6 +402,11 @@ fn is_background_noise_host(host: &str) -> bool {
         "sentry.io",
         "whatsapp.net",
         "anydesk.com",
+        "mozilla.com",
+        "mozilla.net",
+        "firefox.com",
+        "opera.com",
+        "brave.com",
     ];
     if NOISE_DOMAINS.iter().any(|d| host_matches_domain(&h, d)) {
         return true;
@@ -375,11 +430,25 @@ fn extract_url_host(raw: &str) -> String {
         .to_lowercase()
 }
 
+fn is_local_or_private_lan_host(h: &str) -> bool {
+    if h == "localhost" || h == "127.0.0.1" || h == "::1" || h.ends_with(".local") {
+        return true;
+    }
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|s| s.parse::<u8>().is_ok()) {
+        let a: u8 = parts[0].parse().unwrap_or(0);
+        let b: u8 = parts[1].parse().unwrap_or(0);
+        if a == 10 || a == 127 || (a == 192 && b == 168) || (a == 172 && (16..=31).contains(&b)) {
+            return true;
+        }
+    }
+    false
+}
+
 fn host_always_allowed_with(h: &str, snap: &ProxyPolicySnapshot) -> bool {
-    // Always allow the local machine and the relay/control plane, otherwise a
-    // blocked device could never poll for an unblock command (deadlock) and
-    // the admin could not manage it.
-    if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+    // Always allow the local machine, private LAN IPs (branch routers 192.168.x.x / 10.x.x.x, DVRs, printers),
+    // and the relay/control plane, otherwise a blocked device could never access local LAN routers or poll.
+    if is_local_or_private_lan_host(h) {
         return true;
     }
     snap.always_allowed_hosts
@@ -550,12 +619,10 @@ static UPLOADS: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, 
     std::sync::Mutex::new(None);
 
 fn track_upload_dir(host: &str, bytes: u64, is_upload: bool) {
-    if host.is_empty() {
+    if !is_upload || bytes == 0 || host.is_empty() {
         return;
     }
-    if is_upload {
-        record_whatsapp_upload_bytes(host, bytes);
-    }
+    record_whatsapp_upload_bytes(host, bytes);
     let snap = cached_policy_snapshot();
     let threshold_mb: u64 = snap.exfil_threshold_mb;
     let window_secs: u64 = snap.exfil_window_secs;
@@ -678,6 +745,8 @@ struct RootCaState {
     #[cfg_attr(not(test), allow(dead_code))]
     ca_cert_der: CertificateDer<'static>,
     ca_key: KeyPair,
+    shared_leaf_key: KeyPair,
+    shared_leaf_key_der: Vec<u8>,
     leaf_cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
 
@@ -686,6 +755,10 @@ impl RootCaState {
         let key_path = ca_dir.join("ca-key.pem");
         let cer_path = ca_dir.join("ca-cert.cer");
         let pem_path = ca_dir.join("ca-cert.pem");
+
+        let shared_leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .map_err(|e| format!("generate shared leaf key: {}", e))?;
+        let shared_leaf_key_der = shared_leaf_key.serialize_der();
 
         if key_path.exists() && cer_path.exists() {
             if let (Ok(key_pem), Ok(cer_bytes)) =
@@ -698,6 +771,8 @@ impl RootCaState {
                                 ca_cert,
                                 ca_cert_der: CertificateDer::from(cer_bytes),
                                 ca_key,
+                                shared_leaf_key,
+                                shared_leaf_key_der,
                                 leaf_cache: Mutex::new(HashMap::new()),
                             });
                         }
@@ -722,6 +797,8 @@ impl RootCaState {
             ca_cert,
             ca_cert_der,
             ca_key,
+            shared_leaf_key,
+            shared_leaf_key_der,
             leaf_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -768,14 +845,12 @@ impl RootCaState {
         serial[0] = (serial[0] & 0x7F) | 0x01;
         params.serial_number = Some(SerialNumber::from_slice(&serial));
 
-        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .map_err(|e| format!("leaf key: {}", e))?;
         let leaf_cert = params
-            .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
+            .signed_by(&self.shared_leaf_key, &self.ca_cert, &self.ca_key)
             .map_err(|e| format!("sign leaf: {}", e))?;
 
         let cert_chain = vec![leaf_cert.der().clone()];
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.shared_leaf_key_der.clone()));
         let mut cfg =
             ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
                 .with_safe_default_protocol_versions()
@@ -787,7 +862,7 @@ impl RootCaState {
         let cfg = Arc::new(cfg);
 
         if let Ok(mut cache) = self.leaf_cache.lock() {
-            if cache.len() >= 128 {
+            if cache.len() >= 512 {
                 cache.clear();
             }
             cache.insert(cache_key, Arc::clone(&cfg));
@@ -921,8 +996,8 @@ fn serve_blocked_https_with_ca(
         return;
     };
     let mut tls = StreamOwned::new(conn, client);
-    let _ = tls.get_mut().set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = tls.get_mut().set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = tls.get_mut().set_read_timeout(Some(Duration::from_millis(350)));
+    let _ = tls.get_mut().set_write_timeout(Some(Duration::from_millis(350)));
 
     let mut req_buf = [0u8; 8192];
     let mut total = 0usize;
@@ -996,8 +1071,24 @@ fn respond_blocked(mut stream: TcpStream, method: &str, raw_host: &str, norm_hos
     let _ = stream.flush();
 }
 
+fn connect_upstream(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let addrs = (host, port).to_socket_addrs()?;
+    let mut last_err = None;
+    for addr in addrs.take(3) {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "upstream resolve failed")
+    }))
+}
+
 fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()> {
-    let _ = client.set_read_timeout(Some(Duration::from_secs(20)));
+    let _ = client.set_nodelay(true);
+    let _ = client.set_read_timeout(Some(Duration::from_millis(2500)));
     let head = match read_head(&mut client) {
         Some(h) => h,
         None => return Ok(()),
@@ -1035,18 +1126,18 @@ fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()>
     if host_denied_by_policy(&host) {
         state.record_denied(&norm_host);
         state.queue_notification(&norm_host);
-        log_action(&format!("PROXY denied {}", host));
         respond_blocked(client, &method, &host, &norm_host);
         return Ok(());
     }
 
-    let upstream = match TcpStream::connect((host.as_str(), port)) {
+    let upstream = match connect_upstream(&host, port, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(_) => {
             respond(&mut client, "502 Bad Gateway", "upstream unreachable");
             return Ok(());
         }
     };
+    let _ = upstream.set_nodelay(true);
     let _ = upstream.set_read_timeout(Some(Duration::from_secs(300)));
 
     let kbps = state.throttle_kbps.load(Ordering::Relaxed);
@@ -1093,10 +1184,9 @@ fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()>
     if kbps > 0 {
         copy_paced(up_read, client_write, kbps, &host, false);
     } else {
-        // still track uploads even without throttling
         let mut r = up_read;
         let mut w = client_write;
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; 32 * 1024];
         loop {
             let n = match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1105,7 +1195,6 @@ fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()>
             if w.write_all(&buf[..n]).is_err() {
                 break;
             }
-            track_upload_dir(&host, n as u64, false);
         }
     }
     Ok(())
@@ -1127,7 +1216,9 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
         } else {
             let mut r = c_read;
             let mut w = u_write;
-            let mut buf = vec![0u8; 16 * 1024];
+            let mut buf = vec![0u8; 32 * 1024];
+            let mut pending_up: u64 = 0;
+            let mut last_flush = Instant::now();
             loop {
                 let n = match r.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1136,7 +1227,15 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
                 if w.write_all(&buf[..n]).is_err() {
                     break;
                 }
-                track_upload_dir(&host_c, n as u64, true);
+                pending_up = pending_up.saturating_add(n as u64);
+                if pending_up >= 65_536 || last_flush.elapsed() >= Duration::from_millis(350) {
+                    track_upload_dir(&host_c, pending_up, true);
+                    pending_up = 0;
+                    last_flush = Instant::now();
+                }
+            }
+            if pending_up > 0 {
+                track_upload_dir(&host_c, pending_up, true);
             }
         }
     });
@@ -1145,7 +1244,7 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
     } else {
         let mut r = upstream;
         let mut w = client;
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; 32 * 1024];
         loop {
             let n = match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1154,7 +1253,6 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
             if w.write_all(&buf[..n]).is_err() {
                 break;
             }
-            track_upload_dir(&host, n as u64, false);
         }
     }
     let _ = up.join();

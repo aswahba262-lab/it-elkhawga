@@ -42,11 +42,17 @@ pub enum RelayPollOutcome {
 
 pub struct RelayClient {
     http: ureq::Agent,
+    fast_http: ureq::Agent,
+    upload_http: ureq::Agent,
 }
 
 impl RelayClient {
     pub fn new() -> Self {
-        RelayClient { http: tls_agent(30) }
+        RelayClient {
+            http: tls_agent(30),
+            fast_http: tls_agent(10),
+            upload_http: tls_agent(180),
+        }
     }
 
     fn post(&self, base: &str, path: &str, token: &str, body: Value) -> Option<Value> {
@@ -103,7 +109,8 @@ impl RelayClient {
     /// Uploads an exact archived copy of a user-uploaded file (up to 64 MB raw) to the relay.
     pub fn upload_file(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
         let url = format!("{}/api/v1/device/file", relay_url.trim_end_matches('/'));
-        let resp = tls_agent(180)
+        let resp = self
+            .upload_http
             .post(&url)
             .set("Authorization", &format!("Bearer {}", device_token))
             .set("Content-Type", "application/json")
@@ -117,7 +124,8 @@ impl RelayClient {
             return None;
         }
         let url = format!("{}/api/v1/device/alert", relay_url.trim_end_matches('/'));
-        let resp = tls_agent(60)
+        let resp = self
+            .http
             .post(&url)
             .set("Authorization", &format!("Bearer {}", device_token))
             .set("Content-Type", "application/json")
@@ -128,7 +136,8 @@ impl RelayClient {
     /// Uploads a live Dahua CCTV JPEG frame (or error) from a branch bridge PC to the Relay.
     pub fn upload_cctv_frame(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
         let url = format!("{}/api/v1/device/cctv-frame", relay_url.trim_end_matches('/'));
-        let resp = tls_agent(10)
+        let resp = self
+            .fast_http
             .post(&url)
             .set("Authorization", &format!("Bearer {}", device_token))
             .set("Content-Type", "application/json")
@@ -139,7 +148,8 @@ impl RelayClient {
     /// Uploads local subnet Dahua DVR auto-discovery results from a branch bridge PC.
     pub fn upload_cctv_scan(&self, relay_url: &str, device_token: &str, found: &[Value]) -> Option<Value> {
         let url = format!("{}/api/v1/device/cctv-scan", relay_url.trim_end_matches('/'));
-        let resp = tls_agent(15)
+        let resp = self
+            .http
             .post(&url)
             .set("Authorization", &format!("Bearer {}", device_token))
             .set("Content-Type", "application/json")
@@ -150,7 +160,8 @@ impl RelayClient {
     /// Uploads an on-demand Dahua CGI response (HDD health, ChannelTitle, playback search/clip, PTZ) from a branch PC.
     pub fn upload_cctv_cgi(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
         let url = format!("{}/api/v1/device/cctv-cgi", relay_url.trim_end_matches('/'));
-        let resp = tls_agent(45)
+        let resp = self
+            .http
             .post(&url)
             .set("Authorization", &format!("Bearer {}", device_token))
             .set("Content-Type", "application/json")
@@ -161,7 +172,8 @@ impl RelayClient {
     /// Uploads a live micro-chunk of Dahua camera audio (`~1-3 KB` AAC/G.711) while an admin has unmuted a camera.
     pub fn upload_cctv_audio(&self, relay_url: &str, device_token: &str, payload: &Value) -> Option<Value> {
         let url = format!("{}/api/v1/device/cctv-audio", relay_url.trim_end_matches('/'));
-        let resp = tls_agent(8)
+        let resp = self
+            .fast_http
             .post(&url)
             .set("Authorization", &format!("Bearer {}", device_token))
             .set("Content-Type", "application/json")

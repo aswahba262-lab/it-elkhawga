@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-pub const APP_VERSION: &str = "1.1.1";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_NAME: &str = "IT ELKHAWGA";
 pub const DEFAULT_SUPER_ADMIN_USERNAME: &str = "admin";
 pub const DEFAULT_SUPER_ADMIN_PASSWORD: &str = "Admin@123";
@@ -1438,6 +1438,19 @@ fn dahua_raw_get(agent: &ureq::Agent, url: &str, auth_hdr: Option<&str>) -> Resu
     }
 }
 
+fn is_dahua_auth_expired(code: u16, body: &[u8]) -> bool {
+    if code == 401 || code == 403 {
+        return true;
+    }
+    if body.len() <= 256 && body.starts_with(b"Error") {
+        let txt = String::from_utf8_lossy(body);
+        if txt.contains("Invalid Authority") || txt.contains("Authority") {
+            return true;
+        }
+    }
+    false
+}
+
 fn dahua_authed_get(
     host: &str,
     port: u16,
@@ -1448,8 +1461,9 @@ fn dahua_authed_get(
     static DVR_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     let agent = DVR_AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_millis(1400))
-            .timeout(std::time::Duration::from_millis(2400))
+            .timeout_connect(std::time::Duration::from_millis(2000))
+            .timeout_read(std::time::Duration::from_millis(5500))
+            .timeout(std::time::Duration::from_millis(6000))
             .build()
     });
     let url = format!("http://{}:{}{}", host, port, path_with_query);
@@ -1459,37 +1473,60 @@ fn dahua_authed_get(
         .lock()
         .ok()
         .and_then(|mut map| {
-            map.get_mut(&cache_key).map(|entry| {
-                entry.1 = entry.1.wrapping_add(1).max(1);
-                (entry.0.clone(), entry.1)
-            })
+            if let Some(entry) = map.get_mut(&cache_key) {
+                if entry.1 >= 500 {
+                    map.remove(&cache_key);
+                    None
+                } else {
+                    entry.1 = entry.1.wrapping_add(1).max(1);
+                    Some((entry.0.clone(), entry.1))
+                }
+            } else {
+                None
+            }
         });
 
     if let Some((challenge, nc)) = cached_opt {
         let hdr = build_digest_authorization("GET", path_with_query, username, password, &challenge, nc);
-        let (code, _, body) = dahua_raw_get(agent, &url, Some(&hdr))?;
-        if code != 401 {
-            return Ok((code, body));
+        if let Ok((code, _, body)) = dahua_raw_get(agent, &url, Some(&hdr)) {
+            if !is_dahua_auth_expired(code, &body) {
+                return Ok((code, body));
+            }
         }
         if let Ok(mut map) = dahua_digest_cache().lock() {
             map.remove(&cache_key);
         }
     }
 
-    let (probe_code, www_opt, probe_body) = dahua_raw_get(agent, &url, None)?;
+    let (mut probe_code, mut www_opt, mut probe_body) = dahua_raw_get(agent, &url, None)?;
+    if is_dahua_auth_expired(probe_code, &probe_body) && probe_code != 401 {
+        let auth_url = format!(
+            "http://{}:{}/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle",
+            host, port
+        );
+        if let Ok((ac, awww, abody)) = dahua_raw_get(agent, &auth_url, None) {
+            if ac == 401 && awww.is_some() {
+                probe_code = ac;
+                www_opt = awww;
+                probe_body = abody;
+            }
+        }
+    }
     if probe_code != 401 {
         return Ok((probe_code, probe_body));
     }
     if let Some(ref www) = www_opt {
         if let Some(challenge) = parse_digest_header(www) {
-            if let Ok(mut map) = dahua_digest_cache().lock() {
-                if map.len() > 64 {
-                    map.clear();
-                }
-                map.insert(cache_key, (challenge.clone(), 1));
-            }
             let hdr = build_digest_authorization("GET", path_with_query, username, password, &challenge, 1);
             let (code, _, body) = dahua_raw_get(agent, &url, Some(&hdr))?;
+            if !is_dahua_auth_expired(code, &body) {
+                if let Ok(mut map) = dahua_digest_cache().lock() {
+                    if map.len() > 64 {
+                        map.clear();
+                    }
+                    map.insert(cache_key, (challenge, 1));
+                }
+            }
             return Ok((code, body));
         }
     }
@@ -1501,7 +1538,400 @@ fn dahua_authed_get(
 
 fn is_valid_dvr_image(buf: &[u8]) -> bool {
     buf.len() >= 256
-        && ((buf[0] == 0xff && buf[1] == 0xd8) || (buf[0] == 0x89 && buf[1] == 0x50))
+        && ((buf[0] == 0xff && buf[1] == 0xd8)
+            || (buf[0] == 0x89 && buf[1] == 0x50)
+            || (buf.len() >= 512 && buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0x01))
+}
+
+fn http_dead_hosts_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static DEAD_HTTP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    DEAD_HTTP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn rtsp_dead_hosts_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static DEAD_RTSP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    DEAD_RTSP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pulls a single H.264 IDR Keyframe (SPS + PPS + IDR in Annex-B `00 00 00 01` format) over RTSP-over-TCP (`:554`)
+/// from a Dahua DVR or Imou/Dahua IP camera (such as `IPC-A12` where HTTP port 80 is disabled or `snapshot.cgi` is unsupported).
+pub fn fetch_dahua_rtsp_h264_keyframe(
+    host: &str,
+    rtsp_port: u16,
+    username: &str,
+    password: &str,
+    channel: u32,
+    hd: bool,
+) -> Result<Vec<u8>, String> {
+    let clean_host = host.trim();
+    let ch = channel.clamp(1, 64);
+    let first_sub = if hd { 0 } else { 1 };
+    if let Ok(bytes) = fetch_dahua_rtsp_h264_single_sub(clean_host, rtsp_port, username, password, ch, first_sub) {
+        return Ok(bytes);
+    }
+    if !hd {
+        return fetch_dahua_rtsp_h264_single_sub(clean_host, rtsp_port, username, password, ch, 0);
+    }
+    Err(format!("تعذر جلب بث RTSP للقناة {}", ch))
+}
+
+fn fetch_dahua_rtsp_h264_single_sub(
+    host: &str,
+    rtsp_port: u16,
+    username: &str,
+    password: &str,
+    channel: u32,
+    subtype: u32,
+) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    let addr: std::net::SocketAddr = format!("{}:{}", host, rtsp_port.max(1))
+        .parse()
+        .map_err(|_| "عنوان RTSP غير صالح".to_string())?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(1600))
+        .map_err(|e| format!("RTSP connect {}:{} failed: {}", host, rtsp_port, e))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(3800)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(2000)));
+
+    let base_uri = format!(
+        "rtsp://{}:{}/cam/realmonitor?channel={}&subtype={}",
+        host,
+        rtsp_port.max(1),
+        channel,
+        subtype
+    );
+    let mut cseq: u32 = 1;
+    let mut challenge_opt: Option<std::collections::HashMap<String, String>> = None;
+
+    let make_auth = |method: &str, uri: &str, chall: &Option<std::collections::HashMap<String, String>>, seq: u32| -> String {
+        if let Some(ref c) = chall {
+            let h = build_digest_authorization(method, uri, username, password, c, seq);
+            format!("Authorization: {}\r\n", h)
+        } else if !username.is_empty() {
+            let b = base64_encode(format!("{}:{}", username, password).as_bytes());
+            format!("Authorization: Basic {}\r\n", b)
+        } else {
+            String::new()
+        }
+    };
+
+    let read_rtsp_resp = |st: &mut std::net::TcpStream| -> Result<(u16, String, Vec<u8>), String> {
+        let mut buf = Vec::with_capacity(4096);
+        let mut tmp = [0u8; 2048];
+        let mut hdr_end_pos: Option<usize> = None;
+        let mut content_len: usize = 0;
+
+        while buf.len() < 65536 {
+            let n = st.read(&mut tmp).map_err(|e| format!("RTSP read err: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if hdr_end_pos.is_none() {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    hdr_end_pos = Some(pos + 4);
+                    let hdr_str = String::from_utf8_lossy(&buf[..pos]);
+                    for line in hdr_str.lines() {
+                        if line.to_ascii_lowercase().starts_with("content-length:") {
+                            content_len = line
+                                .split(':')
+                                .nth(1)
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            if let Some(hend) = hdr_end_pos {
+                if buf.len() >= hend + content_len {
+                    break;
+                }
+            }
+        }
+        let Some(hend) = hdr_end_pos else {
+            return Err("استجابة RTSP غير مكتملة".into());
+        };
+        let hdr_str = String::from_utf8_lossy(&buf[..hend - 4]).to_string();
+        let code = hdr_str
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body = buf[hend..].to_vec();
+        Ok((code, hdr_str, body))
+    };
+
+    // 1. DESCRIBE (first probe, then Digest if 401)
+    let req1 = format!(
+        "DESCRIBE {} RTSP/1.0\r\nCSeq: {}\r\nAccept: application/sdp\r\nUser-Agent: IT-ELKHAWGA-CCTV/1.1\r\n\r\n",
+        base_uri, cseq
+    );
+    stream.write_all(req1.as_bytes()).map_err(|e| e.to_string())?;
+    cseq += 1;
+    let (mut code, mut hdrs, mut sdp_body) = read_rtsp_resp(&mut stream)?;
+    if code == 401 {
+        for line in hdrs.lines() {
+            if line.to_ascii_lowercase().starts_with("www-authenticate:") {
+                if let Some(val) = line.split_once(':').map(|x| x.1.trim()) {
+                    if let Some(ch_map) = parse_digest_header(val) {
+                        challenge_opt = Some(ch_map);
+                        break;
+                    }
+                }
+            }
+        }
+        let auth_line = make_auth("DESCRIBE", &base_uri, &challenge_opt, cseq);
+        let req2 = format!(
+            "DESCRIBE {} RTSP/1.0\r\nCSeq: {}\r\n{}Accept: application/sdp\r\nUser-Agent: IT-ELKHAWGA-CCTV/1.1\r\n\r\n",
+            base_uri, cseq, auth_line
+        );
+        stream.write_all(req2.as_bytes()).map_err(|e| e.to_string())?;
+        cseq += 1;
+        let r2 = read_rtsp_resp(&mut stream)?;
+        code = r2.0;
+        hdrs = r2.1;
+        sdp_body = r2.2;
+    }
+    if code != 200 {
+        return Err(format!("رفضت الكاميرا طلب RTSP DESCRIBE (كود {})", code));
+    }
+
+    let sdp_str = String::from_utf8_lossy(&sdp_body);
+    let mut track_ctrl = "trackID=0".to_string();
+    let mut sps_nal: Vec<u8> = Vec::new();
+    let mut pps_nal: Vec<u8> = Vec::new();
+    let mut in_video = false;
+    for line in sdp_str.lines() {
+        let l = line.trim();
+        if l.starts_with("m=video") {
+            in_video = true;
+        } else if l.starts_with("m=") {
+            in_video = false;
+        }
+        if in_video && l.starts_with("a=control:") {
+            let ctrl = l.trim_start_matches("a=control:").trim();
+            if !ctrl.is_empty() && ctrl != "*" {
+                track_ctrl = ctrl.to_string();
+            }
+        }
+        if let Some(pos) = l.find("sprop-parameter-sets=") {
+            let rest = &l[pos + "sprop-parameter-sets=".len()..];
+            let param_str = rest.split(';').next().unwrap_or(rest).trim();
+            let mut parts = param_str.split(',');
+            if let Some(s_b64) = parts.next() {
+                if let Some(dec) = base64_decode(s_b64.trim()) {
+                    if !dec.is_empty() {
+                        sps_nal = dec;
+                    }
+                }
+            }
+            if let Some(p_b64) = parts.next() {
+                if let Some(dec) = base64_decode(p_b64.trim()) {
+                    if !dec.is_empty() {
+                        pps_nal = dec;
+                    }
+                }
+            }
+        }
+    }
+
+    let setup_uri = if track_ctrl.starts_with("rtsp://") {
+        track_ctrl
+    } else if base_uri.contains('?') {
+        format!("{}/{}", base_uri, track_ctrl.trim_start_matches('/'))
+    } else {
+        format!("{}/{}", base_uri.trim_end_matches('/'), track_ctrl.trim_start_matches('/'))
+    };
+
+    // 2. SETUP (RTP/AVP/TCP interleaved=0-1)
+    let auth_setup = make_auth("SETUP", &setup_uri, &challenge_opt, cseq);
+    let req_setup = format!(
+        "SETUP {} RTSP/1.0\r\nCSeq: {}\r\n{}Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: IT-ELKHAWGA-CCTV/1.1\r\n\r\n",
+        setup_uri, cseq, auth_setup
+    );
+    stream.write_all(req_setup.as_bytes()).map_err(|e| e.to_string())?;
+    cseq += 1;
+    let (scode, shdrs, _) = read_rtsp_resp(&mut stream)?;
+    if scode != 200 {
+        return Err(format!("فشل RTSP SETUP (كود {})", scode));
+    }
+    let mut session_id = String::new();
+    for line in shdrs.lines() {
+        if line.to_ascii_lowercase().starts_with("session:") {
+            if let Some(val) = line.split_once(':').map(|x| x.1.trim()) {
+                session_id = val.split(';').next().unwrap_or(val).trim().to_string();
+                break;
+            }
+        }
+    }
+
+    // 3. PLAY
+    let auth_play = make_auth("PLAY", &base_uri, &challenge_opt, cseq);
+    let sess_hdr = if !session_id.is_empty() {
+        format!("Session: {}\r\n", session_id)
+    } else {
+        String::new()
+    };
+    let req_play = format!(
+        "PLAY {} RTSP/1.0\r\nCSeq: {}\r\n{}{}Range: npt=0.000-\r\nUser-Agent: IT-ELKHAWGA-CCTV/1.1\r\n\r\n",
+        base_uri, cseq, auth_play, sess_hdr
+    );
+    stream.write_all(req_play.as_bytes()).map_err(|e| e.to_string())?;
+
+    // 4. Read interleaved RTP stream until we assemble SPS + PPS + 1 complete IDR keyframe (`NAL 5`)
+    let mut rbuf: Vec<u8> = Vec::with_capacity(65536);
+    let mut chunk = [0u8; 4096];
+    let mut idr_nals: Vec<Vec<u8>> = Vec::new();
+    let mut fua_buf: Vec<u8> = Vec::new();
+    let mut fua_nal_type: u8 = 0;
+    let started = std::time::Instant::now();
+
+    while started.elapsed() < std::time::Duration::from_millis(3600) && rbuf.len() < 512 * 1024 {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(_) => break,
+        };
+        rbuf.extend_from_slice(&chunk[..n]);
+
+        loop {
+            if rbuf.len() < 4 {
+                break;
+            }
+            if rbuf[0] != b'$' {
+                if rbuf.starts_with(b"RTSP/1.0") {
+                    if let Some(pos) = rbuf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        rbuf.drain(..pos + 4);
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(dollar) = rbuf.iter().position(|&b| b == b'$') {
+                    rbuf.drain(..dollar);
+                    continue;
+                } else {
+                    rbuf.clear();
+                    break;
+                }
+            }
+            let ch_id = rbuf[1];
+            let pkt_len = u16::from_be_bytes([rbuf[2], rbuf[3]]) as usize;
+            if rbuf.len() < 4 + pkt_len {
+                break;
+            }
+            let pkt = rbuf[4..4 + pkt_len].to_vec();
+            rbuf.drain(..4 + pkt_len);
+
+            if ch_id != 0 || pkt.len() < 13 {
+                continue;
+            }
+            let cc = (pkt[0] & 0x0f) as usize;
+            let has_ext = (pkt[0] & 0x10) != 0;
+            let has_pad = (pkt[0] & 0x20) != 0;
+            let rtp_marker = (pkt[1] & 0x80) != 0;
+            let mut offset = 12 + cc * 4;
+            if has_ext && pkt.len() >= offset + 4 {
+                let ext_words = u16::from_be_bytes([pkt[offset + 2], pkt[offset + 3]]) as usize;
+                offset += 4 + ext_words * 4;
+            }
+            let mut end_idx = pkt.len();
+            if has_pad && end_idx > offset {
+                let pad_len = pkt[end_idx - 1] as usize;
+                if pad_len > 0 && end_idx >= offset + pad_len {
+                    end_idx -= pad_len;
+                }
+            }
+            if offset >= end_idx {
+                continue;
+            }
+            let payload = &pkt[offset..end_idx];
+            let nal_hdr = payload[0];
+            let nal_type = nal_hdr & 0x1f;
+
+            if (1..=23).contains(&nal_type) {
+                if nal_type == 7 {
+                    sps_nal = payload.to_vec();
+                } else if nal_type == 8 {
+                    pps_nal = payload.to_vec();
+                } else if nal_type == 5 {
+                    idr_nals.push(payload.to_vec());
+                    if rtp_marker {
+                        break;
+                    }
+                }
+            } else if nal_type == 24 {
+                // STAP-A
+                let mut p = 1usize;
+                while p + 2 <= payload.len() {
+                    let nlen = u16::from_be_bytes([payload[p], payload[p + 1]]) as usize;
+                    p += 2;
+                    if p + nlen > payload.len() || nlen == 0 {
+                        break;
+                    }
+                    let sub_nal = &payload[p..p + nlen];
+                    let stype = sub_nal[0] & 0x1f;
+                    if stype == 7 {
+                        sps_nal = sub_nal.to_vec();
+                    } else if stype == 8 {
+                        pps_nal = sub_nal.to_vec();
+                    } else if stype == 5 {
+                        idr_nals.push(sub_nal.to_vec());
+                    }
+                    p += nlen;
+                }
+            } else if nal_type == 28 && payload.len() >= 2 {
+                // FU-A fragmented NAL unit
+                let fu_hdr = payload[1];
+                let is_start = (fu_hdr & 0x80) != 0;
+                let is_end = (fu_hdr & 0x40) != 0;
+                let orig_type = fu_hdr & 0x1f;
+                if is_start {
+                    fua_buf.clear();
+                    fua_nal_type = orig_type;
+                    fua_buf.push((nal_hdr & 0xe0) | orig_type);
+                    fua_buf.extend_from_slice(&payload[2..]);
+                } else if !fua_buf.is_empty() && fua_nal_type == orig_type {
+                    fua_buf.extend_from_slice(&payload[2..]);
+                }
+                if is_end && !fua_buf.is_empty() {
+                    if fua_nal_type == 7 {
+                        sps_nal = fua_buf.clone();
+                    } else if fua_nal_type == 8 {
+                        pps_nal = fua_buf.clone();
+                    } else if fua_nal_type == 5 {
+                        idr_nals.push(fua_buf.clone());
+                    }
+                    fua_buf.clear();
+                    if fua_nal_type == 5 && rtp_marker {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !idr_nals.is_empty() && !sps_nal.is_empty() && !pps_nal.is_empty() && fua_buf.is_empty() {
+            break;
+        }
+    }
+
+    if idr_nals.is_empty() || sps_nal.is_empty() || pps_nal.is_empty() {
+        return Err("لم يتم استلام إطار فيديو كامل من بث RTSP".into());
+    }
+
+    let mut out = Vec::with_capacity(sps_nal.len() + pps_nal.len() + idr_nals.iter().map(|n| n.len() + 4).sum::<usize>() + 16);
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend_from_slice(&sps_nal);
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend_from_slice(&pps_nal);
+    for idr in idr_nals {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&idr);
+    }
+    Ok(out)
 }
 
 fn is_private_lan_dvr_host(host: &str) -> bool {
@@ -1537,6 +1967,23 @@ pub fn execute_dahua_cgi(
     let pq = path_with_query.trim();
     if !pq.starts_with("/cgi-bin/") && !pq.starts_with("/RPC2") {
         return Err("مسار CGI غير صالح".into());
+    }
+    if pq == "/cgi-bin/_itk_clear_cache" {
+        if let Ok(mut map) = dahua_digest_cache().lock() {
+            map.clear();
+        }
+        return Ok((200, "text/plain".into(), b"OK_CACHE_CLEARED".to_vec()));
+    }
+    if pq.starts_with("/cgi-bin/_itk_rtsp_snap") {
+        let ch: u32 = pq
+            .split("channel=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let hd = pq.contains("subtype=0") || pq.contains("hd=1");
+        let bytes = fetch_dahua_rtsp_h264_keyframe(clean_host, 554, username, password, ch, hd)?;
+        return Ok((200, "video/h264".into(), bytes));
     }
     let safe_max = max_bytes.clamp(4096, 10 * 1024 * 1024);
     let safe_timeout = timeout_ms.clamp(1500, 35_000);
@@ -1575,37 +2022,61 @@ pub fn execute_dahua_cgi(
     };
 
     let cached_opt = dahua_digest_cache().lock().ok().and_then(|mut map| {
-        map.get_mut(&cache_key).map(|entry| {
-            entry.1 = entry.1.wrapping_add(1).max(1);
-            (entry.0.clone(), entry.1)
-        })
+        if let Some(entry) = map.get_mut(&cache_key) {
+            if entry.1 >= 20 {
+                map.remove(&cache_key);
+                None
+            } else {
+                entry.1 = entry.1.wrapping_add(1).max(1);
+                Some((entry.0.clone(), entry.1))
+            }
+        } else {
+            None
+        }
     });
 
     if let Some((challenge, nc)) = cached_opt {
         let hdr = build_digest_authorization("GET", pq, username, password, &challenge, nc);
-        let (code, _, ct, body) = do_req(Some(&hdr))?;
-        if code != 401 {
-            return Ok((code, ct, body));
+        if let Ok((code, _, ct, body)) = do_req(Some(&hdr)) {
+            if !is_dahua_auth_expired(code, &body) {
+                return Ok((code, ct, body));
+            }
         }
         if let Ok(mut map) = dahua_digest_cache().lock() {
             map.remove(&cache_key);
         }
     }
 
-    let (probe_code, www_opt, probe_ct, probe_body) = do_req(None)?;
+    let (mut probe_code, mut www_opt, probe_ct, mut probe_body) = do_req(None)?;
+    if is_dahua_auth_expired(probe_code, &probe_body) && probe_code != 401 {
+        let auth_url = format!(
+            "http://{}:{}/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle",
+            clean_host,
+            port.max(1)
+        );
+        if let Ok((ac, awww, abody)) = dahua_raw_get(&agent, &auth_url, None) {
+            if ac == 401 && awww.is_some() {
+                probe_code = ac;
+                www_opt = awww;
+                probe_body = abody;
+            }
+        }
+    }
     if probe_code != 401 {
         return Ok((probe_code, probe_ct, probe_body));
     }
     if let Some(ref www) = www_opt {
         if let Some(challenge) = parse_digest_header(www) {
-            if let Ok(mut map) = dahua_digest_cache().lock() {
-                if map.len() > 64 {
-                    map.clear();
-                }
-                map.insert(cache_key, (challenge.clone(), 1));
-            }
             let hdr = build_digest_authorization("GET", pq, username, password, &challenge, 1);
             let (code, _, ct, body) = do_req(Some(&hdr))?;
+            if !is_dahua_auth_expired(code, &body) {
+                if let Ok(mut map) = dahua_digest_cache().lock() {
+                    if map.len() > 64 {
+                        map.clear();
+                    }
+                    map.insert(cache_key, (challenge, 1));
+                }
+            }
             return Ok((code, ct, body));
         }
     }
@@ -1802,18 +2273,69 @@ pub fn fetch_dahua_snapshot(
     }
     let ch = channel.clamp(1, 64);
     let sub = if hd { 0 } else { 1 };
-    let primary = format!("/cgi-bin/snapshot.cgi?channel={}&subtype={}", ch, sub);
-    let (mut code, mut body) = dahua_authed_get(clean_host, port.max(1), &primary, username, password)?;
-    if code == 401 {
-        return Err("اسم المستخدم أو كلمة مرور جهاز الـ DVR غير صحيحة (HTTP 401)".into());
+    let http_dead = http_dead_hosts_cache()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&format!("{}:{}", clean_host, port.max(1))).copied())
+        .map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(240));
+
+    let mut code: u16 = 0;
+    let mut body: Vec<u8> = Vec::new();
+
+    if !http_dead {
+        let primary = format!("/cgi-bin/snapshot.cgi?channel={}&subtype={}", ch, sub);
+        match dahua_authed_get(clean_host, port.max(1), &primary, username, password) {
+            Ok(res) => {
+                code = res.0;
+                body = res.1;
+            }
+            Err(e) => {
+                if e.contains("Connect error")
+                    || e.contains("Connection Failed")
+                    || e.contains("timed out")
+                    || e.contains("10060")
+                    || e.contains("Network Error")
+                {
+                    if let Ok(mut map) = http_dead_hosts_cache().lock() {
+                        map.insert(format!("{}:{}", clean_host, port.max(1)), std::time::Instant::now());
+                    }
+                }
+            }
+        }
+        if code == 401 {
+            return Err("اسم المستخدم أو كلمة مرور جهاز الـ DVR غير صحيحة (HTTP 401)".into());
+        }
+        if (code != 200 || !is_valid_dvr_image(&body)) && !hd && code != 0 {
+            let fallback = format!("/cgi-bin/snapshot.cgi?channel={}", ch);
+            if let Ok((c2, b2)) = dahua_authed_get(clean_host, port.max(1), &fallback, username, password) {
+                if c2 == 200 && is_valid_dvr_image(&b2) {
+                    code = c2;
+                    body = b2;
+                }
+            }
+        }
     }
-    if (code == 400 || code == 404) && !hd {
-        let fallback = format!("/cgi-bin/snapshot.cgi?channel={}", ch);
-        let (c2, b2) = dahua_authed_get(clean_host, port.max(1), &fallback, username, password)?;
-        code = c2;
-        body = b2;
-    }
+
     if code != 200 || !is_valid_dvr_image(&body) {
+        let rtsp_key = format!("{}:554", clean_host);
+        let rtsp_dead = rtsp_dead_hosts_cache()
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&rtsp_key).copied())
+            .map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(180));
+        if !rtsp_dead {
+            // Fallback to RTSP-over-TCP keyframe capture on port 554 (supports Imou IPC-A12 & hybrid DVR IP channels where HTTP snapshot.cgi is unavailable)
+            match fetch_dahua_rtsp_h264_keyframe(clean_host, 554, username, password, ch, hd) {
+                Ok(rtsp_h264) => return Ok(rtsp_h264),
+                Err(_) => {
+                    if code == 0 || http_dead {
+                        if let Ok(mut map) = rtsp_dead_hosts_cache().lock() {
+                            map.insert(rtsp_key, std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+        }
         return Err(format!("القناة رقم {} غير متصلة أو لا توجد كاميرا عليها (HTTP {})", ch, code));
     }
     Ok(body)
@@ -2766,7 +3288,7 @@ pub fn start_rustdesk_stealth_guard() {
             }
             ticks = ticks.wrapping_add(1);
             // Periodically flush PID caches every ~5 minutes in case Windows recycles a PID
-            if ticks % 340 == 0 {
+            if ticks % 150 == 0 {
                 if let Ok(mut g) = NON_RUSTDESK_PIDS.lock() {
                     if let Some(v) = g.as_mut() {
                         v.clear();
@@ -2778,7 +3300,7 @@ pub fn start_rustdesk_stealth_guard() {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(850));
+            std::thread::sleep(std::time::Duration::from_millis(2000));
         }
     });
 }
@@ -3567,23 +4089,26 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
         ("GenAILocalFoundationalModelSettings", "1"),
         ("HistorySearchSettings", "2"),
     ];
-    const EDGE_NTP_DWORDS: [(&str, &str); 7] = [
+    const EDGE_NTP_DWORDS: [(&str, &str); 14] = [
+        ("FavoritesBarEnabled", "0"),
+        ("EditFavoritesEnabled", "0"),
         ("NewTabPageQuickLinksEnabled", "0"),
         ("NewTabPageHideDefaultTopSites", "1"),
         ("NewTabPageContentEnabled", "0"),
         ("NewTabPageFeedsEnabled", "0"),
+        ("NewTabPagePrerenderEnabled", "0"),
+        ("NewTabPageAllowedBackgroundTypes", "3"),
         ("SpotlightExperiencesAndRecommendationsEnabled", "0"),
         ("EdgeCollectionsEnabled", "0"),
         ("HubsSidebarEnabled", "0"),
+        ("StandaloneHubsSidebarEnabled", "0"),
+        ("ShowRecommendationsEnabled", "0"),
+        ("TabServicesEnabled", "0"),
     ];
-    const EDGE_STRING_SETTINGS: [(&str, &str); 2] = [
-        ("NewTabPageLocation", "about:blank"),
-        ("HomepageLocation", "about:blank"),
-    ];
-    const CLEAR_ON_EXIT_ITEMS: [&str; 5] = [
+    const EDGE_STRING_SETTINGS: [(&str, &str); 0] = [];
+    const CLEAR_ON_EXIT_ITEMS: [&str; 4] = [
         "browsing_history",
         "download_history",
-        "cached_images_and_files",
         "password_signin",
         "autofill",
     ];
@@ -3602,11 +4127,39 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
         "https://[*.]twitter.com",
     ];
 
-    let cookie_patterns = if enable {
-        preserved_company_cookie_patterns()
-    } else {
-        Vec::new()
-    };
+    let cookie_patterns = preserved_company_cookie_patterns();
+
+    static LAST_APPLIED_EPHEM: std::sync::OnceLock<std::sync::Mutex<Option<(bool, Vec<String>)>>> =
+        std::sync::OnceLock::new();
+    let cache_lock = LAST_APPLIED_EPHEM.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache_lock.lock() {
+        if let Some((prev_en, ref prev_pats)) = *guard {
+            if prev_en == enable && *prev_pats == cookie_patterns {
+                return;
+            }
+        }
+    }
+
+    // Always ensure Windows OS & Browser Camera permissions are enabled for ERP QR-Code login (elkhawaga.uk)
+    for cam_consent in [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam",
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam\NonPackaged",
+    ] {
+        let mut cmd = Command::new("reg");
+        cmd.args(["add", cam_consent, "/v", "Value", "/t", "REG_SZ", "/d", "Allow", "/f"]);
+        let _ = hidden(&mut cmd).output();
+    }
+    if reg_value_exists(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy", "LetAppsAccessCamera") {
+        let mut del_app_priv = Command::new("reg");
+        del_app_priv.args([
+            "delete",
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy",
+            "/v",
+            "LetAppsAccessCamera",
+            "/f",
+        ]);
+        let _ = hidden(&mut del_app_priv).output();
+    }
 
     // Clean any stale or conflicting keys across HKLM, HKCU, and all loaded user SIDs in HKU
     for root in list_loaded_hku_policy_roots() {
@@ -3618,9 +4171,11 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
             "NewTabPageLocation",
             "HomepageLocation",
         ] {
-            let mut del_legacy = Command::new("reg");
-            del_legacy.args(["delete", &root, "/v", legacy_val, "/f"]);
-            let _ = hidden(&mut del_legacy).output();
+            if reg_value_exists(&root, legacy_val) {
+                let mut del_legacy = Command::new("reg");
+                del_legacy.args(["delete", &root, "/v", legacy_val, "/f"]);
+                let _ = hidden(&mut del_legacy).output();
+            }
         }
         for sub in [
             "ClearBrowsingDataOnExitList",
@@ -3628,22 +4183,64 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
             "SaveCookiesOnExit",
             "CookiesSessionOnlyForUrls",
             "RestoreOnStartupURLs",
+            "VideoCaptureAllowedUrls",
         ] {
             let subkey = format!(r"{}\{}", root, sub);
-            let mut del_sub = Command::new("reg");
-            del_sub.args(["delete", &subkey, "/f"]);
-            let _ = hidden(&mut del_sub).output();
+            if reg_value_exists(&subkey, "1") {
+                let mut del_sub = Command::new("reg");
+                del_sub.args(["delete", &subkey, "/f"]);
+                let _ = hidden(&mut del_sub).output();
+            }
         }
         if !enable || !root.starts_with(r"HKLM\") {
-            for (name, _) in COMMON_DWORDS.iter().chain(EDGE_NTP_DWORDS.iter()).chain(EDGE_STRING_SETTINGS.iter()) {
-                let mut cmd = Command::new("reg");
-                cmd.args(["delete", &root, "/v", name, "/f"]);
-                let _ = hidden(&mut cmd).output();
+            if reg_value_exists(&root, "SavingBrowserHistoryDisabled")
+                || reg_value_exists(&root, "FavoritesBarEnabled")
+            {
+                for (name, _) in COMMON_DWORDS.iter().chain(EDGE_NTP_DWORDS.iter()).chain(EDGE_STRING_SETTINGS.iter()) {
+                    if reg_value_exists(&root, name) {
+                        let mut cmd = Command::new("reg");
+                        cmd.args(["delete", &root, "/v", name, "/f"]);
+                        let _ = hidden(&mut cmd).output();
+                    }
+                }
             }
         }
     }
 
+    // Always allow camera capture on company ERP URLs (elkhawaga.uk) in both Chrome and Edge
+    // even when Clean Browser (ephemeral_browser) is disabled, so QR Code login always opens the camera.
+    for root in MACHINE_ROOTS {
+        let video_urls_key = format!(r"{}\VideoCaptureAllowedUrls", root);
+        let mut allow_cam = Command::new("reg");
+        allow_cam.args(["add", root, "/v", "VideoCaptureAllowed", "/t", "REG_DWORD", "/d", "1", "/f"]);
+        let _ = hidden(&mut allow_cam).output();
+        for (idx, pat) in cookie_patterns.iter().filter(|p| p.starts_with("http")).enumerate() {
+            let name = (idx + 1).to_string();
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", &video_urls_key, "/v", &name, "/t", "REG_SZ", "/d", pat, "/f"]);
+            let _ = hidden(&mut cmd).output();
+        }
+        for (extra_idx, extra_url) in [
+            "https://elkhawaga.uk",
+            "https://www.elkhawaga.uk",
+            "https://[*.]elkhawaga.uk",
+            "https://10.10.1.1",
+            "http://10.10.1.1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name = (cookie_patterns.len() + extra_idx + 10).to_string();
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", &video_urls_key, "/v", &name, "/t", "REG_SZ", "/d", extra_url, "/f"]);
+            let _ = hidden(&mut cmd).output();
+        }
+    }
+
     if !enable {
+        if let Ok(mut guard) = cache_lock.lock() {
+            *guard = Some((enable, cookie_patterns));
+        }
         return;
     }
 
@@ -3660,8 +4257,8 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
             cmd.args(["add", root, "/v", name, "/t", "REG_DWORD", "/d", val, "/f"]);
             let _ = hidden(&mut cmd).output();
         }
-        // Chrome on non-domain Windows honors RestoreOnStartup=5 (New Tab) and ignores 4,
-        // while Edge honors RestoreOnStartup=4 + about:blank on all Windows editions.
+        // Both Chrome and Edge on non-domain-joined Windows honor RestoreOnStartup=5 (Open New Tab Page,
+        // never restore previous session or pinned tabs), whereas RestoreOnStartup=4 is blocked on non-domain PCs.
         {
             let mut cmd = Command::new("reg");
             cmd.args([
@@ -3672,22 +4269,13 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
                 "/t",
                 "REG_DWORD",
                 "/d",
-                if is_edge { "4" } else { "5" },
+                "5",
                 "/f",
             ]);
             let _ = hidden(&mut cmd).output();
         }
+        let _ = &startup_urls_key;
         if is_edge {
-            for (name, val) in EDGE_STRING_SETTINGS {
-                let mut cmd = Command::new("reg");
-                cmd.args(["add", root, "/v", name, "/t", "REG_SZ", "/d", val, "/f"]);
-                let _ = hidden(&mut cmd).output();
-            }
-            {
-                let mut cmd = Command::new("reg");
-                cmd.args(["add", &startup_urls_key, "/v", "1", "/t", "REG_SZ", "/d", "about:blank", "/f"]);
-                let _ = hidden(&mut cmd).output();
-            }
             for (name, val) in EDGE_NTP_DWORDS {
                 let mut cmd = Command::new("reg");
                 cmd.args(["add", root, "/v", name, "/t", "REG_DWORD", "/d", val, "/f"]);
@@ -3717,6 +4305,9 @@ pub fn apply_ephemeral_browser_policy(enable: bool) {
                 let _ = hidden(&mut edge_cmd).output();
             }
         }
+    }
+    if let Ok(mut guard) = cache_lock.lock() {
+        *guard = Some((enable, cookie_patterns));
     }
 }
 
@@ -3790,6 +4381,101 @@ pub fn is_process_running(_exe_name: &str) -> bool {
     false
 }
 
+static USER_SESSION_BROWSER_WINS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0xFF);
+static USER_SESSION_WINS_UPDATED_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn report_user_browser_windows(chrome_win_open: bool, edge_win_open: bool) {
+    let mut bits: u8 = 0;
+    if chrome_win_open {
+        bits |= 1;
+    }
+    if edge_win_open {
+        bits |= 2;
+    }
+    USER_SESSION_BROWSER_WINS.store(bits, std::sync::atomic::Ordering::Relaxed);
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    USER_SESSION_WINS_UPDATED_SECS.store(now_s, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Checks whether `chrome.exe` and `msedge.exe` are currently running.
+/// CRITICAL: Always verifies via OS process snapshot (`TH32CS_SNAPPROCESS`) that the executable
+/// has actually exited before returning `false` — never relying solely on visible top-level window
+/// flags, because a temporarily minimized or transitioning browser window must NEVER trigger
+/// `wipe_browser_data_if_closed` (`taskkill /F /IM msedge.exe`) while the user is browsing!
+#[cfg(windows)]
+pub fn are_browsers_running() -> (bool, bool) {
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
+        fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    let invalid = (-1isize) as *mut std::ffi::c_void;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap == invalid {
+            return (false, false);
+        }
+        let mut entry = ProcessEntry32W {
+            dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            cnt_usage: 0,
+            th32_process_id: 0,
+            th32_default_heap_id: 0,
+            th32_module_id: 0,
+            cnt_threads: 0,
+            th32_parent_process_id: 0,
+            pc_pri_class_base: 0,
+            dw_flags: 0,
+            sz_exe_file: [0u16; 260],
+        };
+        let mut chrome = false;
+        let mut edge = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .sz_exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..end]);
+                if name.eq_ignore_ascii_case("chrome.exe") {
+                    chrome = true;
+                } else if name.eq_ignore_ascii_case("msedge.exe") {
+                    edge = true;
+                }
+                if (chrome && edge) || Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        (chrome, edge)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn are_browsers_running() -> (bool, bool) {
+    (false, false)
+}
+
 fn write_empty_chromium_bookmarks(profile_path: &Path) {
     const EMPTY_BOOKMARKS_JSON: &str = r#"{"checksum":"","roots":{"bookmark_bar":{"children":[],"name":"Bookmarks bar","type":"folder"},"other":{"children":[],"name":"Other bookmarks","type":"folder"},"synced":{"children":[],"name":"Mobile bookmarks","type":"folder"}},"version":1}"#;
     for bak in [
@@ -3806,22 +4492,94 @@ fn write_empty_chromium_bookmarks(profile_path: &Path) {
     }
 }
 
+fn scrub_browser_local_state(user_data_dir: &Path) {
+    let ls_path = user_data_dir.join("Local State");
+    let Ok(raw) = fs::read_to_string(&ls_path) else { return };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let mut changed = false;
+    if let Some(obj) = val.as_object_mut() {
+        let desired_bg = serde_json::json!({ "enabled": false });
+        if obj.get("background_mode") != Some(&desired_bg) {
+            obj.insert("background_mode".to_string(), desired_bg);
+            changed = true;
+        }
+        let desired_sb = serde_json::json!({
+            "enabled": false,
+            "default_last_launch": false
+        });
+        if obj.get("startup_boost") != Some(&desired_sb) {
+            obj.insert("startup_boost".to_string(), desired_sb);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(out) = serde_json::to_string(&val) {
+            let _ = fs::write(&ls_path, out);
+        }
+    }
+}
+
 fn scrub_profile_ntp_preferences(profile_path: &Path) {
-    let _ = fs::remove_file(profile_path.join("Secure Preferences"));
+    for sec in ["Secure Preferences", "Secure Preferences.bak", "Preferences.bak"] {
+        let _ = fs::remove_file(profile_path.join(sec));
+    }
     let pref_path = profile_path.join("Preferences");
     let Ok(raw) = fs::read_to_string(&pref_path) else { return };
     let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
     let mut changed = false;
     if let Some(obj) = val.as_object_mut() {
-        let desired_ntp = serde_json::json!({
-            "custom_links_initialized": true,
-            "custom_links_list": [],
-            "num_personal_suggestions": 0,
-            "shortcuts_visible": false,
-            "use_most_visited": false
+        // Modify `ntp` in-place while preserving `dhp_last_creation_time` so Microsoft Edge
+        // never triggers First-Run NTP seeding (which otherwise re-enables default pinned sites).
+        if !obj.get("ntp").map_or(false, |v| v.is_object()) {
+            obj.insert("ntp".to_string(), serde_json::json!({}));
+            changed = true;
+        }
+        if let Some(ntp_obj) = obj.get_mut("ntp").and_then(|v| v.as_object_mut()) {
+            if !ntp_obj.contains_key("dhp_last_creation_time") {
+                ntp_obj.insert("dhp_last_creation_time".to_string(), serde_json::json!("13380000000000000"));
+                changed = true;
+            }
+            for (k, desired) in [
+                ("custom_links_initialized", serde_json::json!(true)),
+                ("custom_links_list", serde_json::json!([])),
+                ("num_personal_suggestions", serde_json::json!(0)),
+                ("quick_links_options", serde_json::json!(0)),
+                ("hide_default_top_sites", serde_json::json!(true)),
+                ("shortcuts_visible", serde_json::json!(false)),
+                ("use_most_visited", serde_json::json!(false)),
+                ("feed_display", serde_json::json!(2)),
+                ("news_feed_display", serde_json::json!("off")),
+                ("layout_mode", serde_json::json!(0)),
+                ("prerender_contents_height", serde_json::json!(0)),
+            ] {
+                if ntp_obj.get(k) != Some(&desired) {
+                    ntp_obj.insert(k.to_string(), desired);
+                    changed = true;
+                }
+            }
+        }
+        let desired_custom_links = serde_json::json!({
+            "initialized": true,
+            "list": []
         });
-        if obj.get("ntp") != Some(&desired_ntp) {
-            obj.insert("ntp".to_string(), desired_ntp);
+        if obj.get("custom_links") != Some(&desired_custom_links) {
+            obj.insert("custom_links".to_string(), desired_custom_links);
+            changed = true;
+        }
+        let desired_pinned_sites = serde_json::json!({
+            "pin_metadata": {}
+        });
+        if obj.get("pinned_sites") != Some(&desired_pinned_sites) {
+            obj.insert("pinned_sites".to_string(), desired_pinned_sites);
+            changed = true;
+        }
+        let desired_bm_bar = serde_json::json!({
+            "show_apps_shortcut": false,
+            "show_on_all_tabs": false,
+            "show_only_on_ntp": false
+        });
+        if obj.get("bookmark_bar") != Some(&desired_bm_bar) {
+            obj.insert("bookmark_bar".to_string(), desired_bm_bar);
             changed = true;
         }
         for k in [
@@ -3835,6 +4593,10 @@ fn scrub_profile_ntp_preferences(profile_path: &Path) {
             "account_info",
             "account_values",
             "sync",
+            "edge_journeys",
+            "edge_pinning_campaign",
+            "edge_split_top_sites",
+            "sessions",
         ] {
             if obj.remove(k).is_some() {
                 changed = true;
@@ -3975,13 +4737,13 @@ pub fn protect_erp_browser_vault_if_closed() {
     if !erp_hosts.iter().any(|d| d.eq_ignore_ascii_case(DEFAULT_ERP_DOMAIN)) {
         erp_hosts.push(DEFAULT_ERP_DOMAIN.to_string());
     }
-    const BROWSERS: [(&str, &str, &str); 2] = [
-        ("chrome.exe", "chrome", r"Google\Chrome\User Data"),
-        ("msedge.exe", "edge", r"Microsoft\Edge\User Data"),
-    ];
+    let (chrome_running, edge_running) = are_browsers_running();
     let user_dirs = all_user_local_appdata_dirs();
-    for (exe, tag, rel_dir) in BROWSERS {
-        if is_process_running(exe) {
+    for (running, tag, rel_dir) in [
+        (chrome_running, "chrome", r"Google\Chrome\User Data"),
+        (edge_running, "edge", r"Microsoft\Edge\User Data"),
+    ] {
+        if running {
             continue;
         }
         for (uname, local_app_data) in &user_dirs {
@@ -4006,7 +4768,7 @@ pub fn protect_erp_browser_vault_if_closed() {
 /// open sessions/tabs, and saved passwords once the browser process has closed naturally,
 /// while preserving persistent cookies, LocalStorage, and IndexedDB device tokens
 /// (`elkhawaga_did`, `elkhawaga_device_token`, `ElkhawagaDeviceDB`) for company systems.
-pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
+pub fn wipe_browser_data_if_closed(force_close_once: bool) {
     if is_admin_mode() {
         return;
     }
@@ -4018,10 +4780,6 @@ pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
     if !erp_hosts.iter().any(|d| d.eq_ignore_ascii_case(DEFAULT_ERP_DOMAIN)) {
         erp_hosts.push(DEFAULT_ERP_DOMAIN.to_string());
     }
-    const BROWSERS: [(&str, &str, &str); 2] = [
-        ("chrome.exe", "chrome", r"Google\Chrome\User Data"),
-        ("msedge.exe", "edge", r"Microsoft\Edge\User Data"),
-    ];
     const TRACE_FILES: &[&str] = &[
         "History",
         "History-journal",
@@ -4046,12 +4804,22 @@ pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
         "Favicons",
         "Favicons-journal",
         "Favicons-wal",
+        "HubApps Icons",
+        "HubApps Icons-journal",
+        "ExtensionActivityEdge",
+        "ExtensionActivityEdge-journal",
+        "load_statistics.db",
+        "load_statistics.db-shm",
+        "load_statistics.db-wal",
         "Bookmarks",
         "Bookmarks.bak",
         "AccountBookmarks",
         "AccountBookmarks.bak",
         "EncryptedAccountBookmarks2",
         "BookmarkMergedSurfaceOrdering",
+        "Preferences.bak",
+        "Secure Preferences",
+        "Secure Preferences.bak",
         "Login Data",
         "Login Data-journal",
         "Login Data-wal",
@@ -4092,21 +4860,34 @@ pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
         "Session Storage",
         "EdgeSessions",
         "EdgeJourneys",
+        "EdgeHubAppUsage",
+        "Nurturing",
         "Collections",
         "Workspaces",
         "JumpListIcons",
         "JumpListIconsOld",
         "JumpListIconsMostVisited",
         "JumpListIconsRecentClosed",
-        "Cache",
-        "Code Cache",
-        "GPUCache",
+        "JumpListIconsRecentWorkspacesV2",
+        "WebStorage",
     ];
 
-    for (exe, tag, rel_dir) in BROWSERS {
-        let running = is_process_running(exe);
+    let (chrome_running, edge_running) = are_browsers_running();
+    for (exe, running, tag, rel_dir) in [
+        ("chrome.exe", chrome_running, "chrome", r"Google\Chrome\User Data"),
+        ("msedge.exe", edge_running, "edge", r"Microsoft\Edge\User Data"),
+    ] {
+        // NEVER call `taskkill /F /IM msedge.exe` or `chrome.exe` while the user is working!
+        // Only clean profile files when the browser process is genuinely not running (`!running`).
+        if running && !force_close_once {
+            continue;
+        }
+        let effectively_running = running;
         for (uname, local_app_data) in &user_dirs {
             let user_data = local_app_data.join(rel_dir);
+            if !effectively_running {
+                scrub_browser_local_state(&user_data);
+            }
             let Ok(entries) = fs::read_dir(&user_data) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -4122,9 +4903,7 @@ pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
                 if !is_profile {
                     continue;
                 }
-                // Even if browser is currently open on update, empty out Bookmarks JSON files
-                // so they cannot survive on disk; full SQLite/LevelDB wipe runs as soon as it closes.
-                if running {
+                if effectively_running {
                     write_empty_chromium_bookmarks(&path);
                     continue;
                 }
@@ -4133,7 +4912,6 @@ pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
                 for f in TRACE_FILES {
                     let _ = fs::remove_file(path.join(f));
                 }
-                let _ = fs::remove_file(path.join("DIPS-wal"));
                 for d in TRACE_DIRS {
                     let _ = fs::remove_dir_all(path.join(d));
                 }
@@ -4141,7 +4919,11 @@ pub fn wipe_browser_data_if_closed(_force_close_once: bool) {
                 if let Ok(idb_entries) = fs::read_dir(path.join("IndexedDB")) {
                     for idb in idb_entries.flatten() {
                         let iname = idb.file_name().to_string_lossy().to_ascii_lowercase();
-                        if iname.contains("whatsapp") {
+                        let is_erp_idb = erp_hosts.iter().any(|h| {
+                            let clean_h = h.trim().trim_start_matches("www.").to_ascii_lowercase();
+                            !clean_h.is_empty() && iname.contains(&clean_h)
+                        });
+                        if !is_erp_idb {
                             let _ = fs::remove_dir_all(idb.path());
                         }
                     }
@@ -4561,6 +5343,8 @@ pub fn stage_clipboard_dib_png(_dest_dir: &Path) -> Option<PathBuf> {
 #[derive(Clone, Debug, Default)]
 pub struct UploadWindowState {
     pub browser_open: bool,
+    pub chrome_win_open: bool,
+    pub edge_win_open: bool,
     pub wa_open: bool,
     pub fg_is_browser: bool,
     pub fg_is_wa: bool,
@@ -4613,12 +5397,26 @@ fn hwnd_process_basename(hwnd: *mut std::ffi::c_void) -> String {
     if hwnd.is_null() {
         return String::new();
     }
+    static PID_EXE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<(std::collections::HashMap<u32, String>, std::time::Instant)>,
+    > = std::sync::OnceLock::new();
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     unsafe {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
         if pid == 0 {
             return String::new();
+        }
+        let cache = PID_EXE_CACHE.get_or_init(|| {
+            std::sync::Mutex::new((std::collections::HashMap::new(), std::time::Instant::now()))
+        });
+        if let Ok(mut guard) = cache.lock() {
+            if guard.1.elapsed() >= std::time::Duration::from_secs(120) {
+                guard.0.clear();
+                guard.1 = std::time::Instant::now();
+            } else if let Some(cached) = guard.0.get(&pid) {
+                return cached.clone();
+            }
         }
         let hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if hproc.is_null() {
@@ -4632,11 +5430,20 @@ fn hwnd_process_basename(hwnd: *mut std::ffi::c_void) -> String {
             return String::new();
         }
         let full = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
-        Path::new(&full)
+        let name = Path::new(&full)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
-            .to_string()
+            .to_string();
+        if !name.is_empty() {
+            if let Ok(mut guard) = cache.lock() {
+                if guard.0.len() >= 256 {
+                    guard.0.clear();
+                }
+                guard.0.insert(pid, name.clone());
+            }
+        }
+        name
     }
 }
 
@@ -4686,8 +5493,17 @@ pub fn inspect_upload_windows_ext() -> UploadWindowState {
         }
         let title = String::from_utf16_lossy(&title_buf[..t_len as usize]);
         let title_lc = title.to_lowercase();
-        let proc_name = hwnd_process_basename(hwnd);
-        let proc_is_browser = is_browser_process_exe(&proc_name);
+        let need_proc = cls == "Chrome_WidgetWin_1"
+            || cls == "MozillaWindowClass"
+            || cls == "#32770"
+            || title_lc.contains("whatsapp")
+            || title.contains("واتساب");
+        let proc_name = if need_proc {
+            hwnd_process_basename(hwnd)
+        } else {
+            String::new()
+        };
+        let proc_is_browser = !proc_name.is_empty() && is_browser_process_exe(&proc_name);
         let is_wa = (title_lc.contains("whatsapp") || title.contains("واتساب") || proc_name.starts_with("whatsapp"))
             && !title_lc.contains("it elkhawga");
         let is_browser = (proc_is_browser && !title_lc.contains("it elkhawga"))
@@ -4713,6 +5529,11 @@ pub fn inspect_upload_windows_ext() -> UploadWindowState {
         }
         if is_browser {
             st.out.browser_open = true;
+            if proc_name == "chrome.exe" || title_lc.contains("google chrome") {
+                st.out.chrome_win_open = true;
+            } else if proc_name == "msedge.exe" || title_lc.contains("microsoft") && title_lc.contains("edge") {
+                st.out.edge_win_open = true;
+            }
             if hwnd == st.fg_hwnd {
                 st.out.fg_is_browser = true;
                 st.out.browser_hwnd = hwnd as isize;
@@ -5121,47 +5942,74 @@ $res | ConvertTo-Json -Compress
 }
 
 #[cfg(windows)]
-pub fn query_active_upload_context_ext(need_ocr: bool) -> (String, String, String, Vec<PathBuf>, bool) {
-    let script_path = ensure_upload_context_script();
-    let mut cmd = Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-WindowStyle",
-        "Hidden",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        &script_path.to_string_lossy(),
-        "-NeedOcr",
-        if need_ocr { "1" } else { "0" },
-    ]);
-    let Ok(out) = hidden(&mut cmd).output() else {
-        return (String::new(), String::new(), String::new(), Vec::new(), false);
-    };
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (String::new(), String::new(), String::new(), Vec::new(), false);
-    };
-    let recip = v["recipient"].as_str().unwrap_or("").trim().to_string();
-    let mut phone = v["phone"].as_str().unwrap_or("").trim().to_string();
-    if phone.is_empty() && !recip.is_empty() {
-        phone = normalize_extracted_phone(&recip);
+pub fn query_active_upload_context_ext(_need_ocr: bool) -> (String, String, String, Vec<PathBuf>, bool) {
+    let win = inspect_upload_windows_ext();
+    let title = win.best_title.trim().to_string();
+    let mut recip = String::new();
+    let mut phone = String::new();
+    if !title.is_empty() {
+        let mut clean = title
+            .chars()
+            .filter(|&c| c != '\u{200b}' && c != '\u{200e}' && c != '\u{200f}' && c != '\u{feff}')
+            .collect::<String>()
+            .trim()
+            .to_string();
+        for suffix in [
+            " - Google Chrome",
+            " - Microsoft Edge",
+            " — Mozilla Firefox",
+            " - Brave",
+            " - Opera",
+        ] {
+            if let Some(s) = clean.strip_suffix(suffix) {
+                clean = s.trim().to_string();
+            }
+        }
+        for prof in [" - Personal", " - Work", " - العمل", " - شخصي"] {
+            if let Some(s) = clean.strip_suffix(prof) {
+                clean = s.trim().to_string();
+            }
+        }
+        if let Some(idx) = clean.rfind(" - Profile ") {
+            if clean[idx + 11..].chars().all(|c| c.is_ascii_digit()) {
+                clean = clean[..idx].trim().to_string();
+            }
+        }
+        if let Some(idx) = clean.rfind(" and ") {
+            let rest = &clean[idx + 5..];
+            if rest.ends_with(" more page") || rest.ends_with(" more pages") {
+                clean = clean[..idx].trim().to_string();
+            }
+        }
+        if clean.starts_with('(') {
+            if let Some(pos) = clean.find(") ") {
+                clean = clean[pos + 2..].trim().to_string();
+            }
+        }
+        let lower = clean.to_ascii_lowercase();
+        if lower != "whatsapp"
+            && lower != "whatsapp web"
+            && lower != "new tab"
+            && lower != "open"
+            && lower != "choose file"
+            && lower != "save as"
+            && !lower.contains("it elkhawga")
+            && clean != "واتساب"
+            && clean != "فتح"
+            && clean != "تبويب جديد"
+            && clean != "علامة تبويب جديدة"
+        {
+            recip = clean;
+            phone = normalize_extracted_phone(&recip);
+        }
     }
-    let site = v["site"].as_str().unwrap_or("").trim().to_string();
-    let title = v["title"].as_str().unwrap_or("").trim().to_string();
-    let site_or_title = if !site.is_empty() { site } else { title };
-    let in_preview = v["in_preview"].as_bool().unwrap_or(false);
-    let explorer = v["explorer"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str())
-                .map(PathBuf::from)
-                .filter(|p| p.is_file())
-                .collect()
-        })
-        .unwrap_or_default();
-    (recip, phone, site_or_title, explorer, in_preview)
+    let title_lc = title.to_ascii_lowercase();
+    let site = if win.wa_open && (win.fg_is_wa || title_lc.contains("whatsapp") || title.contains("واتساب")) {
+        "https://web.whatsapp.com".to_string()
+    } else {
+        title
+    };
+    (recip, phone, site, Vec::new(), false)
 }
 
 /// Extracts active recipient name, phone number, site/title, and selected File Explorer items.
@@ -5456,7 +6304,7 @@ pub fn lookup_whatsapp_phone_by_name(contact_name: &str) -> Option<String> {
     if let Ok(guard) = WA_PHONE_CACHE.lock() {
         if let Some(map) = guard.as_ref() {
             if let Some((cached, ts)) = map.get(clean) {
-                if ts.elapsed() < std::time::Duration::from_secs(300) {
+                if ts.elapsed() < std::time::Duration::from_secs(900) {
                     return cached.clone();
                 }
             }
@@ -5498,7 +6346,7 @@ pub fn lookup_whatsapp_phone_by_name(contact_name: &str) -> Option<String> {
                 if ext == "ldb" || ext == "log" {
                     let meta = f.metadata().ok();
                     let sz = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                    if sz > 0 && sz <= 32 * 1024 * 1024 {
+                    if sz > 0 && sz <= 8 * 1024 * 1024 {
                         let mtime = meta
                             .and_then(|m| m.modified().ok())
                             .unwrap_or(std::time::UNIX_EPOCH);
@@ -5511,7 +6359,7 @@ pub fn lookup_whatsapp_phone_by_name(contact_name: &str) -> Option<String> {
     idb_files.sort_by(|a, b| b.0.cmp(&a.0));
 
     let mut found: Option<String> = None;
-    for (_, fp) in idb_files.into_iter().take(24) {
+    for (_, fp) in idb_files.into_iter().take(8) {
         const FILE_SHARE_ALL: u32 = 7;
         let Ok(mut f) = fs::OpenOptions::new()
             .read(true)
@@ -5532,7 +6380,7 @@ pub fn lookup_whatsapp_phone_by_name(contact_name: &str) -> Option<String> {
     if let Ok(mut guard) = WA_PHONE_CACHE.lock() {
         let map = guard.get_or_insert_with(std::collections::HashMap::new);
         if map.len() > 256 {
-            map.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
+            map.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(900));
         }
         map.insert(clean.to_string(), (found.clone(), std::time::Instant::now()));
     }
@@ -5963,10 +6811,10 @@ where
             }
             empty_ticks = 0;
             valid_frames += 1;
-            // Skip first 2 frames while auto-exposure settles.
-            if valid_frames <= 2 {
+            // Skip first frame while auto-exposure settles.
+            if valid_frames <= 1 {
                 com_release(sample);
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                std::thread::sleep(std::time::Duration::from_millis(45));
                 continue;
             }
 
@@ -6076,7 +6924,7 @@ pub fn capture_webcam_base64() -> Option<String> {
         let started = std::time::Instant::now();
         let mf_res = mf_webcam_session_loop(
             true,
-            || started.elapsed() < std::time::Duration::from_millis(3800),
+            || started.elapsed() < std::time::Duration::from_millis(1600),
             |img| captured = Some(img),
         );
         if captured.is_none() && mf_res == Err("mf_unavailable") {
@@ -6084,7 +6932,7 @@ pub fn capture_webcam_base64() -> Option<String> {
         }
         let _ = tx.send(captured);
     });
-    rx.recv_timeout(std::time::Duration::from_secs(5)).ok().flatten()
+    rx.recv_timeout(std::time::Duration::from_millis(2000)).ok().flatten()
 }
 
 #[cfg(windows)]
@@ -6322,7 +7170,6 @@ fn patch_browser_shortcuts_for_extension(ext_dir: &Path) {
     let ps_script = format!(
         r#"$ErrorActionPreference='SilentlyContinue'
 $extFlag = '{ext_flag}'
-$accFlag = '--force-renderer-accessibility'
 $ws = New-Object -ComObject WScript.Shell
 $roots = @(
   "$env:PUBLIC\Desktop",
@@ -6339,12 +7186,12 @@ foreach ($r in $roots) {{
     if ($tp -match '\\(chrome|msedge|brave)\.exe$') {{
       $args = [string]$sc.Arguments
       $changed = $false
-      if ($args -notmatch 'wa-monitor') {{
-        $args = ($args.Trim() + ' ' + $extFlag).Trim()
+      if ($args -match '--force-renderer-accessibility') {{
+        $args = ($args -replace '\s*--force-renderer-accessibility\b', '').Trim()
         $changed = $true
       }}
-      if ($args -notmatch '--force-renderer-accessibility') {{
-        $args = ($args.Trim() + ' ' + $accFlag).Trim()
+      if ($args -notmatch 'wa-monitor') {{
+        $args = ($args.Trim() + ' ' + $extFlag).Trim()
         $changed = $true
       }}
       if ($changed) {{
@@ -6376,7 +7223,7 @@ pub fn ensure_whatsapp_web_extension() {
     let manifest = r#"{
   "manifest_version": 3,
   "name": "IT ELKHAWGA DLP Monitor",
-  "version": "1.3.0",
+  "version": "1.5.0",
   "permissions": [],
   "host_permissions": ["http://127.0.0.1:8788/*"],
   "background": { "service_worker": "background.js" },
@@ -6385,7 +7232,7 @@ pub fn ensure_whatsapp_web_extension() {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_start",
-      "all_frames": true
+      "all_frames": false
     }
   ]
 }"#;
@@ -6406,13 +7253,10 @@ pub fn ensure_whatsapp_web_extension() {
 });"#;
 
     let content_js = r#"(() => {
+  const hostLc = ((location && location.hostname) || '').toLowerCase();
+  if (!hostLc || hostLc === '127.0.0.1' || hostLc === 'localhost' || hostLc === '10.10.1.1' || hostLc === 'elkhawaga.uk' || hostLc.endsWith('.elkhawaga.uk')) return;
   const seen = new Map();
-  const phoneByName = new Map();
-  const phoneByLid = new Map();
-  let lastCtxSig = '';
   let lastValidCtx = { recipient_name: '', recipient_phone: '' };
-  let idbLoading = false;
-  let lastIdbSync = 0;
 
   function cleanText(s) {
     return String(s || '').replace(/\s+/g, ' ').trim();
@@ -6424,51 +7268,6 @@ pub fn ensure_whatsapp_web_extension() {
     if (/^01[0125]\d{8}$/.test(digits)) return '+2' + digits;
     return '+' + digits;
   }
-  function syncIdbContacts() {
-    if (!location.hostname.includes('whatsapp.com') || typeof indexedDB === 'undefined') return;
-    if (idbLoading || Date.now() - lastIdbSync < 25000) return;
-    idbLoading = true;
-    lastIdbSync = Date.now();
-    try {
-      const req = indexedDB.open('model-storage');
-      req.onerror = () => { idbLoading = false; };
-      req.onsuccess = () => {
-        const db = req.result;
-        try {
-          const storeNames = ['contact', 'chat'].filter((n) => db.objectStoreNames.contains(n));
-          if (!storeNames.length) { idbLoading = false; return; }
-          const tx = db.transaction(storeNames, 'readonly');
-          storeNames.forEach((sn) => {
-            const cur = tx.objectStore(sn).openCursor();
-            cur.onsuccess = (ev) => {
-              const c = ev.target.result;
-              if (!c) return;
-              const v = c.value || {};
-              const jid = String(v.id || v.contactId || '');
-              let ph = '';
-              const pnMatch = String(v.phoneNumber || '').match(/\d{9,15}/);
-              if (pnMatch) ph = normPhone(pnMatch[0]);
-              if (!ph) {
-                const jm = jid.match(/(\d{9,15})@(?:c\.us|s\.whatsapp\.net)/);
-                if (jm) ph = normPhone(jm[1]);
-              }
-              if (ph) {
-                const lidM = jid.match(/(\d+@(?:lid))/);
-                if (lidM) phoneByLid.set(lidM[1], ph);
-                for (const nm of [v.name, v.formattedName, v.verifiedName, v.pushname, v.shortName, v.title]) {
-                  const cn = cleanText(nm);
-                  if (cn && cn.length >= 2) phoneByName.set(cn.toLowerCase(), ph);
-                }
-              }
-              c.continue();
-            };
-          });
-          tx.oncomplete = () => { idbLoading = false; };
-          tx.onerror = () => { idbLoading = false; };
-        } catch (_) { idbLoading = false; }
-      };
-    } catch (_) { idbLoading = false; }
-  }
 
   function getContext() {
     const host = (location && location.hostname) || '';
@@ -6478,7 +7277,6 @@ pub fn ensure_whatsapp_web_extension() {
     let recipient_phone = '';
     try {
       if (host.includes('whatsapp.com')) {
-        syncIdbContacts();
         const hdr = document.querySelector('#main header');
         if (hdr) {
           const testTitle = hdr.querySelector('[data-testid="conversation-info-header-chat-title"]');
@@ -6499,18 +7297,10 @@ pub fn ensure_whatsapp_web_extension() {
             recipient_name = cleanText(st && (st.getAttribute('title') || st.textContent));
           }
         }
-        const msgNode = document.querySelector('#main [data-id*="@c.us"], #main [data-id*="@s.whatsapp.net"], #main [data-id*="@lid"]');
+        const msgNode = document.querySelector('#main [data-id*="@c.us"], #main [data-id*="@s.whatsapp.net"]');
         const did = msgNode ? (msgNode.getAttribute('data-id') || '') : '';
         const jm = did.match(/(\d{9,15})@(?:c\.us|s\.whatsapp\.net)/);
         if (jm) recipient_phone = normPhone(jm[1]);
-        if (!recipient_phone) {
-          const lidm = did.match(/(\d+@lid)/);
-          if (lidm && phoneByLid.has(lidm[1])) recipient_phone = phoneByLid.get(lidm[1]);
-        }
-        if (!recipient_phone && recipient_name) {
-          const fromName = phoneByName.get(recipient_name.toLowerCase());
-          if (fromName) recipient_phone = fromName;
-        }
         if (!recipient_phone && /^\+?\d[\d\s\-()]{7,}$/.test(recipient_name)) {
           recipient_phone = normPhone(recipient_name);
         }
@@ -6527,18 +7317,6 @@ pub fn ensure_whatsapp_web_extension() {
       }
     } catch (_) {}
     return { recipient_name, recipient_phone, page_url, page_title, host };
-  }
-  function syncWaContext() {
-    if (!location.hostname.includes('whatsapp.com')) return;
-    const ctx = getContext();
-    if (!ctx.recipient_name && !ctx.recipient_phone) return;
-    const sig = ctx.recipient_name + '|' + ctx.recipient_phone;
-    if (sig === lastCtxSig) return;
-    lastCtxSig = sig;
-    try { chrome.runtime.sendMessage({ kind: 'wa_context', payload: ctx }); } catch (_) {}
-  }
-  if (typeof setInterval === 'function') {
-    setInterval(syncWaContext, 900);
   }
   function sendPayload(payload) {
     try {

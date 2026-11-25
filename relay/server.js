@@ -188,14 +188,43 @@ function appendArchiveLog(entry) {
   } catch (e) {}
 }
 
+let archiveLogCacheSig = '';
+let archiveLogCacheEntries = [];
+let diskSpaceCache = { root: '', at: 0, free: 0, total: 0 };
+
+function getCachedDiskSpaceBytes(targetPath) {
+  const nowTs = Date.now();
+  if (diskSpaceCache.root === targetPath && nowTs - diskSpaceCache.at < 30000) {
+    return { free: diskSpaceCache.free, total: diskSpaceCache.total };
+  }
+  const res = getDiskSpaceBytes(targetPath);
+  diskSpaceCache = { root: targetPath, at: nowTs, free: res.free, total: res.total };
+  return res;
+}
+
 function readArchiveLogEntries() {
-  const out = [];
-  const seen = new Set();
   const curRoot = getArchiveRoot();
   const roots = [curRoot];
   if (curRoot.toLowerCase() !== DEFAULT_ARCHIVE_ROOT.toLowerCase()) {
     roots.push(DEFAULT_ARCHIVE_ROOT);
   }
+  const sigParts = [];
+  for (const r of roots) {
+    try {
+      const p = path.join(r, 'archive-log.jsonl');
+      const st = fs.statSync(p);
+      sigParts.push(`${p}:${st.size}:${Math.floor(st.mtimeMs)}`);
+    } catch (_) {
+      sigParts.push(`${r}:0:0`);
+    }
+  }
+  const sig = sigParts.join('|');
+  if (sig && sig === archiveLogCacheSig) {
+    return archiveLogCacheEntries;
+  }
+
+  const out = [];
+  const seen = new Set();
   for (const r of roots) {
     try {
       const p = path.join(r, 'archive-log.jsonl');
@@ -215,6 +244,8 @@ function readArchiveLogEntries() {
       }
     } catch (_) {}
   }
+  archiveLogCacheSig = sig;
+  archiveLogCacheEntries = out;
   return out;
 }
 
@@ -530,6 +561,11 @@ function bearer(req) {
   const h = req.headers.authorization || '';
   return h.startsWith('Bearer ') ? h.slice(7).trim() : '';
 }
+function clientIpFromReq(req) {
+  const xff = String(req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || '').split(',')[0].trim();
+  const raw = xff || String((req.socket && req.socket.remoteAddress) || '').trim();
+  return raw.replace(/^::ffff:/i, '');
+}
 function requireAdmin(req, res) {
   if (!ADMIN_KEY || bearer(req) !== ADMIN_KEY) { json(res, 401, {ok:false,error:'unauthorized'}); return false; }
   return true;
@@ -538,6 +574,9 @@ function getDeviceByToken(token) {
   if (!token) return null;
   const h = sha256(token);
   const row = db.prepare('SELECT * FROM devices WHERE device_token_hash=?').get(h);
+  if (row) {
+    try { db.prepare('UPDATE devices SET last_seen=? WHERE device_id=?').run(now(), row.device_id); } catch (_) {}
+  }
   return row || null;
 }
 function pendingCommand(deviceId) {
@@ -585,20 +624,57 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (req.method === 'OPTIONS') return json(res, 204, {});
     // Health
-    if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, {ok:true, version: RELAY_VERSION, ts: now()});
-    if (req.method === 'GET' && url.pathname === '/api/v1/version') return json(res, 200, {ok:true, version: RELAY_VERSION});
-    if (req.method === 'GET' && (url.pathname === '/api/v1/client-setup.exe' || url.pathname === '/api/client-setup.exe')) {
-      const candidates = [
-        path.join(process.cwd(), '..', 'final-release', 'IT ELKHAWGA Client_1.0.0_x64-setup.exe'),
-        path.join(process.cwd(), 'final-release', 'IT ELKHAWGA Client_1.0.0_x64-setup.exe'),
-        'C:/Users/IT APP/Desktop/blockwebsite/final-release/IT ELKHAWGA Client_1.0.0_x64-setup.exe',
-        'C:/Users/IT APP/Desktop/tools/IT ELKHAWGA Client_1.0.0_x64-setup.exe',
+    const findNewestSetupInstaller = (productPrefix) => {
+      const searchDirs = [
+        path.join(process.cwd(), '..', 'final-release'),
+        path.join(process.cwd(), 'final-release'),
+        'C:/Users/IT APP/Desktop/blockwebsite/final-release',
+        'C:/Users/IT APP/Desktop/tools',
       ];
-      const found = candidates.find((p) => {
-        try { return fs.existsSync(p) && fs.statSync(p).size > 500000; } catch (_) { return false; }
-      });
-      if (!found) return json(res, 404, { error: 'client installer not found on relay' });
-      const stat = fs.statSync(found);
+      const parseSemver = (v) => String(v || '0.0.0').split('.').map((n) => parseInt(n, 10) || 0);
+      const cmpSemver = (a, b) => {
+        const pa = parseSemver(a), pb = parseSemver(b);
+        for (let i = 0; i < 3; i++) {
+          if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+        }
+        return 0;
+      };
+      let best = null;
+      const seenPaths = new Set();
+      for (const dir of searchDirs) {
+        try {
+          if (!fs.existsSync(dir)) continue;
+          for (const fname of fs.readdirSync(dir)) {
+            if (!fname.startsWith(productPrefix) || !fname.endsWith('_x64-setup.exe')) continue;
+            const full = path.resolve(dir, fname);
+            if (seenPaths.has(full.toLowerCase())) continue;
+            seenPaths.add(full.toLowerCase());
+            const st = fs.statSync(full);
+            if (!st.isFile() || st.size <= 500000) continue;
+            const verMatch = fname.slice(productPrefix.length).match(/^([0-9]+\.[0-9]+\.[0-9]+)_x64-setup\.exe$/i);
+            const ver = verMatch ? verMatch[1] : '1.0.0';
+            if (
+              !best ||
+              Math.floor(st.mtimeMs) > Math.floor(best.stat.mtimeMs) + 2000 ||
+              (Math.abs(Math.floor(st.mtimeMs) - Math.floor(best.stat.mtimeMs)) <= 2000 && cmpSemver(ver, best.version) > 0)
+            ) {
+              best = { path: full, stat: st, version: ver };
+            }
+          }
+        } catch (_) {}
+      }
+      return best;
+    };
+
+    if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, {ok:true, version: RELAY_VERSION, ts: now()});
+    if (req.method === 'GET' && url.pathname === '/api/v1/version') {
+      const ci = findNewestSetupInstaller('IT ELKHAWGA Client_');
+      return json(res, 200, { ok: true, version: RELAY_VERSION, latest_client_version: (ci && ci.version) || '1.1.2' });
+    }
+    if (req.method === 'GET' && (url.pathname === '/api/v1/client-setup.exe' || url.pathname === '/api/client-setup.exe')) {
+      const foundInfo = findNewestSetupInstaller('IT ELKHAWGA Client_');
+      if (!foundInfo) return json(res, 404, { error: 'client installer not found on relay' });
+      const { path: found, stat } = foundInfo;
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'Content-Length': stat.size,
@@ -612,17 +688,9 @@ const server = http.createServer(async (req, res) => {
     // Authenticated Admin self-update metadata & NSIS installer download
     if (req.method === 'GET' && (url.pathname === '/api/v1/admin/update-info' || url.pathname === '/api/v1/admin/admin-setup.exe')) {
       if (!requireAdmin(req, res)) return;
-      const adminCandidates = [
-        path.join(process.cwd(), '..', 'final-release', 'IT ELKHAWGA Admin_1.0.0_x64-setup.exe'),
-        path.join(process.cwd(), 'final-release', 'IT ELKHAWGA Admin_1.0.0_x64-setup.exe'),
-        'C:/Users/IT APP/Desktop/blockwebsite/final-release/IT ELKHAWGA Admin_1.0.0_x64-setup.exe',
-        'C:/Users/IT APP/Desktop/tools/IT ELKHAWGA Admin_1.0.0_x64-setup.exe',
-      ];
-      const foundAdmin = adminCandidates.find((p) => {
-        try { return fs.existsSync(p) && fs.statSync(p).size > 500000; } catch (_) { return false; }
-      });
-      if (!foundAdmin) return json(res, 404, { ok: false, error: 'admin installer not found on relay' });
-      const st = fs.statSync(foundAdmin);
+      const foundAdminInfo = findNewestSetupInstaller('IT ELKHAWGA Admin_');
+      if (!foundAdminInfo) return json(res, 404, { ok: false, error: 'admin installer not found on relay' });
+      const { path: foundAdmin, stat: st, version: adminVer } = foundAdminInfo;
       if (url.pathname === '/api/v1/admin/update-info') {
         const cacheKey = `${foundAdmin}|${st.size}|${Math.floor(st.mtimeMs)}`;
         if (!globalThis.__adminSetupHashCache || globalThis.__adminSetupHashCache.key !== cacheKey) {
@@ -635,7 +703,7 @@ const server = http.createServer(async (req, res) => {
           size: st.size,
           mtime_ms: Math.floor(st.mtimeMs),
           sha256: globalThis.__adminSetupHashCache.sha256,
-          version: '1.0.0',
+          version: adminVer || '1.1.4',
         });
       }
       res.writeHead(200, {
@@ -664,11 +732,27 @@ const server = http.createServer(async (req, res) => {
       }
       const fid = decodeURIComponent(uploadDlMatch[1]).replace(/[^A-Za-z0-9_-]/g, '');
       if (!fid) return json(res, 400, { ok: false, error: 'invalid file_id' });
+      const dispKind = url.searchParams.get('inline') === '1' ? 'inline' : 'attachment';
+      const etagVal = `"${fid}"`;
+      const inm = String(req.headers['if-none-match'] || '');
+      if (inm && inm.includes(etagVal)) {
+        const h304 = {
+          'ETag': etagVal,
+          'Access-Control-Allow-Origin': CORS_ORIGIN,
+        };
+        if (dispKind === 'inline') {
+          h304['Cache-Control'] = 'private, max-age=604800, immutable';
+        }
+        res.writeHead(304, h304);
+        return res.end();
+      }
       const row = db.prepare('SELECT file_name, stored_path FROM uploaded_files WHERE file_id=?').get(fid);
       let filePath = row && row.stored_path && fs.existsSync(row.stored_path) ? row.stored_path : '';
       let fileName = (row && row.file_name) || '';
       if (!filePath) {
-        for (const entry of readArchiveLogEntries().reverse()) {
+        const logList = readArchiveLogEntries();
+        for (let i = logList.length - 1; i >= 0; i--) {
+          const entry = logList[i];
           if (entry && entry.file_id === fid && entry.stored_path && fs.existsSync(entry.stored_path)) {
             filePath = entry.stored_path;
             if (!fileName) fileName = entry.file_name || '';
@@ -700,18 +784,18 @@ const server = http.createServer(async (req, res) => {
         : lowerExt.endsWith('.gif') ? 'image/gif'
         : lowerExt.endsWith('.pdf') ? 'application/pdf'
         : 'application/octet-stream';
-      const dispKind = url.searchParams.get('inline') === '1' ? 'inline' : 'attachment';
       const dlHeaders = {
         'Content-Type': mime,
         'Content-Length': stat.size,
         'Content-Disposition': `${dispKind}; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+        'ETag': etagVal,
         'X-Content-Type-Options': 'nosniff',
         'Referrer-Policy': 'no-referrer',
         'Access-Control-Allow-Origin': CORS_ORIGIN,
-        'Access-Control-Expose-Headers': 'Content-Disposition, Content-Length',
+        'Access-Control-Expose-Headers': 'Content-Disposition, Content-Length, ETag',
       };
       if (dispKind === 'inline') {
-        dlHeaders['Cache-Control'] = 'private, max-age=86400';
+        dlHeaders['Cache-Control'] = 'private, max-age=604800, immutable';
       }
       res.writeHead(200, dlHeaders);
       fs.createReadStream(filePath).pipe(res);
@@ -937,7 +1021,7 @@ const server = http.createServer(async (req, res) => {
       if (!requireAdmin(req,res)) return;
       const totalUsers = db.prepare('SELECT COUNT(*) AS n FROM devices').get().n;
       const onlineUsers = db.prepare('SELECT COUNT(*) AS n FROM devices WHERE last_seen > ?')
-        .get(now() - 60_000).n;
+        .get(now() - 120_000).n;
       const commands = db.prepare('SELECT COUNT(*) AS n FROM commands').get().n;
       const pending = db.prepare('SELECT COUNT(*) AS n FROM commands WHERE acked_at IS NULL').get().n;
       const engagement = totalUsers ? Math.round((onlineUsers / totalUsers) * 1000) / 10 : 0;
@@ -970,7 +1054,7 @@ const server = http.createServer(async (req, res) => {
       const channel = Math.max(1, Math.min(64, Number(url.searchParams.get('channel') || 1) || 1));
       const hd = url.searchParams.get('hd') === '1';
       try {
-        const frame = await cctv.getFrame({ dvrId, channel, hd, waitMs: 9000 });
+        const frame = await cctv.getFrame({ dvrId, channel, hd, waitMs: 12500 });
         res.writeHead(200, {
           'Content-Type': frame.mime || 'image/jpeg',
           'Content-Length': frame.buf.length,
@@ -1090,7 +1174,7 @@ const server = http.createServer(async (req, res) => {
           dvrId: body.dvr_id,
           channel: Number(body.channel || 1),
           hd: Boolean(body.hd),
-          waitMs: 9000,
+          waitMs: 12500,
         });
         return json(res, 200, {
           ok: true,
@@ -1455,14 +1539,21 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/devices') {
       if (!requireAdmin(req,res)) return;
       const rows = db.prepare('SELECT device_id,hostname,os,app_version,enrolled_at,last_seen,ip,blocked,usb_blocked,mode,policy_version,group_id,label,last_event,last_event_at,throttle_kbps,sites,denied,rustdesk_id,rustdesk_password FROM devices ORDER BY last_seen DESC').all();
+      const pendRows = db.prepare('SELECT device_id, type FROM commands WHERE acked_at IS NULL ORDER BY created_at DESC').all();
+      const pendMap = new Map();
+      for (const pr of pendRows) {
+        if (!pendMap.has(pr.device_id)) pendMap.set(pr.device_id, pr.type || '');
+      }
+      const ci = findNewestSetupInstaller('IT ELKHAWGA Client_');
+      const latestVer = (ci && ci.version) || '1.1.3';
       const out = rows.map(d => {
         let sites = [];
         let denied = [];
         try { sites = JSON.parse(d.sites || '[]'); } catch (e) { sites = []; }
         try { denied = JSON.parse(d.denied || '[]'); } catch (e) { denied = []; }
-        return {...d, sites, denied, rustdesk_id: d.rustdesk_id || '', rustdesk_password: d.rustdesk_password || '', blocked: !!d.blocked, usb_blocked: !!d.usb_blocked, online: d.last_seen && (now()-d.last_seen < 60_000)};
+        return {...d, sites, denied, pending_command: pendMap.get(d.device_id) || '', latest_client_version: latestVer, rustdesk_id: d.rustdesk_id || '', rustdesk_password: d.rustdesk_password || '', blocked: !!d.blocked, usb_blocked: !!d.usb_blocked, online: d.last_seen && (now()-d.last_seen < 120_000)};
       });
-      return json(res, 200, {ok:true, devices: out});
+      return json(res, 200, {ok:true, latest_client_version: latestVer, devices: out});
     }
     // Admin: command
     const cmdMatch = url.pathname.match(/^\/api\/v1\/admin\/devices\/([^/]+)\/command$/);
@@ -1546,10 +1637,11 @@ const server = http.createServer(async (req, res) => {
       const device_token = rid('dvt_');
       const rawLabel = (row.label || '').trim();
       const label = rawLabel === 'permanent' ? '' : rawLabel;
+      const realIp = clientIpFromReq(req);
       db.prepare(`INSERT INTO devices(device_id,hostname,os,app_version,device_token_hash,enrolled_at,last_seen,ip,label)
                   VALUES(?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT(device_id) DO UPDATE SET hostname=excluded.hostname,os=excluded.os,app_version=excluded.app_version,device_token_hash=excluded.device_token_hash,last_seen=excluded.last_seen,ip=excluded.ip,label=COALESCE(NULLIF(excluded.label,''),devices.label)`)
-        .run(device_id, body.hostname||'', body.os||'', body.app_version||'', sha256(device_token), now(), now(), req.socket.remoteAddress||'', label);
+                  ON CONFLICT(device_id) DO UPDATE SET hostname=excluded.hostname,os=excluded.os,app_version=excluded.app_version,device_token_hash=excluded.device_token_hash,last_seen=excluded.last_seen,ip=CASE WHEN excluded.ip!='' AND excluded.ip!='127.0.0.1' THEN excluded.ip ELSE COALESCE(NULLIF(devices.ip,'127.0.0.1'), excluded.ip) END,label=COALESCE(NULLIF(excluded.label,''),devices.label)`)
+        .run(device_id, body.hostname||'', body.os||'', body.app_version||'', sha256(device_token), now(), now(), realIp, label);
       // Token stays reusable so a single token links many clients forever.
       audit('device:' + device_id, 'enroll', device_id, 'ok', {hostname: body.hostname || ''});
       return json(res, 200, {ok:true, device_id, device_token, poll_seconds: 3});
@@ -1707,11 +1799,11 @@ const server = http.createServer(async (req, res) => {
       const offset = (safePage - 1) * pageSize;
       const files = matched.slice(offset, offset + pageSize).map((f) => ({
         ...f,
-        exists_on_disk: Boolean(f.stored_path && fs.existsSync(f.stored_path)),
+        exists_on_disk: Boolean(f.stored_path),
       }));
 
       const curArchiveRoot = getArchiveRoot();
-      const disk = getDiskSpaceBytes(curArchiveRoot);
+      const disk = getCachedDiskSpaceBytes(curArchiveRoot);
       return json(res, 200, {
         ok: true,
         archive_root: curArchiveRoot,
@@ -1954,8 +2046,12 @@ const server = http.createServer(async (req, res) => {
         db.prepare('UPDATE commands SET acked_at=? WHERE id=? AND device_id=? AND acked_at IS NULL')
           .run(now(), body.ack_command_id, dev.device_id);
       }
+      const realPollIp = clientIpFromReq(req);
+      const nextIp = (realPollIp && realPollIp !== '127.0.0.1' && realPollIp !== '::1')
+        ? realPollIp
+        : ((dev.ip && dev.ip !== '127.0.0.1') ? dev.ip : (realPollIp || '127.0.0.1'));
       db.prepare("UPDATE devices SET hostname=?,os=COALESCE(NULLIF(?,'') ,os),app_version=?,last_seen=?,ip=?,blocked=?,usb_blocked=?,mode=?,policy_version=? WHERE device_id=?")
-        .run(body.hostname||dev.hostname, body.os||'', body.app_version||dev.app_version, now(), req.socket.remoteAddress||'', body.blocked?1:0, body.usb_blocked?1:0, body.mode||dev.mode, body.policy_version||dev.policy_version, dev.device_id);
+        .run(body.hostname||dev.hostname, body.os||'', body.app_version||dev.app_version, now(), nextIp, body.blocked?1:0, body.usb_blocked?1:0, body.mode||dev.mode, body.policy_version||dev.policy_version, dev.device_id);
       if (Array.isArray(body.sites)) {
         const clean = body.sites
           .filter(function (s) { return typeof s === 'string' && s.length <= 120; })
@@ -2003,6 +2099,7 @@ const server = http.createServer(async (req, res) => {
           cctvScan = cctv.popPendingScanForDevice(dev.device_id);
           cctvCgi = cctv.popPendingCgiForDevice(dev.device_id);
         }
+        try { db.prepare('UPDATE devices SET last_seen=? WHERE device_id=?').run(now(), dev.device_id); } catch (_) {}
       }
       return json(res, 200, {
         ok: true,
@@ -2124,6 +2221,114 @@ const server = http.createServer(async (req, res) => {
       return res.end(html);
     }
 
+    // Direct zero-hop in-memory fast path for CCTV RPC commands on Web Admin / iPad PWA (eliminates 8790 -> 8787 -> 8790 double round-trip!)
+    if (req.method === 'POST' && url.pathname === '/api/rpc') {
+      const jwtVerified = verifyAdminJwtToken(bearer(req));
+      if (jwtVerified && jwtVerified.claims) {
+        const rpcBody = await readBody(req).catch(() => null);
+        const rpcCmd = rpcBody && typeof rpcBody.cmd === 'string' ? rpcBody.cmd.trim() : '';
+        const rpcArgs = (rpcBody && rpcBody.args) || {};
+        const actor = String(jwtVerified.claims.sub || 'admin');
+        const role = String(jwtVerified.claims.role || 'admin').toLowerCase();
+        if (rpcCmd === 'cctv_action' || rpcCmd === 'cctv_list_dvrs' || rpcCmd === 'cctv_get_frame_b64') {
+          const st = cctv.getSettings();
+          if (st.super_only && role !== 'super') {
+            return json(res, 200, {
+              ok: true,
+              result: rpcCmd === 'cctv_list_dvrs'
+                ? { ok: true, dvrs: [], settings: st, restricted: true }
+                : { ok: false, success: false, error: 'تم حصر مشاهدة الكاميرات بحساب السوبر أدمن فقط' },
+            });
+          }
+          try {
+            if (rpcCmd === 'cctv_list_dvrs') {
+              return json(res, 200, { ok: true, result: cctv.listDvrs({ actor, role }) });
+            }
+            if (rpcCmd === 'cctv_action') {
+              const act = String(rpcArgs.action || '');
+              if (role === 'viewer' && ['ptz', 'save_channel_meta', 'pull_names', 'save_settings'].includes(act)) {
+                return json(res, 200, { ok: true, result: { ok: false, success: false, error: 'صلاحية المشاهدة فقط لا تسمح بالتعديل أو تحريك الكاميرات' } });
+              }
+              const out = await cctv.handleAction({
+                action: act,
+                payload: rpcArgs.payload || {},
+                actor,
+                role,
+              });
+              return json(res, 200, { ok: true, result: out });
+            }
+            if (rpcCmd === 'cctv_get_frame_b64') {
+              const frame = await cctv.getFrame({
+                dvrId: rpcArgs.dvrId,
+                channel: Number(rpcArgs.channel || 1),
+                hd: Boolean(rpcArgs.hd),
+                waitMs: 10000,
+              });
+              return json(res, 200, {
+                ok: true,
+                result: {
+                  ok: true,
+                  mime: frame.mime || 'image/jpeg',
+                  at: frame.at,
+                  image: frame.buf.toString('base64'),
+                },
+              });
+            }
+          } catch (e) {
+            return json(res, 200, {
+              ok: true,
+              result: { ok: false, success: false, error: (e && e.message) || 'تعذر تنفيذ إجراء الكاميرا' },
+            });
+          }
+        }
+        // For non-CCTV RPC calls, forward the already-read body buffer to 127.0.0.1:8787
+        const rawRpcBuf = Buffer.from(JSON.stringify(rpcBody || {}), 'utf8');
+        const fwdHeaders = {
+          host: '127.0.0.1:8787',
+          'content-type': 'application/json',
+          'content-length': rawRpcBuf.length,
+        };
+        if (req.headers['authorization']) fwdHeaders['authorization'] = req.headers['authorization'];
+        const proxyReq = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: 8787,
+            path: '/api/rpc',
+            method: 'POST',
+            headers: fwdHeaders,
+            agent: lanKeepAliveAgent,
+            timeout: 25000,
+          },
+          (proxyRes) => {
+            const chunks = [];
+            proxyRes.on('data', (c) => chunks.push(c));
+            proxyRes.on('end', () => {
+              const rawBuf = Buffer.concat(chunks);
+              const outHeaders = { ...proxyRes.headers, Vary: 'Accept-Encoding' };
+              if (res.__acceptGzip && rawBuf.length >= 1024 && !outHeaders['content-encoding']) {
+                const gz = zlib.gzipSync(rawBuf, { level: zlib.constants.Z_BEST_SPEED });
+                outHeaders['Content-Encoding'] = 'gzip';
+                outHeaders['content-length'] = gz.length;
+                delete outHeaders['Content-Length'];
+                res.writeHead(proxyRes.statusCode || 200, outHeaders);
+                res.end(gz);
+              } else {
+                outHeaders['content-length'] = rawBuf.length;
+                delete outHeaders['Content-Length'];
+                res.writeHead(proxyRes.statusCode || 200, outHeaders);
+                res.end(rawBuf);
+              }
+            });
+          }
+        );
+        proxyReq.on('error', () => {
+          if (!res.headersSent) json(res, 502, { ok: false, error: 'لوحة الإدارة قيد إعادة التشغيل، حاول بعد ثوانٍ' });
+        });
+        proxyReq.end(rawRpcBuf);
+        return;
+      }
+    }
+
     // Reverse-proxy Web Admin Dashboard & iPad PWA routes to local Admin Server (127.0.0.1:8787)
     // so the company owner (iPad) and remote managers can sign in securely over HTTPS from anywhere.
     const isWebProxyRoute =
@@ -2170,7 +2375,8 @@ const server = http.createServer(async (req, res) => {
             url.pathname.endsWith('.js') ||
             url.pathname.endsWith('.css')
           ) {
-            outHeaders['Cache-Control'] = 'no-cache, must-revalidate';
+            outHeaders['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0';
+            outHeaders['Pragma'] = 'no-cache';
           }
           const ctype = String(outHeaders['content-type'] || '').toLowerCase();
           const canCompress =

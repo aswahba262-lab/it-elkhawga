@@ -53,8 +53,34 @@ try {
 $userInetKeys = $userInetKeys | Select-Object -Unique
 
 # Always route traffic through our local proxy on 127.0.0.1:8080 when blocking is active
-# (in both whitelist and blacklist modes) so blocked sites are enforced, logged, and trigger notifications.
-$overrideList = "<local>;localhost;127.0.0.1"
+# (in both whitelist and blacklist modes) so blocked sites are enforced, logged, and trigger notifications,
+# while bypassing the local proxy for the company ERP (elkhawaga.uk) and for WhatsApp Web when allowed
+# so real-time WebSockets, media CDNs, and ERP pages run at 100% native speed without proxy socket bottlenecks.
+$allowedList = Read-List $allowedSitesFile
+$blockedList = Read-List $blockedSitesFile
+$waAllowed = $false
+if ($mode -eq "blacklist") {
+    $waBlocked = $blockedList | Where-Object { $_ -match "whatsapp" }
+    if (-not $waBlocked) { $waAllowed = $true }
+} else {
+    $waInAllowed = $allowedList | Where-Object { $_ -match "whatsapp" }
+    if ($waInAllowed) { $waAllowed = $true }
+}
+
+$overrideParts = @("<local>", "<-loopback>", "localhost", "127.0.0.1", "10.*", "192.168.*", "172.16.*", "172.17.*", "172.18.*", "172.19.*", "172.20.*", "172.21.*", "172.22.*", "172.23.*", "172.24.*", "172.25.*", "172.26.*", "172.27.*", "172.28.*", "172.29.*", "172.30.*", "172.31.*", "*.local", "elkhawaga.uk", "*.elkhawaga.uk")
+if ($config -and $config.erp_domains) {
+    foreach ($ed in $config.erp_domains) {
+        $cleanEd = ([string]$ed).Trim().ToLower()
+        if ($cleanEd -and $cleanEd -notmatch "[:/]") {
+            $overrideParts += $cleanEd
+            $overrideParts += "*.$cleanEd"
+        }
+    }
+}
+if ($waAllowed) {
+    $overrideParts += @("whatsapp.com", "*.whatsapp.com", "whatsapp.net", "*.whatsapp.net")
+}
+$overrideList = ($overrideParts | Select-Object -Unique) -join ";"
 
 if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
 try { Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord } catch { }
