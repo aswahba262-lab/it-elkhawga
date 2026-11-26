@@ -368,7 +368,7 @@ function compactDatabaseIfNeeded() {
     const pc = db.prepare('PRAGMA page_count').get();
     const freePages = Number((fc && fc.freelist_count) || 0);
     const totalPages = Number((pc && pc.page_count) || 0);
-    if (freePages > 5000 && totalPages > 0 && (freePages / totalPages) > 0.05) {
+    if (freePages > 120000 && totalPages > 0 && (freePages / totalPages) > 0.35) {
       console.log(`Compacting relay.db (${freePages}/${totalPages} free pages)...`);
       const t0 = Date.now();
       db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');

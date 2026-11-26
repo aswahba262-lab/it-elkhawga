@@ -2898,8 +2898,10 @@ export function createDahuaCctvManager({ db }) {
 
     // Fallback for G.711Mu / G.711A / 16-bit PCM
     let pcmBuf;
+    let pcmSampleRate = 8000;
     if (ctLower.includes('pcm') || ctLower.includes('l16')) {
-      pcmBuf = inner;
+      pcmBuf = inner.length % 2 === 0 ? inner : inner.subarray(0, inner.length - 1);
+      if (ctLower.includes('16000') || ctLower.includes('pcm16k')) pcmSampleRate = 16000;
     } else {
       const table = (ctLower.includes('ulaw') || ctLower.includes('mulaw') || ctLower === 'audio/basic')
         ? ULAW_TO_PCM16
@@ -2909,12 +2911,13 @@ export function createDahuaCctvManager({ db }) {
         pcmBuf.writeInt16LE(table[inner[i]], i * 2);
       }
     }
+    if (!pcmBuf || pcmBuf.length < 2) return;
     st.seq += 1;
     st.chunks.push({
       seq: st.seq,
       at: Date.now(),
       format: 'pcm16',
-      sample_rate: 8000,
+      sample_rate: pcmSampleRate,
       frame_count: 0,
       data_b64: pcmBuf.toString('base64'),
     });
@@ -2969,22 +2972,24 @@ export function createDahuaCctvManager({ db }) {
           [
             '-hide_banner',
             '-loglevel', 'error',
-            '-probesize', '65536',
-            '-analyzeduration', '800000',
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-probesize', '32768',
+            '-analyzeduration', '500000',
             '-rtsp_transport', 'tcp',
-            '-timeout', '5000000',
             '-i', rtspUrl,
             '-vn',
-            '-c:a', 'aac',
+            '-acodec', 'pcm_s16le',
             '-ar', '16000',
             '-ac', '1',
-            '-b:a', '32k',
-            '-f', 'adts',
+            '-flush_packets', '1',
+            '-f', 's16le',
             'pipe:1',
           ],
           { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
         );
         let gotRtspAudio = false;
+        let pcmCarry = Buffer.alloc(0);
         const wrapper = {
           destroy: () => {
             try { proc.kill(); } catch (_) {}
@@ -3000,7 +3005,13 @@ export function createDahuaCctvManager({ db }) {
             directAudioReqs.delete(streamKey);
             return;
           }
-          ingestRawAudioBytes(dvr.id, ch, 'Audio/AAC', chunk);
+          pcmCarry = pcmCarry.length ? Buffer.concat([pcmCarry, chunk]) : chunk;
+          // Emit in ~250ms chunks (8000 bytes @ 16kHz 16-bit mono) for silky smooth Web Audio playback
+          while (pcmCarry.length >= 6400) {
+            const slice = pcmCarry.subarray(0, 6400);
+            pcmCarry = pcmCarry.subarray(6400);
+            ingestRawAudioBytes(dvr.id, ch, 'audio/pcm16k', slice);
+          }
         });
 
         proc.on('close', () => {
