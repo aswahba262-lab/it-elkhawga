@@ -5591,7 +5591,7 @@
         if (abortCtrl) {
           try { abortCtrl.abort(); } catch (_) {}
         }
-      }, 6500);
+      }, 9500);
 
       const resp = await fetch(mseUrl, {
         method: 'GET',
@@ -5771,15 +5771,9 @@
           await tryFmp4MseStream('copy');
           return;
         }
-        // Default 'nextgen': Smart Zero-Transcode fMP4/MSE (handles both Dokki H.264 & Maadi H.265/HEVC natively at 0% CPU)
-        // with automatic WebRTC WHEP & HLS fallback!
-        try {
-          await tryFmp4MseStream('copy');
-          return;
-        } catch (_) {
-          await tryWebRtcWhep();
-          return;
-        }
+        // Default 'nextgen': Smart Zero-Transcode fMP4/MSE (handles both H.264 & H.265/HEVC natively at 0% CPU)
+        await tryFmp4MseStream('copy');
+        return;
       } catch (err) {
         if (!cancelled) {
           scheduleReconnect((err && err.message) || 'تعذر الاتصال بالكاميرا');
@@ -5787,7 +5781,12 @@
       }
     };
 
-    startAttempt();
+    const initialDelayMs = Math.max(0, Number(opts.staggerMs || 0));
+    if (initialDelayMs > 0) {
+      retryTimer = setTimeout(startAttempt, initialDelayMs);
+    } else {
+      startAttempt();
+    }
 
     return {
       stop: () => {
@@ -6100,6 +6099,7 @@
         dvrId: tileInfo.dvrId,
         channel: tileInfo.channel,
         hd: wantHd,
+        staggerMs: idx * 110,
         videoEl: vidEl,
         imgFallbackEl: imgEl,
         statusOverlayEl: msgEl,

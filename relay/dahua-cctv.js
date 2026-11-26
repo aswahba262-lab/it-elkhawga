@@ -579,8 +579,10 @@ export function createDahuaCctvManager({ db }) {
   let lastPrewarmAt = 0;
   function prewarmDvrsBackground() {
     const nowMs = Date.now();
-    if (nowMs - lastPrewarmAt < 25_000) return;
+    if (nowMs - lastPrewarmAt < 45_000) return;
     lastPrewarmAt = nowMs;
+    // Do not send background HTTP snapshots if active fMP4 video hubs are already streaming
+    if (activeFmp4Hubs.size > 0) return;
     try {
       const rows = db.prepare('SELECT * FROM cctv_dvrs WHERE enabled=1 ORDER BY created_at ASC').all();
       for (const dvr of rows) {
@@ -588,27 +590,6 @@ export function createDahuaCctvManager({ db }) {
         resolveActiveBridgeDevice(dvr);
         if (dvr.router_host && dvr.router_host !== prevRouterIp) {
           try { syncAndEnsureMediaMtxGateway(true); } catch (_) {}
-        }
-        if (dvr.connection_mode === 'router' && dvr.router_host) {
-          ensureRouterDirectStatus(dvr, false)
-            .then((st) => {
-              if (st && st.tcpOpen) {
-                const maxPre = Math.min(4, Number(dvr.channels_count || 4));
-                for (let ch = 1; ch <= maxPre; ch++) {
-                  const ck = `${dvr.id}:${ch}:0`;
-                  const cur = frameCache.get(ck);
-                  if (!cur || Date.now() - cur.at > 15_000) {
-                    fetchDirectSnapshot({ ...dvr, host: st.routerHost, http_port: st.routerPort }, ch, false)
-                      .then((res) => {
-                        verifiedWorkingChannels.add(`${dvr.id}:${ch}`);
-                        frameCache.set(ck, { buf: res.buf, mime: res.mime, at: res.at, error: '', transport: 'router', hd: false });
-                      })
-                      .catch(() => {});
-                  }
-                }
-              }
-            })
-            .catch(() => {});
         }
       }
     } catch (_) {}
@@ -2741,6 +2722,32 @@ export function createDahuaCctvManager({ db }) {
         if (ch >= 1 && ch <= 64) foundSet.add(ch);
       }
     }
+    // Also check RemoteDevice for active IP cameras (e.g. IPC-K2E-3H1W / IPC-K2E-3R1W) which stream AAC audio directly over RTSP
+    try {
+      const rdResp = await executeDvrCgi(dvr, '/cgi-bin/configManager.cgi?action=getConfig&name=RemoteDevice', {
+        timeoutMs: 6500,
+        maxBytes: 524288,
+      });
+      if (rdResp.statusCode === 200 && rdResp.body) {
+        const rdTxt = rdResp.body.toString('utf8');
+        const enabledIpIdx = new Set();
+        const validIpIdx = new Set();
+        for (const ln of rdTxt.split(/\r?\n/)) {
+          const mEn = ln.match(/NETCAMERA_INFO_(\d+)\.Enable=(true|1)\b/i);
+          if (mEn) enabledIpIdx.add(parseInt(mEn[1], 10));
+          const mAddr = ln.match(/NETCAMERA_INFO_(\d+)\.Address=(\d+\.\d+\.\d+\.\d+)/i);
+          if (mAddr && mAddr[2] !== '192.168.0.0' && mAddr[2] !== '0.0.0.0') {
+            validIpIdx.add(parseInt(mAddr[1], 10));
+          }
+        }
+        for (const idx of enabledIpIdx) {
+          if (validIpIdx.has(idx)) {
+            const ch = idx + 1;
+            if (ch >= 1 && ch <= 64) foundSet.add(ch);
+          }
+        }
+      }
+    } catch (_) {}
     const sorted = Array.from(foundSet).sort((a, b) => a - b);
     db.prepare('UPDATE cctv_dvrs SET audio_channels=? WHERE id=?').run(JSON.stringify(sorted), dvr.id);
     return {
@@ -2946,6 +2953,70 @@ export function createDahuaCctvManager({ db }) {
     const streamKey = `${dvr.id}:${ch}`;
     if (directAudioReqs.has(streamKey)) return;
 
+    const st = getOrCreateAudioStream(streamKey);
+
+    // 1. Prefer RTSP Audio Stream (Port 554) first: works for ALL IP cameras (including ONVIF IPC-K2E-3H1W in Nozha & October)
+    // and coaxial cameras, outputting clean 16kHz ADTS AAC frames!
+    const rtspPort = Number(dvr.router_rtsp_port || dvr.rtsp_port || 554) || 554;
+    const rtspOpen = await checkRtspTcpPortFast(dvr.host, rtspPort, 1000);
+    if (rtspOpen) {
+      const userEnc = encodeURIComponent(String(dvr.username || 'admin'));
+      const passEnc = encodeURIComponent(String(dvr.password || ''));
+      const rtspUrl = `rtsp://${userEnc}:${passEnc}@${dvr.host}:${rtspPort}/cam/realmonitor?channel=${ch}&subtype=1`;
+      try {
+        const proc = spawn(
+          resolveFfmpegBin(),
+          [
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-probesize', '65536',
+            '-analyzeduration', '800000',
+            '-rtsp_transport', 'tcp',
+            '-timeout', '5000000',
+            '-i', rtspUrl,
+            '-vn',
+            '-c:a', 'aac',
+            '-ar', '16000',
+            '-ac', '1',
+            '-b:a', '32k',
+            '-f', 'adts',
+            'pipe:1',
+          ],
+          { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
+        );
+        let gotRtspAudio = false;
+        const wrapper = {
+          destroy: () => {
+            try { proc.kill(); } catch (_) {}
+          },
+        };
+        directAudioReqs.set(streamKey, wrapper);
+
+        proc.stdout.on('data', (chunk) => {
+          gotRtspAudio = true;
+          const lease = audioLeases.get(dvr.id);
+          if (!lease || lease.channel !== ch || lease.until <= Date.now()) {
+            try { proc.kill(); } catch (_) {}
+            directAudioReqs.delete(streamKey);
+            return;
+          }
+          ingestRawAudioBytes(dvr.id, ch, 'Audio/AAC', chunk);
+        });
+
+        proc.on('close', () => {
+          directAudioReqs.delete(streamKey);
+          if (!gotRtspAudio && !st.chunks.length) {
+            st.error = `🔇 الكاميرا رقم ${ch} لا ترسل مسار صوت حالياً من الـ DVR`;
+            st.errorAt = Date.now();
+          }
+        });
+        return;
+      } catch (_) {
+        directAudioReqs.delete(streamKey);
+      }
+    }
+
+    // 2. Fallback to HTTP /cgi-bin/audio.cgi if RTSP port 554 is closed on the branch router
     const pq = `/cgi-bin/audio.cgi?action=getAudio&httptype=singlepart&channel=${ch}`;
     const cacheKey = `${dvr.host}:${dvr.http_port}:${dvr.username}`;
     let authHdr = '';
@@ -2974,7 +3045,6 @@ export function createDahuaCctvManager({ db }) {
       authHdr = 'Basic ' + Buffer.from(`${dvr.username}:${dvr.password}`, 'utf8').toString('base64');
     }
 
-    const st = getOrCreateAudioStream(streamKey);
     const req = http.request(
       {
         hostname: dvr.host,
@@ -2988,10 +3058,21 @@ export function createDahuaCctvManager({ db }) {
         },
       },
       (res) => {
+        if (res.statusCode === 401) {
+          const rawWww = res.headers && res.headers['www-authenticate'];
+          const wwwStr = Array.isArray(rawWww) ? rawWww.join(', ') : String(rawWww || '');
+          const freshChallenge = parseDigestHeader(wwwStr);
+          if (freshChallenge) {
+            digestCache.set(cacheKey, { challenge: freshChallenge, nc: 1 });
+          } else {
+            digestCache.delete(cacheKey);
+          }
+          res.resume();
+          directAudioReqs.delete(streamKey);
+          return;
+        }
         if (res.statusCode !== 200) {
-          st.error = res.statusCode === 401
-            ? 'بيانات دخول الـ DVR غير صحيحة (401)'
-            : `هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت مغلق في الـ DVR (HTTP ${res.statusCode})`;
+          st.error = `هذه الكاميرا غير مزوّدة بمايكروفون أو الصوت مغلق في الـ DVR (HTTP ${res.statusCode})`;
           st.errorAt = Date.now();
           res.resume();
           directAudioReqs.delete(streamKey);
@@ -3335,12 +3416,12 @@ export function createDahuaCctvManager({ db }) {
     const args = [
       '-hide_banner',
       '-loglevel', 'error',
-      '-fflags', 'nobuffer+genpts+discardcorrupt',
+      '-fflags', '+genpts+discardcorrupt',
       '-flags', 'low_delay',
-      '-probesize', '32768',
-      '-analyzeduration', '250000',
+      '-probesize', '2000000',
+      '-analyzeduration', '4500000',
       '-rtsp_transport', 'tcp',
-      '-timeout', '5000000',
+      '-timeout', '6000000',
       '-use_wallclock_as_timestamps', '1',
       '-i', rtspUrl,
       '-an',
