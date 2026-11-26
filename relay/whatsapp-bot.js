@@ -24,6 +24,7 @@ const DEFAULT_FEATURES = {
   notify_cctv_health: false,
   notify_cctv_schedule: false,
   notify_biometrics_offline: true,
+  notify_morning_brief: true,
   // الأوامر التفاعلية من واتساب المدير (جميعها متوقفة افتراضياً ليختار المدير ما يشاء)
   cmd_status: false,
   cmd_screenshot: false,
@@ -270,7 +271,7 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
     const fSrc = src.features && typeof src.features === 'object' ? src.features : {};
     const features = {};
     for (const k of Object.keys(DEFAULT_FEATURES)) {
-      features[k] = Boolean(fSrc[k]);
+      features[k] = fSrc[k] !== undefined ? Boolean(fSrc[k]) : Boolean(DEFAULT_FEATURES[k]);
     }
     const maxMb = Math.max(1, Math.min(64, Number(src.max_file_mb) || 25));
     return {
@@ -885,6 +886,116 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
     return Array.from(byId.values());
   }
 
+  async function buildExecutiveMorningBriefText({ pullFreshBiometrics = false } = {}) {
+    const nowMs = Date.now();
+    // 1. Devices status
+    const devices = await getMergedDevices();
+    const onlineDevs = devices.filter((d) => d.online);
+    const blockedDevs = devices.filter((d) => d.blocked);
+    const openDevs = Math.max(0, devices.length - blockedDevs.length);
+
+    // 2. ERP Backup status (elkhawaga.uk)
+    const erpSt = await lanAdminRequest('GET', 'erp-backups').catch(() => null);
+    const lastErp = erpSt && Array.isArray(erpSt.backups) && erpSt.backups[0] ? erpSt.backups[0] : null;
+    const erpLine = lastErp
+      ? `🟢 محدثة — \`${lastErp.file_name}\` (${formatBytes(lastErp.size_bytes)})`
+      : `⚪ لم يتم سحب نسخة بعد`;
+
+    // 3. Dahua CCTV DVRs & HDD Health
+    let cctvLines = ['⚪ لا توجد أجهزة DVR مضافة'];
+    if (cctv) {
+      const dvrs = (cctv.listDvrs().dvrs || []).filter((d) => d.enabled);
+      if (dvrs.length) {
+        const hAll = await cctv.checkAllDvrsHealth().catch(() => null);
+        const hMap = new Map();
+        if (hAll && Array.isArray(hAll.results)) {
+          for (const r of hAll.results) hMap.set(r.dvr_id, r.health || {});
+        }
+        cctvLines = dvrs.map((d) => {
+          const h = hMap.get(d.id) || {};
+          const reachable = h.reachable !== false;
+          const hddSt = h.hdd_status || 'ok';
+          const hddLabel = hddSt === 'ok'
+            ? `هارد سليم ✅${h.total_gb ? ` (${h.total_gb}GB)` : ''}`
+            : (hddSt === 'error' ? '⚠️ عطل هارد!' : (hddSt === 'missing' ? '⚠️ بدون هارد!' : 'متصل'));
+          return `   • ${reachable ? '🟢' : '🔴'} *${d.name}* (${d.channels_count || 8} كاميرا): ${reachable ? hddLabel : 'غير متصل'}`;
+        });
+      }
+    }
+
+    // 4. Biometrics devices & Today's Attendance
+    let bioHeader = '⚪ لا توجد ماكينات بصمة مضافة';
+    const bioDevLines = [];
+    let bioAttendanceLines = [];
+    if (bioManager) {
+      if (pullFreshBiometrics) {
+        await bioManager.pullAttendanceLogs({}).catch(() => {});
+      }
+      const bioSt = await bioManager.checkAllDevicesHealth(false).catch(() => bioManager.listDevices());
+      const bioDevs = (bioSt && bioSt.devices) || [];
+      const bioSum = (bioSt && bioSt.summary) || {};
+      const attBrief = bioManager.getTodayAttendanceBrief ? bioManager.getTodayAttendanceBrief() : null;
+
+      bioHeader = `🟢 متصل: *${bioSum.online_devices || 0}* من *${bioDevs.length}* ماكينة`;
+      for (const bd of bioDevs) {
+        const icon = bd.online ? '🟢' : '🔴';
+        const vTag = bd.vendor === 'hikvision' ? 'Hikvision' : 'ZKTeco';
+        bioDevLines.push(`   • ${icon} *${bd.name}* [${vTag}]: ${bd.online ? `متصل (${bd.latency_ms}ms)` : 'مفصول'}`);
+      }
+      if (attBrief) {
+        bioAttendanceLines = [
+          `   👥 *الحاضرون (${attBrief.active_day_label}):* *${attBrief.present_employees_count}* موظف (من إجمالي ${attBrief.total_registered_employees || '—'} مسجلين · ${attBrief.total_punches} حركة)`,
+        ];
+        if (attBrief.first_punch) {
+          bioAttendanceLines.push(`   🌅 *أول حضور:* ${attBrief.first_punch.name} (#${attBrief.first_punch.id}) الساعة \`${attBrief.first_punch.time}\``);
+        }
+        if (attBrief.last_punch) {
+          bioAttendanceLines.push(`   🕒 *آخر بصمة:* ${attBrief.last_punch.name} (#${attBrief.last_punch.id}) الساعة \`${attBrief.last_punch.time}\``);
+        }
+      }
+    }
+
+    // 5. DLP Archive & Security Alerts Today
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    let todayFiles = 0;
+    let todayWaFiles = 0;
+    let unackedAlerts = 0;
+    try {
+      todayFiles = db.prepare('SELECT COUNT(*) AS n FROM uploaded_files WHERE created_at >= ?').get(startOfDay.getTime()).n || 0;
+      todayWaFiles = db.prepare("SELECT COUNT(*) AS n FROM uploaded_files WHERE created_at >= ? AND channel LIKE '%whatsapp%'").get(startOfDay.getTime()).n || 0;
+      unackedAlerts = db.prepare('SELECT COUNT(*) AS n FROM alerts WHERE acked_at IS NULL').get().n || 0;
+    } catch (_) {}
+
+    const lines = [
+      `☀️ *التقرير الصباحي الموحّد للإدارة العليا — IT ELKHAWGA*`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `🖥️ *1. السيرفر الرئيسي وموقع الشركة (elkhawaga.uk):*`,
+      `   • حالة السيرفر السحابي: 🟢 يعمل بكفاءة 100%`,
+      `   • آخر نسخة احتياطية للموقع: ${erpLine}`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `💻 *2. أجهزة الفروع والموظفين (${devices.length} جهاز):*`,
+      `   • 🟢 متصل الآن: *${onlineDevs.length}* جهاز | ⚪ مغلق: *${devices.length - onlineDevs.length}*`,
+      `   • 🔒 مقفول الإنترنت (Whitelist): *${blockedDevs.length}* | 🌐 مفتوح: *${openDevs}*`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `🎥 *3. كاميرات الفروع (Dahua DVR) وهاردات التسجيل:*`,
+      ...cctvLines,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `👆 *4. ماكينات البصمة والحضور والانصراف:*`,
+      `   • حالة الماكينات: ${bioHeader}`,
+      ...bioDevLines,
+      ...bioAttendanceLines,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `🛡️ *5. أرشيف الملفات والتنبيهات الأمنية اليوم:*`,
+      `   • 📂 ملفات مؤرشفة اليوم: *${todayFiles}* (منها *${todayWaFiles}* واتساب)`,
+      `   • 🔔 تنبيهات غير مقروءة: *${unackedAlerts}*`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `🕒 *التوقيت:* ${formatCairoTime(nowMs)}`,
+      `💡 للاستعلام عن دوام أي موظف أرسل: *حضور <اسم الموظف>*`,
+    ];
+    return lines.join('\n');
+  }
+
   function findMatchingDevice(devices, query) {
     const q = String(query || '').trim().toLowerCase();
     if (!q) return null;
@@ -1072,7 +1183,7 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
     if (['مساعدة', 'المساعدة', 'اوامر', 'الأوامر', 'الاوامر', 'help', 'menu'].includes(lower)) {
       const cmds = ['🤖 *أوامر بوت IT ELKHAWGA المفعّلة حالياً:*', '━━━━━━━━━━━━━━'];
       if (f.cmd_status) cmds.push('• *حالة* أو *اجهزة* ⬅ عرض الفروع المتصلة والمنقطعة');
-      if (f.cmd_daily_report) cmds.push('• *تقرير* أو *ملخص* ⬅ إحصائية اليوم والأرشيف والهارد');
+      if (f.cmd_daily_report) cmds.push('• *تقرير* أو *موجز* ⬅ التقرير الموحّد للإدارة (السيرفر + الأجهزة + الكاميرات + البصمات)');
       if (f.cmd_screenshot) cmds.push('• *صورة <اسم الجهاز>* ⬅ التقاط صورة شاشة فورية');
       if (f.cmd_camera) cmds.push('• *كاميرا <اسم الجهاز>* ⬅ التقاط صورة فورية من الكاميرا');
       if (f.cmd_cctv) {
@@ -1082,6 +1193,7 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
       if (f.cmd_biometrics !== false) {
         cmds.push('• *بصمات* أو *حالة البصمات* ⬅ حالة اتصال أجهزة البصمة (ZK & Hikvision)');
         cmds.push('• *سحب البصمات* ⬅ سحب حركات الحضور والانصراف من جميع أجهزة البصمة فوراً');
+        cmds.push('• *حضور <اسم الموظف أو الكود>* ⬅ مواعيد حضور وانصراف الموظف خلال الأسبوع');
       }
       if (f.cmd_block_unblock) {
         cmds.push('• *قفل <اسم الجهاز>* ⬅ حجب الإنترنت عن الجهاز');
@@ -1132,39 +1244,15 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
       return;
     }
 
-    // 2b. Daily Summary Report: "تقرير" / "ملخص"
-    if (['تقرير', 'التقرير', 'تقرير اليوم', 'ملخص', 'ملخص اليوم', 'report', 'summary'].includes(lower)) {
-      if (!f.cmd_daily_report) {
+    // 2b. Unified Executive Morning Brief / Daily Summary Report: "تقرير" / "ملخص" / "موجز" / "التقرير الصباحي"
+    if (['تقرير', 'التقرير', 'تقرير اليوم', 'ملخص', 'ملخص اليوم', 'موجز', 'الموجز', 'التقرير الصباحي', 'تقرير الصباح', 'موجز الصباح', 'report', 'summary', 'brief', 'morning'].includes(lower)) {
+      if (!f.cmd_daily_report && f.notify_morning_brief === false) {
         await reply({ text: '⚠️ أمر التقرير اليومي متوقف حالياً من إعدادات بوت واتساب في لوحة التحكم.' });
         return;
       }
-      const devices = await getMergedDevices();
-      const onlineCount = devices.filter((d) => d.online).length;
-      const startOfDay = new Date();
-      startOfDay.setHours(0, 0, 0, 0);
-      let todayFiles = 0;
-      let todayWaFiles = 0;
-      let unackedAlerts = 0;
-      try {
-        todayFiles = db.prepare('SELECT COUNT(*) AS n FROM uploaded_files WHERE created_at >= ?').get(startOfDay.getTime()).n || 0;
-        todayWaFiles = db.prepare("SELECT COUNT(*) AS n FROM uploaded_files WHERE created_at >= ? AND channel LIKE '%whatsapp%'").get(startOfDay.getTime()).n || 0;
-        unackedAlerts = db.prepare('SELECT COUNT(*) AS n FROM alerts WHERE acked_at IS NULL').get().n || 0;
-      } catch (_) {}
-      const erpSt = await lanAdminRequest('GET', 'erp-backups');
-      const lastErp = erpSt && Array.isArray(erpSt.backups) && erpSt.backups[0] ? erpSt.backups[0] : null;
-      const lines = [
-        `📈 *التقرير التنفيذي اليومي — IT ELKHAWGA*`,
-        `━━━━━━━━━━━━━━`,
-        `💻 *الأجهزة المتصلة الآن:* ${onlineCount} من ${devices.length}`,
-        `📂 *ملفات اليوم المسحوبة:* ${todayFiles} ملف (منها ${todayWaFiles} واتساب)`,
-        `🔔 *تنبيهات غير مقروءة:* ${unackedAlerts}`,
-        lastErp
-          ? `💾 *آخر نسخة لموقع الشركة:* ${lastErp.file_name} (${formatBytes(lastErp.size_bytes)})`
-          : `💾 *آخر نسخة لموقع الشركة:* لا توجد بعد`,
-        `🕒 *التوقيت:* ${formatCairoTime(Date.now())}`,
-      ];
-      await reply({ text: lines.join('\n') });
-      pushLog('تم إرسال التقرير التنفيذي اليومي عبر واتساب');
+      const briefText = await buildExecutiveMorningBriefText({ pullFreshBiometrics: false });
+      await reply({ text: briefText });
+      pushLog('تم إرسال التقرير الموحّد للإدارة العليا عبر واتساب');
       return;
     }
 
@@ -1497,6 +1585,71 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
         }
         return;
       }
+    }
+
+    // 3b4. Employee Attendance Lookup by Name or Code ("حضور <اسم الموظف>" / "بصمة <اسم الموظف>" / "دوام <اسم الموظف>")
+    const empAttMatch = normalized.match(/^(?:حضور|انصراف|دوام|مواعيد|بصمة موظف|بصمه موظف|بصمة|بصمه)\s+(.+)$/i);
+    if (empAttMatch) {
+      if (f.cmd_biometrics === false) {
+        await reply({ text: '⚠️ أوامر أجهزة البصمة عبر واتساب متوقفة حالياً من إعدادات البوت.' });
+        return;
+      }
+      if (!bioManager || typeof bioManager.searchEmployeeWeeklyAttendance !== 'function') {
+        await reply({ text: '⚠️ خدمة البحث في سجلات البصمة غير مهيأة حالياً.' });
+        return;
+      }
+      const empQuery = empAttMatch[1].trim();
+      const res = bioManager.searchEmployeeWeeklyAttendance(empQuery, 7);
+      if (!res || !res.ok) {
+        await reply({ text: `⚠️ ${(res && res.error) || 'تعذر البحث عن الموظف'}` });
+        return;
+      }
+      if (!res.found || !Array.isArray(res.employees) || !res.employees.length) {
+        await reply({
+          text:
+            `❌ لم يتم العثور على موظف يطابق: *"${empQuery}"*\n` +
+            `💡 يمكنك البحث بالاسم بالعربية أو الإنجليزية أو بكود البصمة (مثال: *حضور كرم* أو *حضور ميلاد* أو *حضور 22*).\n` +
+            `ولسحب أحدث البصمات من الماكينات أرسل: *سحب البصمات*`,
+        });
+        return;
+      }
+
+      const dayNameAr = (ymd) => {
+        try {
+          const dt = new Date(`${ymd}T12:00:00`);
+          return dt.toLocaleDateString('ar-EG', { weekday: 'long' });
+        } catch (_) {
+          return '';
+        }
+      };
+
+      const lines = [
+        `👆 *تقرير حضور وانصراف الموظف (آخر 7 أيام عمل)*`,
+        `🔎 البحث: *"${empQuery}"*${res.total_matched > 1 ? ` (مطابق لـ ${res.total_matched} موظفين)` : ''}`,
+      ];
+
+      for (const emp of res.employees) {
+        lines.push(`━━━━━━━━━━━━━━━━━━━━`);
+        lines.push(`👤 *${emp.employee_name || `موظف #${emp.employee_id}`}* (كود: \`${emp.employee_id}\`)`);
+        lines.push(`🏢 ${emp.branch_name || 'المقر الرئيسي'} — ${emp.device_name || 'ماكينة البصمة'}`);
+        if (!emp.days || !emp.days.length) {
+          lines.push(`⚪ لا توجد حركات بصمة مسجلة لهذا الموظف في السجل المسحوب حالياً.`);
+          continue;
+        }
+        lines.push(`📅 *أيام الحضور المسجلة (${emp.days.length} أيام · إجمالي ${emp.total_punches} بصمة):*`);
+        for (const d of emp.days) {
+          const wDay = dayNameAr(d.day);
+          const dayLabel = wDay ? `${wDay} ${d.day}` : d.day;
+          if (d.check_out) {
+            lines.push(`   • *${dayLabel}:*\n     🟢 حضور: \`${d.check_in}\` ⬅ 🔴 انصراف: \`${d.check_out}\` (⏱ ${d.duration_text})`);
+          } else {
+            lines.push(`   • *${dayLabel}:* 🕒 بصمة الساعة \`${d.check_in}\`${d.punches_count > 1 ? ` (${d.punches_count} حركات: ${d.all_times.join(' ، ')})` : ''}`);
+          }
+        }
+      }
+      await reply({ text: lines.join('\n') });
+      pushLog(`تم الرد على استعلام حضور الموظف (${empQuery}) عبر واتساب`);
+      return;
     }
 
     // 3c. USB Storage Lock / Unlock command (single device or group): "قفل usb <device>" / "فتح usb <device>" / "قفل فلاشة <device>"
@@ -2065,6 +2218,18 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, bi
               }
             }
           }
+        }
+      }
+
+      // 4. Scheduled Executive Morning Brief (10:30 AM Cairo Time daily)
+      if (canSend && f.notify_morning_brief !== false) {
+        const cairoNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Cairo' }));
+        const hhmm = `${String(cairoNow.getHours()).padStart(2, '0')}:${String(cairoNow.getMinutes()).padStart(2, '0')}`;
+        const briefDayKey = `${cairoNow.getFullYear()}-${cairoNow.getMonth() + 1}-${cairoNow.getDate()}`;
+        if (hhmm === '10:30' && globalThis.__lastExecutiveMorningBriefDay !== briefDayKey) {
+          globalThis.__lastExecutiveMorningBriefDay = briefDayKey;
+          const briefText = await buildExecutiveMorningBriefText({ pullFreshBiometrics: true });
+          await sendToRecipients({ text: briefText }, 'إرسال التقرير الصباحي الموحّد للإدارة العليا (10:30 ص)');
         }
       }
     } catch (_) {}

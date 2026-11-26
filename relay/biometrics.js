@@ -525,6 +525,7 @@ async function queryZkTecoUdp({ host, port = 4370, commKey = 0, pullLogs = false
         cleanup();
 
         let logs = [];
+        let usersList = [];
         if (pullLogs) {
           let userMap = new Map();
           const userBuf = await fetchZkUdpBulkTable({
@@ -537,6 +538,9 @@ async function queryZkTecoUdp({ host, port = 4370, commKey = 0, pullLogs = false
           });
           if (userBuf && userBuf.length >= 12) {
             userMap = parseZkUsersBuffer(userBuf);
+            for (const [empId, empName] of userMap.entries()) {
+              if (empId && empName) usersList.push({ employee_id: empId, employee_name: empName });
+            }
           }
           const attBuf = await fetchZkUdpBulkTable({
             host,
@@ -559,6 +563,7 @@ async function queryZkTecoUdp({ host, port = 4370, commKey = 0, pullLogs = false
           serial_number: serialNumber,
           device_model: deviceModel,
           logs,
+          users: usersList,
         });
       } catch (e) {
         clearTimeout(timer);
@@ -1044,6 +1049,16 @@ export function createBiometricsManager({ db, onDeviceStatusChange = null }) {
       UNIQUE(device_id, employee_id, punch_time)
     );
     CREATE INDEX IF NOT EXISTS idx_bio_logs_ts ON biometric_logs(punch_ts DESC);
+
+    CREATE TABLE IF NOT EXISTS biometric_employees (
+      device_id TEXT NOT NULL,
+      employee_id TEXT NOT NULL,
+      employee_name TEXT NOT NULL,
+      branch_name TEXT DEFAULT '',
+      device_name TEXT DEFAULT '',
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(device_id, employee_id)
+    );
   `);
 
   // Runtime state tracker for offline/online transition notifications (avoids false alarms on single packet drop)
@@ -1317,6 +1332,21 @@ export function createBiometricsManager({ db, onDeviceStatusChange = null }) {
     for (const dev of targets) {
       try {
         const res = await probeSingleDeviceRaw(dev, true);
+        if (Array.isArray(res.users) && res.users.length > 0) {
+          const upEmp = db.prepare(`INSERT INTO biometric_employees
+            (device_id, employee_id, employee_name, branch_name, device_name, updated_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(device_id, employee_id) DO UPDATE SET
+              employee_name=excluded.employee_name,
+              branch_name=excluded.branch_name,
+              device_name=excluded.device_name,
+              updated_at=excluded.updated_at`);
+          for (const u of res.users) {
+            if (u.employee_id && u.employee_name) {
+              upEmp.run(dev.id, String(u.employee_id), String(u.employee_name), dev.branch_name || '', dev.name, nowMs);
+            }
+          }
+        }
         const pulledList = Array.isArray(res.logs) ? res.logs : [];
         let devInserted = 0;
         for (const item of pulledList) {
@@ -1424,6 +1454,273 @@ export function createBiometricsManager({ db, onDeviceStatusChange = null }) {
     };
   }
 
+  // Bidirectional Arabic <-> English phonetic name matcher for WhatsApp "حضور <اسم الموظف>"
+  const ARABIC_LATIN_NAME_PAIRS = [
+    ['كرم', ['karam', 'karm']],
+    ['ميلاد', ['melad', 'milad']],
+    ['مايكل', ['michael', 'mikael', 'micheal', 'michel']],
+    ['محمد', ['mouhamed', 'mohamed', 'mohammed', 'muhammad', 'mohamad']],
+    ['احمد', ['ahmed', 'ahmad']],
+    ['محمود', ['mahmoud', 'mahmod']],
+    ['وليد', ['walid', 'waleed']],
+    ['وهبه', ['wahba', 'wehba', 'wahbe']],
+    ['عربي', ['araby', 'arabi']],
+    ['فرحات', ['farahat', 'farhat']],
+    ['خلف', ['khalaf']],
+    ['نصيف', ['nasief', 'nassif', 'nasif']],
+    ['شنوده', ['shenoda', 'shenouda', 'shinoda']],
+    ['جاد', ['gad', 'jad']],
+    ['ابراهيم', ['ibrahim', 'ebrahem']],
+    ['يوسف', ['youssef', 'yousef', 'yousif', 'joseph']],
+    ['علي', ['ali', 'aly']],
+    ['حسن', ['hassan', 'hasan']],
+    ['حسين', ['hussein', 'hussien', 'husein']],
+    ['عمرو', ['amr', 'amro']],
+    ['عمر', ['omar']],
+    ['مصطفي', ['mostafa', 'mustafa', 'moustafa']],
+    ['جرجس', ['girgis', 'gerges', 'guirguis']],
+    ['مينا', ['mina', 'mena']],
+    ['ابانوب', ['abanoub', 'abanob']],
+    ['بيشوي', ['bishoy', 'beshoy']],
+    ['كيرلس', ['kirollos', 'kyrillos', 'kerolos']],
+    ['ماركو', ['marco', 'marko', 'mark']],
+    ['بيتر', ['peter', 'pierre']],
+    ['جون', ['john', 'jon']],
+    ['جورج', ['george', 'gorge']],
+    ['سامح', ['sameh']],
+    ['سامي', ['samy', 'sami']],
+    ['هاني', ['hany', 'hani']],
+    ['تامر', ['tamer']],
+    ['طارق', ['tarek', 'tariq']],
+    ['خالد', ['khaled', 'khalid']],
+    ['سعيد', ['saeed', 'said']],
+    ['سيد', ['sayed', 'elsayed']],
+    ['عبدالله', ['abdallah', 'abdullah']],
+    ['عبدالرحمن', ['abdelrahman', 'abdulrahman']],
+    ['زكي', ['zaki', 'zakee', 'zaky']],
+    ['طحاوي', ['tahawi', 'tahawy']],
+    ['شريف', ['sherif', 'shereef']],
+    ['اشرف', ['ashraf']],
+    ['ايمن', ['ayman', 'aiman']],
+    ['امير', ['amir', 'ameer']],
+    ['رامي', ['ramy', 'rami']],
+    [' وائل', ['wael']],
+    ['وائل', ['wael']],
+    ['كريم', ['karim', 'kareem']],
+    ['ياسر', ['yasser', 'yaser']],
+    ['مجدي', ['magdy', 'magdi']],
+    ['مدحت', ['medhat']],
+    ['عادل', ['adel']],
+    ['نبيل', ['nabil', 'nabeel']],
+    ['اسامه', ['osama', 'oussama']],
+    ['اسلام', ['islam', 'eslam']],
+    ['ايهاب', ['ehab', 'ihab']],
+    ['حسام', ['hossam', 'hosam']],
+    ['عصام', ['essam', 'esam']],
+    ['هشام', ['hesham', 'hisham']],
+  ];
+
+  function normalizeArabicName(s) {
+    return String(s || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ة/g, 'ه')
+      .replace(/ى/g, 'ي')
+      .replace(/ؤ/g, 'و')
+      .replace(/ئ/g, 'ي')
+      .replace(/[\u064B-\u065F]/g, '')
+      .replace(/\s+/g, ' ');
+  }
+
+  function expandNameTokenVariants(token) {
+    const norm = normalizeArabicName(token);
+    const out = new Set([norm]);
+    for (const [ar, latList] of ARABIC_LATIN_NAME_PAIRS) {
+      if (norm === ar || ar.includes(norm) || latList.includes(norm)) {
+        out.add(ar);
+        for (const l of latList) out.add(l);
+      }
+    }
+    return Array.from(out);
+  }
+
+  function searchEmployeeWeeklyAttendance(rawQuery, daysBack = 7) {
+    const qNorm = normalizeArabicName(rawQuery);
+    if (!qNorm) return { ok: false, error: 'يرجى كتابة اسم الموظف أو الكود بعد كلمة حضور' };
+
+    // Collect distinct employees from both biometric_employees and biometric_logs
+    const empMap = new Map(); // key: `${device_id}|${employee_id}` -> { device_id, device_name, branch_name, employee_id, employee_name }
+    const empRows = db.prepare('SELECT device_id, device_name, branch_name, employee_id, employee_name FROM biometric_employees').all();
+    for (const r of empRows) {
+      empMap.set(`${r.device_id}|${r.employee_id}`, {
+        device_id: r.device_id,
+        device_name: r.device_name || '',
+        branch_name: r.branch_name || '',
+        employee_id: String(r.employee_id),
+        employee_name: String(r.employee_name || ''),
+      });
+    }
+    const logEmpRows = db.prepare(`
+      SELECT device_id, MAX(device_name) AS device_name, MAX(branch_name) AS branch_name, employee_id, MAX(employee_name) AS employee_name
+      FROM biometric_logs
+      GROUP BY device_id, employee_id
+    `).all();
+    for (const r of logEmpRows) {
+      const k = `${r.device_id}|${r.employee_id}`;
+      const prev = empMap.get(k);
+      if (!prev || (!prev.employee_name && r.employee_name)) {
+        empMap.set(k, {
+          device_id: r.device_id,
+          device_name: r.device_name || (prev && prev.device_name) || '',
+          branch_name: r.branch_name || (prev && prev.branch_name) || '',
+          employee_id: String(r.employee_id),
+          employee_name: String(r.employee_name || (prev && prev.employee_name) || ''),
+        });
+      }
+    }
+
+    const queryWords = qNorm.split(' ').filter(Boolean);
+    const wordVariants = queryWords.map(expandNameTokenVariants);
+
+    const matchedEmployees = [];
+    for (const emp of empMap.values()) {
+      if (emp.employee_id.toLowerCase() === qNorm) {
+        matchedEmployees.unshift({ ...emp, exact: true });
+        continue;
+      }
+      const hay = normalizeArabicName(`${emp.employee_name} ${emp.employee_id}`);
+      const allWordsMatch = wordVariants.every((variants) => variants.some((v) => hay.includes(v)));
+      if (allWordsMatch) {
+        matchedEmployees.push({ ...emp, exact: hay === qNorm });
+      }
+    }
+
+    if (!matchedEmployees.length) {
+      return { ok: true, found: false, query: rawQuery, employees: [] };
+    }
+
+    // Sort exact or shorter name matches first, and pick up to 4 employees
+    matchedEmployees.sort((a, b) => (b.exact ? 1 : 0) - (a.exact ? 1 : 0) || a.employee_name.length - b.employee_name.length);
+    const selected = matchedEmployees.slice(0, 4);
+
+    // Find latest timestamp in logs for relative 7-day window (plus current real clock)
+    const employeeReports = selected.map((emp) => {
+      const rows = db.prepare(`
+        SELECT punch_time, punch_ts, punch_type, verify_mode, device_name, branch_name
+        FROM biometric_logs
+        WHERE device_id=? AND employee_id=?
+        ORDER BY punch_ts DESC
+        LIMIT 120
+      `).all(emp.device_id, emp.employee_id);
+
+      const byDay = new Map(); // YYYY-MM-DD -> array of punches sorted ascending by time
+      for (const r of rows) {
+        const dayKey = String(r.punch_time || '').slice(0, 10);
+        if (!dayKey) continue;
+        if (!byDay.has(dayKey)) byDay.set(dayKey, []);
+        byDay.get(dayKey).push(r);
+      }
+
+      const dayKeys = Array.from(byDay.keys()).sort((a, b) => b.localeCompare(a)).slice(0, daysBack);
+      const days = dayKeys.map((day) => {
+        const list = byDay.get(day).sort((a, b) => a.punch_ts - b.punch_ts);
+        const firstPunch = list[0];
+        const lastPunch = list[list.length - 1];
+        const firstTime = String(firstPunch.punch_time || '').slice(11, 16);
+        const lastTime = String(lastPunch.punch_time || '').slice(11, 16);
+        const diffMs = Math.max(0, lastPunch.punch_ts - firstPunch.punch_ts);
+        const hasCheckOut = list.length > 1 && diffMs >= 15 * 60 * 1000;
+        const hrs = Math.floor(diffMs / 3600000);
+        const mins = Math.floor((diffMs % 3600000) / 60000);
+        return {
+          day,
+          punches_count: list.length,
+          check_in: firstTime,
+          check_out: hasCheckOut ? lastTime : '',
+          duration_text: hasCheckOut ? `${hrs}س و${mins}د` : '',
+          all_times: list.map((x) => String(x.punch_time || '').slice(11, 16)),
+        };
+      });
+
+      return {
+        ...emp,
+        total_punches: rows.length,
+        days,
+      };
+    });
+
+    return {
+      ok: true,
+      found: true,
+      query: rawQuery,
+      total_matched: matchedEmployees.length,
+      employees: employeeReports,
+    };
+  }
+
+  function getTodayAttendanceBrief() {
+    const todayPrefix = new Date().toLocaleDateString('sv-SE', { timeZone: 'Africa/Cairo' }); // YYYY-MM-DD in Cairo
+    let rows = db.prepare(`
+      SELECT employee_id, employee_name, device_name, branch_name, punch_time, punch_ts
+      FROM biometric_logs
+      WHERE punch_time LIKE ?
+      ORDER BY punch_ts ASC
+    `).all(`${todayPrefix}%`);
+
+    let activeDayLabel = `اليوم (${todayPrefix})`;
+    if (!rows.length) {
+      // Also check the latest active date in biometric_logs so the morning brief always shows the most recent active attendance day if no one punched yet at early morning
+      const latestRow = db.prepare('SELECT punch_time FROM biometric_logs ORDER BY punch_ts DESC LIMIT 1').get();
+      if (latestRow && latestRow.punch_time) {
+        const lastDay = String(latestRow.punch_time).slice(0, 10);
+        rows = db.prepare(`
+          SELECT employee_id, employee_name, device_name, branch_name, punch_time, punch_ts
+          FROM biometric_logs
+          WHERE punch_time LIKE ?
+          ORDER BY punch_ts ASC
+        `).all(`${lastDay}%`);
+        activeDayLabel = lastDay === todayPrefix ? `اليوم (${todayPrefix})` : `آخر يوم عمل مسجل (${lastDay})`;
+      }
+    }
+
+    const distinctEmp = new Map();
+    for (const r of rows) {
+      const k = `${r.device_name}|${r.employee_id}`;
+      if (!distinctEmp.has(k)) {
+        distinctEmp.set(k, r);
+      }
+    }
+    const firstPunch = rows[0] || null;
+    const lastPunch = rows.length ? rows[rows.length - 1] : null;
+    const totalRegisteredEmployees = db.prepare('SELECT COUNT(*) AS n FROM biometric_employees').get().n || 0;
+
+    return {
+      today_date: todayPrefix,
+      active_day_label: activeDayLabel,
+      is_today: activeDayLabel.startsWith('اليوم'),
+      present_employees_count: distinctEmp.size,
+      total_registered_employees: totalRegisteredEmployees,
+      total_punches: rows.length,
+      first_punch: firstPunch
+        ? {
+            name: firstPunch.employee_name || `موظف #${firstPunch.employee_id}`,
+            id: firstPunch.employee_id,
+            time: String(firstPunch.punch_time || '').slice(11, 16),
+            device: firstPunch.device_name,
+          }
+        : null,
+      last_punch: lastPunch
+        ? {
+            name: lastPunch.employee_name || `موظف #${lastPunch.employee_id}`,
+            id: lastPunch.employee_id,
+            time: String(lastPunch.punch_time || '').slice(11, 16),
+            device: lastPunch.device_name,
+          }
+        : null,
+    };
+  }
+
   // Automatic Local Subnet Scanner for ZKTeco (TCP 4370) & Hikvision Access Terminals (TCP 80 / 8000)
   async function scanLocalLanForBiometrics({ customSubnetPrefix = '' } = {}) {
     const prefixes = new Set();
@@ -1520,6 +1817,10 @@ export function createBiometricsManager({ db, onDeviceStatusChange = null }) {
           search: payload.search || '',
           limit: payload.limit || 300,
         });
+      case 'search_employee':
+        return searchEmployeeWeeklyAttendance(payload.query || '', payload.days || 7);
+      case 'today_brief':
+        return { ok: true, brief: getTodayAttendanceBrief() };
       case 'clear_logs': {
         const targetId = String(payload.device_id || payload.id || '').trim();
         if (targetId) {
@@ -1536,12 +1837,16 @@ export function createBiometricsManager({ db, onDeviceStatusChange = null }) {
     }
   }
 
-  // 24/7 Background Health Monitor every 30 seconds
+  // 24/7 Background Health Monitor every 30 seconds + Automatic Attendance Pull every 30 minutes
   setInterval(() => {
     checkAllDevicesHealth(true).catch(() => {});
   }, 30_000);
+  setInterval(() => {
+    pullAttendanceLogs({}).catch(() => {});
+  }, 30 * 60_000);
   setTimeout(() => {
     checkAllDevicesHealth(false).catch(() => {});
+    pullAttendanceLogs({}).catch(() => {});
   }, 3500);
 
   writeBioLog('INFO', 'ENGINE_BOOT', 'تم تشغيل محرك أجهزة البصمة والحضور والانصراف (ZKTeco TCP 4370 + Hikvision ISAPI + 24/7 Monitor)');
@@ -1555,6 +1860,8 @@ export function createBiometricsManager({ db, onDeviceStatusChange = null }) {
     checkAllDevicesHealth,
     pullAttendanceLogs,
     queryStoredLogs,
+    searchEmployeeWeeklyAttendance,
+    getTodayAttendanceBrief,
     scanLocalLanForBiometrics,
     handleAction,
   };
