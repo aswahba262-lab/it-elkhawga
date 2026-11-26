@@ -496,7 +496,17 @@ export function createDahuaCctvManager({ db }) {
         const lbl = String(d.label || d.hostname || '').toLowerCase();
         return lbl.includes(branchFirstWord);
       });
-      if (match) return match;
+      if (match) {
+        syncRouterIpFromDev(match);
+        return match;
+      }
+      // Even if the branch PC was seen earlier today (not within 120s), still sync its last known public IP if router_host is stale
+      const anyRecentBranchDev = allDevs
+        .filter((d) => String(d.label || d.hostname || '').toLowerCase().includes(branchFirstWord) && isPublicIpv4(d.ip))
+        .sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0))[0];
+      if (anyRecentBranchDev) {
+        syncRouterIpFromDev(anyRecentBranchDev);
+      }
     }
     // Fallback to primary record even if offline so caller can display a clear message
     return primary || backup || null;
@@ -574,6 +584,11 @@ export function createDahuaCctvManager({ db }) {
     try {
       const rows = db.prepare('SELECT * FROM cctv_dvrs WHERE enabled=1 ORDER BY created_at ASC').all();
       for (const dvr of rows) {
+        const prevRouterIp = dvr.router_host;
+        resolveActiveBridgeDevice(dvr);
+        if (dvr.router_host && dvr.router_host !== prevRouterIp) {
+          try { syncAndEnsureMediaMtxGateway(true); } catch (_) {}
+        }
         if (dvr.connection_mode === 'router' && dvr.router_host) {
           ensureRouterDirectStatus(dvr, false)
             .then((st) => {
@@ -3458,16 +3473,54 @@ export function createDahuaCctvManager({ db }) {
     return hub;
   }
 
-  function subscribeClientToFmp4Stream({ dvrId, channel = 1, hd = false, mode = 'copy', actor = '', role = 'super', req, res }) {
+  const rtspPortStatusCache = new Map(); // `${host}:${port}` -> { open: boolean, at: number }
+
+  function checkRtspTcpPortFast(host, port, timeoutMs = 1100) {
+    const key = `${host}:${port}`;
+    const nowMs = Date.now();
+    const cached = rtspPortStatusCache.get(key);
+    if (cached && nowMs - cached.at < 25_000) {
+      return Promise.resolve(cached.open);
+    }
+    return new Promise((resolve) => {
+      const sock = new net.Socket();
+      let done = false;
+      const finish = (open) => {
+        if (done) return;
+        done = true;
+        try { sock.destroy(); } catch (_) {}
+        rtspPortStatusCache.set(key, { open, at: Date.now() });
+        resolve(open);
+      };
+      sock.setTimeout(timeoutMs);
+      sock.on('connect', () => finish(true));
+      sock.on('error', () => finish(false));
+      sock.on('timeout', () => finish(false));
+      sock.connect(Number(port || 554), host);
+    });
+  }
+
+  async function subscribeClientToFmp4Stream({ dvrId, channel = 1, hd = false, mode = 'copy', actor = '', role = 'super', req, res }) {
     const dvr = getRawDvr(dvrId);
     if (!dvr) {
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: false, error: 'جهاز الـ DVR غير موجود' }));
       return;
     }
+    resolveActiveBridgeDevice(dvr);
     if (!canAdminAccessDvr(dvr, actor, role)) {
       res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: false, error: 'لا تملك صلاحية الوصول إلى كاميرات هذا الفرع' }));
+      return;
+    }
+
+    const isRouterMode = dvr.connection_mode === 'router' && dvr.router_host;
+    const rtspHost = isRouterMode ? String(dvr.router_host).trim() : String(dvr.host || '').trim();
+    const rtspPort = isRouterMode ? (Number(dvr.router_rtsp_port || 554) || 554) : (Number(dvr.rtsp_port || 554) || 554);
+    const rtspOpen = await checkRtspTcpPortFast(rtspHost, rtspPort, 1100);
+    if (!rtspOpen) {
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: false, error: `منفذ RTSP (${rtspHost}:${rtspPort}) غير مفتوح في راوتر الفرع — يتم التحويل تلقائياً لبورت HTTP (${dvr.router_http_port || 8085})` }));
       return;
     }
 
@@ -3524,8 +3577,16 @@ export function createDahuaCctvManager({ db }) {
   async function negotiateWebRtcWhep({ dvrId, channel = 1, hd = false, offerSdp = '', actor = '', role = 'super' }) {
     const dvr = getRawDvr(dvrId);
     if (!dvr) throw new Error('جهاز الـ DVR غير موجود');
+    resolveActiveBridgeDevice(dvr);
     if (!canAdminAccessDvr(dvr, actor, role)) {
       throw new Error('لا تملك صلاحية الوصول إلى كاميرات هذا الفرع');
+    }
+    const isRouterMode = dvr.connection_mode === 'router' && dvr.router_host;
+    const rtspHost = isRouterMode ? String(dvr.router_host).trim() : String(dvr.host || '').trim();
+    const rtspPort = isRouterMode ? (Number(dvr.router_rtsp_port || 554) || 554) : (Number(dvr.rtsp_port || 554) || 554);
+    const rtspOpen = await checkRtspTcpPortFast(rtspHost, rtspPort, 1100);
+    if (!rtspOpen) {
+      throw new Error(`منفذ RTSP (${rtspHost}:${rtspPort}) غير مفتوح في راوتر الفرع`);
     }
     if (!offerSdp || !String(offerSdp).includes('v=0')) {
       throw new Error('SDP Offer غير صالح');
