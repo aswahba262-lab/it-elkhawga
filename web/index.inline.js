@@ -5319,6 +5319,7 @@
     dvrId,
     channel,
     hd,
+    staggerMs = 0,
     videoEl,
     imgFallbackEl,
     statusOverlayEl,
@@ -5772,8 +5773,14 @@
           return;
         }
         // Default 'nextgen': Smart Zero-Transcode fMP4/MSE (handles both H.264 & H.265/HEVC natively at 0% CPU)
-        await tryFmp4MseStream('copy');
-        return;
+        // with automatic WebRTC WHEP fallback!
+        try {
+          await tryFmp4MseStream('copy');
+          return;
+        } catch (_) {
+          await tryWebRtcWhep();
+          return;
+        }
       } catch (err) {
         if (!cancelled) {
           scheduleReconnect((err && err.message) || 'تعذر الاتصال بالكاميرا');
@@ -5781,7 +5788,7 @@
       }
     };
 
-    const initialDelayMs = Math.max(0, Number(opts.staggerMs || 0));
+    const initialDelayMs = Math.max(0, Number(staggerMs || 0));
     if (initialDelayMs > 0) {
       retryTimer = setTimeout(startAttempt, initialDelayMs);
     } else {
