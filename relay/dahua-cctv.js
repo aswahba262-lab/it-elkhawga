@@ -1630,6 +1630,21 @@ export function createDahuaCctvManager({ db }) {
               }
             }
           } catch (_) {}
+          if (!verifiedDahua) {
+            try {
+              const titleResp = await dahuaAuthedGet({
+                host: rHost,
+                port: rPort,
+                pathWithQuery: '/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle',
+                username: dvr.username || 'admin',
+                password: dvr.password || '',
+                timeoutMs: 3200,
+              });
+              if (titleResp && titleResp.statusCode === 200) {
+                verifiedDahua = true;
+              }
+            } catch (_) {}
+          }
         }
         const state = {
           ok: tcpOpen && verifiedDahua,
@@ -3429,8 +3444,8 @@ export function createDahuaCctvManager({ db }) {
       '-loglevel', 'error',
       '-fflags', '+genpts+discardcorrupt',
       '-flags', 'low_delay',
-      '-probesize', '1000000',
-      '-analyzeduration', '3000000',
+      '-probesize', hd ? '1000000' : '350000',
+      '-analyzeduration', hd ? '2500000' : '1200000',
       '-rtsp_transport', 'tcp',
       '-timeout', '6000000',
       '-i', rtspUrl,
@@ -3457,8 +3472,8 @@ export function createDahuaCctvManager({ db }) {
     args.push(
       '-flush_packets', '1',
       '-f', 'mp4',
-      '-movflags', 'empty_moov+default_base_moof+omit_tfhd_offset',
-      '-frag_duration', '100000',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset',
+      '-frag_duration', '200000',
       'pipe:1'
     );
 
