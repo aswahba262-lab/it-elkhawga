@@ -278,6 +278,8 @@
       else { stopWaBotPoll(); }
       if (item.dataset.view === 'cameras') { openCamerasView(); }
       else { stopCctvWall(); }
+      if (item.dataset.view === 'biometrics') { openBiometricsView(); }
+      else { stopBiometricsPoll(); }
     });
   });
 
@@ -7956,6 +7958,673 @@
     }
   })();
 
+  /* ==========================================================================
+     Biometrics & Attendance Center (ZKTeco Port 4370 + Hikvision ISAPI)
+     ========================================================================== */
+  let bioDevices = [];
+  let bioLogs = [];
+  let bioSummary = { total_devices: 0, online_devices: 0, offline_devices: 0, total_logs: 0, today_logs: 0 };
+  let bioPollTimer = null;
+
+  async function callBiometricsApi(action, payload) {
+    const tok = (api && api.getAuthToken && api.getAuthToken()) || authToken || '';
+    const baseOrigin = resolveCctvRelayOrigin();
+    const directUrl = (baseOrigin || '') + '/api/biometrics/action';
+    if (tok && (location.port === '8790' || location.hostname === '127.0.0.1' || location.hostname === 'localhost' || !isNativeTauriOrigin)) {
+      try {
+        const resp = await fetch(directUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + tok,
+          },
+          body: JSON.stringify({ action, payload: payload || {} }),
+        });
+        if (resp && resp.ok) {
+          return await resp.json();
+        }
+      } catch (_) {}
+    }
+    if (api && typeof api.biometricsAction === 'function') {
+      return api.biometricsAction(action, payload || {});
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    if (tok) headers['Authorization'] = 'Bearer ' + tok;
+    const resp = await fetch('/api/rpc', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ cmd: 'biometrics_action', args: { action, payload: payload || {} } }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    return data.result;
+  }
+
+  function showBioBanner(msg, isError) {
+    const el = $('bioActionStatusBanner');
+    if (!el) return;
+    if (!msg) {
+      el.style.display = 'none';
+      return;
+    }
+    el.style.display = 'block';
+    el.style.background = isError ? 'rgba(239,68,68,0.12)' : 'rgba(16,185,129,0.12)';
+    el.style.border = isError ? '1px solid rgba(239,68,68,0.35)' : '1px solid rgba(16,185,129,0.35)';
+    el.style.color = isError ? '#ef4444' : '#10b981';
+    el.textContent = msg;
+  }
+
+  function updateBiometricsKpis() {
+    const total = Number(bioSummary.total_devices || bioDevices.length || 0);
+    const online = Number(bioSummary.online_devices != null ? bioSummary.online_devices : bioDevices.filter((d) => d.online).length);
+    const offline = Math.max(0, total - online);
+    const totalLogs = Number(bioSummary.total_logs != null ? bioSummary.total_logs : bioLogs.length);
+    const todayLogs = Number(bioSummary.today_logs || 0);
+
+    if ($('bioKpiTotalDevices')) $('bioKpiTotalDevices').textContent = String(total);
+    if ($('bioKpiOnlineDevices')) $('bioKpiOnlineDevices').textContent = String(online);
+    if ($('bioKpiOfflineDevices')) $('bioKpiOfflineDevices').textContent = String(offline);
+    if ($('bioKpiTotalLogs')) $('bioKpiTotalLogs').textContent = String(totalLogs);
+    if ($('bioKpiTodayLogsBadge')) $('bioKpiTodayLogsBadge').textContent = 'اليوم: ' + todayLogs;
+    if ($('navBiometricsCount')) {
+      $('navBiometricsCount').textContent = total > 0 ? (online + '/' + total) : '0';
+      $('navBiometricsCount').style.background = offline > 0 ? 'rgba(239,68,68,0.18)' : '';
+      $('navBiometricsCount').style.color = offline > 0 ? '#ef4444' : '';
+    }
+  }
+
+  function syncBioLogDeviceFilter() {
+    const sel = $('bioLogDeviceFilter');
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">كل ماكينات البصمة (' + bioDevices.length + ')</option>' +
+      bioDevices.map((d) => '<option value="' + esc(d.id) + '">' + esc(d.name) + (d.branch ? (' — ' + esc(d.branch)) : '') + '</option>').join('');
+    if (prev && bioDevices.some((d) => d.id === prev)) {
+      sel.value = prev;
+    }
+  }
+
+  function renderBiometricsDevices() {
+    const grid = $('bioDevicesGrid');
+    if (!grid) return;
+    if (!bioDevices.length) {
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1;">لا توجد ماكينات بصمة مضافة بعد — اضغط «➕ إضافة ماكينة بصمة (ZK / Hikvision)» أو «🔎 كشف تلقائي لأجهزة البصمة على الشبكة»</div>';
+      return;
+    }
+    const isViewer = String(currentAdminRole || '').toLowerCase() === 'viewer';
+    grid.innerHTML = bioDevices.map((d) => {
+      const isOnline = Boolean(d.online);
+      const vBadge = d.vendor === 'hikvision'
+        ? '<span class="badge blue mono">Hikvision ISAPI</span>'
+        : '<span class="badge violet mono">ZKTeco 4370</span>';
+      const statusBadge = isOnline
+        ? '<span class="badge green">🟢 متصل (' + Number(d.latency_ms || 1) + 'ms)</span>'
+        : '<span class="badge red">🔴 غير متصل / مفصول</span>';
+      const lastSeenStr = d.last_seen
+        ? new Date(d.last_seen).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : 'لم يتصل بعد';
+      const lastPullStr = d.last_pull_at
+        ? new Date(d.last_pull_at).toLocaleString('ar-EG', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        : 'لم يُسحب بعد';
+      const borderCol = isOnline ? 'rgba(16,185,129,0.38)' : 'rgba(239,68,68,0.45)';
+      return (
+        '<div class="card" style="margin-bottom:0;padding:14px;border:1.5px solid ' + borderCol + ';display:flex;flex-direction:column;justify-content:space-between;gap:10px;">' +
+          '<div>' +
+            '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;">' +
+              '<div>' +
+                '<div style="font-weight:900;font-size:15px;">👆 ' + esc(d.name) + '</div>' +
+                '<div class="hint" style="margin-top:2px;">🏢 ' + esc(d.branch || 'المقر الرئيسي') + '</div>' +
+              '</div>' +
+              '<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">' +
+                statusBadge +
+                vBadge +
+              '</div>' +
+            '</div>' +
+            '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;padding:9px 11px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border);font-size:12px;">' +
+              '<div><span style="color:var(--muted);">عنوان الـ IP:</span> <b class="mono" dir="ltr">' + esc(d.ip) + ':' + Number(d.port || 4370) + '</b></div>' +
+              '<div><span style="color:var(--muted);">الرقم التسلسلي:</span> <b class="mono" dir="ltr">' + esc(d.serial_number || '—') + '</b></div>' +
+              '<div><span style="color:var(--muted);">الطراز:</span> <b class="mono" dir="ltr">' + esc(d.device_model || (d.vendor === 'hikvision' ? 'Hikvision' : 'ZKTeco')) + '</b></div>' +
+              '<div><span style="color:var(--muted);">آخر ظهور:</span> <b>' + esc(lastSeenStr) + '</b></div>' +
+              '<div><span style="color:var(--muted);">البصمات المسحوبة:</span> <b class="mono" style="color:#8b5cf6;">' + Number(d.last_pull_count || 0) + '</b></div>' +
+              '<div><span style="color:var(--muted);">آخر سحب:</span> <b>' + esc(lastPullStr) + '</b></div>' +
+            '</div>' +
+            (!isOnline && d.last_error
+              ? '<div style="margin-top:7px;padding:6px 9px;border-radius:8px;background:rgba(239,68,68,0.1);color:#ef4444;font-size:11.5px;font-weight:700;">⚠️ السبب: ' + esc(d.last_error) + '</div>'
+              : '') +
+          '</div>' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;padding-top:8px;border-top:1px solid var(--border);">' +
+            '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+              '<button type="button" class="btn btn-primary btn-sm" data-bio-pull="' + esc(d.id) + '" style="background:linear-gradient(135deg,#059669,#10b981);border:none;">📥 سحب البصمات</button>' +
+              '<button type="button" class="btn btn-ghost btn-sm" data-bio-probe="' + esc(d.id) + '">🔌 فحص</button>' +
+            '</div>' +
+            (!isViewer
+              ? '<div style="display:flex;gap:5px;">' +
+                  '<button type="button" class="btn btn-ghost btn-sm" data-bio-edit="' + esc(d.id) + '" title="تعديل بيانات الماكينة">✏️</button>' +
+                  '<button type="button" class="btn btn-ghost btn-sm" data-bio-del="' + esc(d.id) + '" style="color:var(--danger);" title="حذف الماكينة">🗑</button>' +
+                '</div>'
+              : '') +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
+  }
+
+  function formatBioPunchType(t) {
+    const s = String(t || '');
+    if (s === 'check_in') return '<span class="badge green">🟢 حضور</span>';
+    if (s === 'check_out') return '<span class="badge gold">🟡 انصراف</span>';
+    if (s === 'break_out') return '<span class="badge gray">خروج راحة</span>';
+    if (s === 'break_in') return '<span class="badge blue">عودة راحة</span>';
+    if (s === 'overtime_in') return '<span class="badge violet">إضافي حضور</span>';
+    if (s === 'overtime_out') return '<span class="badge violet">إضافي انصراف</span>';
+    return '<span class="badge blue">' + esc(s || 'بصمة') + '</span>';
+  }
+
+  function formatBioVerifyMode(m) {
+    const s = String(m || '');
+    if (s === 'fingerprint') return '👆 بصمة إصبع';
+    if (s === 'face') return '😊 بصمة وجه';
+    if (s === 'card') return '💳 كارت ذكي';
+    if (s === 'password') return '🔢 كود سري';
+    return esc(s || '👆 بصمة');
+  }
+
+  function renderBiometricsLogs() {
+    const tbody = $('bioLogsTableBody');
+    if (!tbody) return;
+    const devFilter = ($('bioLogDeviceFilter') && $('bioLogDeviceFilter').value) || '';
+    const q = (($('bioLogSearchInput') && $('bioLogSearchInput').value) || '').trim().toLowerCase();
+
+    const filtered = bioLogs.filter((r) => {
+      if (devFilter && r.device_id !== devFilter) return false;
+      if (q) {
+        const hay = `${r.employee_id || ''} ${r.employee_name || ''} ${r.branch || ''} ${r.device_name || ''} ${r.punch_time || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    if (!filtered.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">لا توجد حركات بصمة مطابقة للبحث الحالي</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = filtered.slice(0, 350).map((r) => {
+      const vBadge = r.vendor === 'hikvision'
+        ? '<span class="badge blue mono">Hikvision</span>'
+        : '<span class="badge violet mono">ZKTeco</span>';
+      return (
+        '<tr>' +
+          '<td class="mono" style="font-weight:800;">' + esc(r.employee_id) + '</td>' +
+          '<td style="font-weight:700;">' + esc(r.employee_name || ('موظف #' + r.employee_id)) + '</td>' +
+          '<td>' + esc(r.branch || '—') + '</td>' +
+          '<td>' + esc(r.device_name || '—') + '</td>' +
+          '<td>' + vBadge + '</td>' +
+          '<td class="mono" dir="ltr" style="font-weight:700;">' + esc(r.punch_time) + '</td>' +
+          '<td>' + formatBioPunchType(r.punch_type) + '</td>' +
+          '<td>' + formatBioVerifyMode(r.verify_mode) + '</td>' +
+        '</tr>'
+      );
+    }).join('');
+  }
+
+  async function loadBiometricsOverview(silent) {
+    try {
+      const devId = ($('bioLogDeviceFilter') && $('bioLogDeviceFilter').value) || '';
+      const q = (($('bioLogSearchInput') && $('bioLogSearchInput').value) || '').trim();
+      const res = await callBiometricsApi('overview', { device_id: devId, search: q, limit: 350 });
+      if (res && res.ok) {
+        bioDevices = Array.isArray(res.devices) ? res.devices : [];
+        bioLogs = Array.isArray(res.logs) ? res.logs : [];
+        if (res.summary) bioSummary = res.summary;
+        updateBiometricsKpis();
+        syncBioLogDeviceFilter();
+        renderBiometricsDevices();
+        renderBiometricsLogs();
+      }
+    } catch (e) {
+      if (!silent) toast('تعذر تحميل بيانات أجهزة البصمة: ' + (e.message || e), 'error');
+    }
+  }
+
+  function openBiometricsView() {
+    loadBiometricsOverview(false);
+    if (bioPollTimer) clearInterval(bioPollTimer);
+    bioPollTimer = setInterval(() => {
+      if (!document.hidden && $('view-biometrics') && $('view-biometrics').classList.contains('active')) {
+        loadBiometricsOverview(true);
+      }
+    }, 15000);
+  }
+
+  function stopBiometricsPoll() {
+    if (bioPollTimer) {
+      clearInterval(bioPollTimer);
+      bioPollTimer = null;
+    }
+  }
+
+  function syncBioVendorFormFields() {
+    const vendor = ($('bioVendorSelect') && $('bioVendorSelect').value) || 'zk';
+    const isHik = vendor === 'hikvision';
+    if ($('bioHikvisionAuthRow')) {
+      $('bioHikvisionAuthRow').style.display = isHik ? 'grid' : 'none';
+    }
+    if ($('bioZkCommKeyWrap')) {
+      $('bioZkCommKeyWrap').style.display = isHik ? 'none' : '';
+    }
+    if ($('bioPortInput')) {
+      const curPort = Number($('bioPortInput').value || 0);
+      if (isHik && (curPort === 4370 || !curPort)) $('bioPortInput').value = '80';
+      if (!isHik && (curPort === 80 || !curPort)) $('bioPortInput').value = '4370';
+    }
+  }
+
+  function resetBioForm() {
+    if ($('bioEditIdInput')) $('bioEditIdInput').value = '';
+    if ($('bioNameInput')) $('bioNameInput').value = '';
+    if ($('bioBranchInput')) $('bioBranchInput').value = '';
+    if ($('bioVendorSelect')) $('bioVendorSelect').value = 'zk';
+    if ($('bioIpInput')) $('bioIpInput').value = '';
+    if ($('bioPortInput')) $('bioPortInput').value = '4370';
+    if ($('bioCommKeyInput')) $('bioCommKeyInput').value = '0';
+    if ($('bioUserInput')) $('bioUserInput').value = 'admin';
+    if ($('bioPassInput')) $('bioPassInput').value = '';
+    if ($('bioFormTitle')) $('bioFormTitle').textContent = '➕ إضافة ماكينة بصمة جديدة على الشبكة المحلية (ZKTeco / Hikvision)';
+    if ($('bioTestResultBanner')) $('bioTestResultBanner').style.display = 'none';
+    syncBioVendorFormFields();
+  }
+
+  (function bindBiometricsEvents() {
+    if ($('bioVendorSelect')) {
+      $('bioVendorSelect').addEventListener('change', syncBioVendorFormFields);
+    }
+    if ($('bioManageToggleBtn')) {
+      $('bioManageToggleBtn').addEventListener('click', () => {
+        const panel = $('bioManagePanel');
+        if (!panel) return;
+        const open = panel.style.display === 'none';
+        panel.style.display = open ? 'block' : 'none';
+        if (open) {
+          resetBioForm();
+          if ($('bioNameInput')) $('bioNameInput').focus();
+        }
+      });
+    }
+    if ($('bioCloseManageBtn')) {
+      $('bioCloseManageBtn').addEventListener('click', () => {
+        if ($('bioManagePanel')) $('bioManagePanel').style.display = 'none';
+      });
+    }
+    if ($('bioResetFormBtn')) {
+      $('bioResetFormBtn').addEventListener('click', resetBioForm);
+    }
+
+    if ($('bioTestConnBtn')) {
+      $('bioTestConnBtn').addEventListener('click', async () => {
+        const btn = $('bioTestConnBtn');
+        const banner = $('bioTestResultBanner');
+        const payload = {
+          id: ($('bioEditIdInput') && $('bioEditIdInput').value) || '',
+          name: ($('bioNameInput') && $('bioNameInput').value.trim()) || 'ماكينة بصمة',
+          branch: ($('bioBranchInput') && $('bioBranchInput').value.trim()) || '',
+          vendor: ($('bioVendorSelect') && $('bioVendorSelect').value) || 'zk',
+          ip: ($('bioIpInput') && $('bioIpInput').value.trim()) || '',
+          port: Number(($('bioPortInput') && $('bioPortInput').value) || 4370),
+          comm_key: ($('bioCommKeyInput') && $('bioCommKeyInput').value.trim()) || '0',
+          username: ($('bioUserInput') && $('bioUserInput').value.trim()) || 'admin',
+          password: ($('bioPassInput') && $('bioPassInput').value) || '',
+        };
+        if (!payload.ip) {
+          toast('يرجى إدخال عنوان الـ IP الداخلي لماكينة البصمة', 'error');
+          return;
+        }
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري فحص الاتصال...';
+        if (banner) {
+          banner.style.display = 'block';
+          banner.style.background = 'rgba(59,130,246,0.12)';
+          banner.style.border = '1px solid rgba(59,130,246,0.35)';
+          banner.style.color = '#38bdf8';
+          banner.textContent = '⏳ جاري الاتصال بالماكينة على ' + payload.ip + ':' + payload.port + ' ...';
+        }
+        try {
+          const res = await callBiometricsApi('test_device', payload);
+          if (res && res.ok) {
+            if (banner) {
+              banner.style.background = 'rgba(16,185,129,0.14)';
+              banner.style.border = '1px solid rgba(16,185,129,0.4)';
+              banner.style.color = '#10b981';
+              banner.textContent = '✅ متصلة بنجاح (' + Number(res.latency_ms || 1) + 'ms) · الطراز: ' + (res.device_model || payload.vendor.toUpperCase()) + (res.serial_number ? (' · S/N: ' + res.serial_number) : '');
+            }
+            toast('✅ ماكينة البصمة متصلة وتستجيب بنجاح');
+          } else {
+            if (banner) {
+              banner.style.background = 'rgba(239,68,68,0.14)';
+              banner.style.border = '1px solid rgba(239,68,68,0.4)';
+              banner.style.color = '#ef4444';
+              banner.textContent = '❌ تعذر الاتصال: ' + ((res && res.error) || 'تأكد من عنوان الـ IP والبورت وأن الماكينة تعمل على الشبكة');
+            }
+            toast((res && res.error) || 'تعذر الاتصال بماكينة البصمة', 'error');
+          }
+        } catch (err) {
+          if (banner) {
+            banner.style.background = 'rgba(239,68,68,0.14)';
+            banner.style.color = '#ef4444';
+            banner.textContent = '❌ خطأ: ' + (err.message || err);
+          }
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('bioSaveDeviceBtn')) {
+      $('bioSaveDeviceBtn').addEventListener('click', async () => {
+        const btn = $('bioSaveDeviceBtn');
+        const payload = {
+          id: ($('bioEditIdInput') && $('bioEditIdInput').value) || '',
+          name: ($('bioNameInput') && $('bioNameInput').value.trim()) || '',
+          branch: ($('bioBranchInput') && $('bioBranchInput').value.trim()) || '',
+          vendor: ($('bioVendorSelect') && $('bioVendorSelect').value) || 'zk',
+          ip: ($('bioIpInput') && $('bioIpInput').value.trim()) || '',
+          port: Number(($('bioPortInput') && $('bioPortInput').value) || 4370),
+          comm_key: ($('bioCommKeyInput') && $('bioCommKeyInput').value.trim()) || '0',
+          username: ($('bioUserInput') && $('bioUserInput').value.trim()) || 'admin',
+          password: ($('bioPassInput') && $('bioPassInput').value) || '',
+          enabled: true,
+        };
+        if (!payload.ip) {
+          toast('يرجى إدخال عنوان الـ IP لماكينة البصمة', 'error');
+          return;
+        }
+        if (!payload.name) {
+          payload.name = (payload.vendor === 'hikvision' ? 'بصمة Hikvision ' : 'بصمة ZKTeco ') + payload.ip;
+        }
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الحفظ والفحص...';
+        try {
+          const res = await callBiometricsApi('save_device', payload);
+          if (res && res.ok) {
+            bioDevices = Array.isArray(res.devices) ? res.devices : bioDevices;
+            if (res.summary) bioSummary = res.summary;
+            updateBiometricsKpis();
+            syncBioLogDeviceFilter();
+            renderBiometricsDevices();
+            if ($('bioManagePanel')) $('bioManagePanel').style.display = 'none';
+            resetBioForm();
+            toast('✓ تم حفظ ماكينة البصمة وفحص اتصالها على الشبكة');
+          } else {
+            toast((res && res.error) || 'فشل حفظ ماكينة البصمة', 'error');
+          }
+        } catch (err) {
+          toast('خطأ: ' + (err.message || err), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('bioProbeAllBtn')) {
+      $('bioProbeAllBtn').addEventListener('click', async () => {
+        const btn = $('bioProbeAllBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري الفحص...';
+        showBioBanner('⏳ جاري فحص حالة اتصال جميع ماكينات البصمة على الشبكة المحلية...', false);
+        try {
+          const res = await callBiometricsApi('probe_all', {});
+          if (res && res.ok) {
+            bioDevices = Array.isArray(res.devices) ? res.devices : bioDevices;
+            if (res.summary) bioSummary = res.summary;
+            updateBiometricsKpis();
+            renderBiometricsDevices();
+            const onCount = bioDevices.filter((d) => d.online).length;
+            showBioBanner('✅ اكتمل الفحص اللحظي: ' + onCount + ' متصل من إجمالي ' + bioDevices.length + ' ماكينة بصمة', false);
+            toast('✓ تم تحديث حالة اتصال ماكينات البصمة');
+          } else {
+            showBioBanner((res && res.error) || 'تعذر فحص الأجهزة', true);
+          }
+        } catch (err) {
+          showBioBanner('خطأ: ' + (err.message || err), true);
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('bioPullAllBtn')) {
+      $('bioPullAllBtn').addEventListener('click', async () => {
+        const btn = $('bioPullAllBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري سحب البصمات...';
+        showBioBanner('⏳ جاري الاتصال بماكينات البصمة وسحب سجلات الحضور والانصراف...', false);
+        try {
+          const res = await callBiometricsApi('pull_logs', {});
+          if (res && res.ok) {
+            if (Array.isArray(res.devices)) bioDevices = res.devices;
+            if (Array.isArray(res.logs)) bioLogs = res.logs;
+            if (res.summary) bioSummary = res.summary;
+            updateBiometricsKpis();
+            renderBiometricsDevices();
+            renderBiometricsLogs();
+            const msg = '✅ اكتمل سحب البصمات: إجمالي الحركات المقروءة (' + Number(res.total_pulled || 0) + ') · حركات جديدة تمت إضافتها للسيرفر (' + Number(res.total_inserted || 0) + ')';
+            showBioBanner(msg, false);
+            toast(msg);
+          } else {
+            showBioBanner((res && res.error) || 'تعذر سحب البصمات', true);
+            toast((res && res.error) || 'تعذر سحب البصمات', 'error');
+          }
+        } catch (err) {
+          showBioBanner('خطأ أثناء سحب البصمات: ' + (err.message || err), true);
+          toast('خطأ: ' + (err.message || err), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('bioAutoScanLanBtn')) {
+      $('bioAutoScanLanBtn').addEventListener('click', async () => {
+        const btn = $('bioAutoScanLanBtn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري مسح الشبكة...';
+        showBioBanner('🔎 جاري البحث التلقائي في الشبكة المحلية عن ماكينات بصمة ZKTeco (منفذ 4370)...', false);
+        try {
+          const res = await callBiometricsApi('scan_lan', {});
+          if (res && res.ok && Array.isArray(res.found)) {
+            if (!res.found.length) {
+              showBioBanner('ℹ️ لم يتم العثور تلقائياً على ماكينات ZKTeco على المنفذ 4370 في نفس النطاق — يمكنك إضافة الـ IP يدوياً (سواء ZK أو Hikvision).', false);
+            } else {
+              const ips = res.found.map((x) => x.ip + ':' + x.port).join(' ، ');
+              showBioBanner('✅ تم اكتشاف (' + res.found.length + ') ماكينة بصمة على الشبكة: ' + ips + ' — تم ملء أول جهاز في نموذج الإضافة.', false);
+              if ($('bioManagePanel')) $('bioManagePanel').style.display = 'block';
+              resetBioForm();
+              if ($('bioIpInput')) $('bioIpInput').value = res.found[0].ip;
+              if ($('bioPortInput')) $('bioPortInput').value = String(res.found[0].port || 4370);
+              if ($('bioNameInput')) $('bioNameInput').value = 'ماكينة بصمة ' + res.found[0].ip;
+            }
+          } else {
+            showBioBanner((res && res.error) || 'تعذر فحص الشبكة', true);
+          }
+        } catch (err) {
+          showBioBanner('خطأ: ' + (err.message || err), true);
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
+    }
+
+    if ($('bioExportCsvBtn')) {
+      $('bioExportCsvBtn').addEventListener('click', async () => {
+        const devId = ($('bioLogDeviceFilter') && $('bioLogDeviceFilter').value) || '';
+        const q = (($('bioLogSearchInput') && $('bioLogSearchInput').value) || '').trim();
+        const filtered = bioLogs.filter((r) => {
+          if (devId && r.device_id !== devId) return false;
+          if (q) {
+            const hay = `${r.employee_id || ''} ${r.employee_name || ''} ${r.branch || ''} ${r.device_name || ''} ${r.punch_time || ''}`.toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          return true;
+        });
+        if (!filtered.length) {
+          toast('لا توجد حركات بصمة حالياً لتصديرها', 'error');
+          return;
+        }
+        const rows = [
+          ['كود الموظف', 'اسم الموظف', 'الفرع / القسم', 'ماكينة البصمة', 'النوع', 'وقت البصمة', 'نوع الحركة', 'طريقة التحقق'].map(csvCell).join(','),
+        ];
+        filtered.forEach((r) => {
+          rows.push([
+            r.employee_id,
+            r.employee_name || ('موظف #' + r.employee_id),
+            r.branch || '—',
+            r.device_name || '—',
+            r.vendor === 'hikvision' ? 'Hikvision' : 'ZKTeco',
+            r.punch_time,
+            r.punch_type === 'check_out' ? 'انصراف' : 'حضور',
+            r.verify_mode || 'fingerprint',
+          ].map(csvCell).join(','));
+        });
+        await saveDownloadText(rows.join('\r\n'), 'Biometrics_Attendance_' + new Date().toISOString().slice(0, 10) + '.csv', 'text/csv;charset=utf-8');
+      });
+    }
+
+    if ($('bioLogDeviceFilter')) {
+      $('bioLogDeviceFilter').addEventListener('change', () => loadBiometricsOverview(true));
+    }
+    if ($('bioLogSearchInput')) {
+      $('bioLogSearchInput').addEventListener('input', () => renderBiometricsLogs());
+    }
+    if ($('bioRefreshLogsBtn')) {
+      $('bioRefreshLogsBtn').addEventListener('click', () => loadBiometricsOverview(false));
+    }
+
+    document.addEventListener('click', async (e) => {
+      const pullBtn = e.target.closest('[data-bio-pull]');
+      if (pullBtn) {
+        const id = pullBtn.getAttribute('data-bio-pull');
+        const dev = bioDevices.find((x) => x.id === id);
+        const orig = pullBtn.innerHTML;
+        pullBtn.disabled = true;
+        pullBtn.innerHTML = '<span class="spinner"></span> جاري السحب...';
+        showBioBanner('⏳ جاري سحب حركات البصمة من «' + ((dev && dev.name) || id) + '»...', false);
+        try {
+          const res = await callBiometricsApi('pull_logs', { id });
+          if (res && res.ok) {
+            if (Array.isArray(res.devices)) bioDevices = res.devices;
+            if (Array.isArray(res.logs)) bioLogs = res.logs;
+            if (res.summary) bioSummary = res.summary;
+            updateBiometricsKpis();
+            renderBiometricsDevices();
+            renderBiometricsLogs();
+            const firstRes = (Array.isArray(res.results) && res.results[0]) || {};
+            if (firstRes.ok === false) {
+              showBioBanner('⚠️ تعذر سحب البصمات من «' + ((dev && dev.name) || id) + '»: ' + (firstRes.error || 'غير متصل'), true);
+              toast(firstRes.error || 'تعذر السحب من الماكينة', 'error');
+            } else {
+              const msg = '✅ تم سحب (' + Number(res.total_pulled || 0) + ') حركة بصمة من «' + ((dev && dev.name) || id) + '» (منها ' + Number(res.total_inserted || 0) + ' جديدة)';
+              showBioBanner(msg, false);
+              toast(msg);
+            }
+          } else {
+            showBioBanner((res && res.error) || 'تعذر سحب البصمات', true);
+          }
+        } catch (err) {
+          showBioBanner('خطأ: ' + (err.message || err), true);
+        } finally {
+          pullBtn.disabled = false;
+          pullBtn.innerHTML = orig;
+        }
+        return;
+      }
+
+      const probeBtn = e.target.closest('[data-bio-probe]');
+      if (probeBtn) {
+        const id = probeBtn.getAttribute('data-bio-probe');
+        const orig = probeBtn.innerHTML;
+        probeBtn.disabled = true;
+        probeBtn.innerHTML = '...';
+        try {
+          const res = await callBiometricsApi('probe_one', { id });
+          if (res && res.ok) {
+            if (Array.isArray(res.devices)) bioDevices = res.devices;
+            if (res.summary) bioSummary = res.summary;
+            updateBiometricsKpis();
+            renderBiometricsDevices();
+            const d = res.device;
+            if (d && d.online) {
+              toast('🟢 «' + d.name + '» متصل (' + d.latency_ms + 'ms)');
+            } else {
+              toast('🔴 «' + ((d && d.name) || 'الجهاز') + '» غير متصل حالياً', 'error');
+            }
+          }
+        } catch (err) {
+          toast('خطأ: ' + (err.message || err), 'error');
+        } finally {
+          probeBtn.disabled = false;
+          probeBtn.innerHTML = orig;
+        }
+        return;
+      }
+
+      const editBtn = e.target.closest('[data-bio-edit]');
+      if (editBtn) {
+        const id = editBtn.getAttribute('data-bio-edit');
+        const d = bioDevices.find((x) => x.id === id);
+        if (!d) return;
+        if ($('bioManagePanel')) $('bioManagePanel').style.display = 'block';
+        if ($('bioEditIdInput')) $('bioEditIdInput').value = d.id;
+        if ($('bioNameInput')) $('bioNameInput').value = d.name || '';
+        if ($('bioBranchInput')) $('bioBranchInput').value = d.branch || '';
+        if ($('bioVendorSelect')) $('bioVendorSelect').value = d.vendor || 'zk';
+        if ($('bioIpInput')) $('bioIpInput').value = d.ip || '';
+        if ($('bioPortInput')) $('bioPortInput').value = String(d.port || (d.vendor === 'hikvision' ? 80 : 4370));
+        if ($('bioCommKeyInput')) $('bioCommKeyInput').value = d.comm_key || '0';
+        if ($('bioUserInput')) $('bioUserInput').value = d.username || 'admin';
+        if ($('bioPassInput')) {
+          $('bioPassInput').value = '';
+          $('bioPassInput').placeholder = d.has_password ? 'محفوظة (اتركها فارغة للإبقاء عليها)' : 'أدخل كلمة المرور';
+        }
+        if ($('bioFormTitle')) $('bioFormTitle').textContent = '✏️ تعديل بيانات ماكينة البصمة: ' + d.name;
+        syncBioVendorFormFields();
+        if ($('bioNameInput')) $('bioNameInput').focus();
+        return;
+      }
+
+      const delBtn = e.target.closest('[data-bio-del]');
+      if (delBtn) {
+        const id = delBtn.getAttribute('data-bio-del');
+        const d = bioDevices.find((x) => x.id === id);
+        if (!window.confirm('هل أنت متأكد من حذف ماكينة البصمة «' + ((d && d.name) || id) + '»؟')) return;
+        try {
+          const res = await callBiometricsApi('delete_device', { id });
+          if (res && res.ok) {
+            bioDevices = Array.isArray(res.devices) ? res.devices : [];
+            if (res.summary) bioSummary = res.summary;
+            updateBiometricsKpis();
+            syncBioLogDeviceFilter();
+            renderBiometricsDevices();
+            toast('🗑 تم حذف ماكينة البصمة');
+          } else {
+            toast((res && res.error) || 'فشل الحذف', 'error');
+          }
+        } catch (err) {
+          toast('خطأ: ' + (err.message || err), 'error');
+        }
+      }
+    });
+  })();
+
   /* ---------- Init ---------- */
   let visibilityHookBound = false;
   async function bootDashboardData() {
@@ -7985,6 +8654,7 @@
       loadAdminUsers(),
       loadWaBotStatus(true),
       loadCctvDvrs(false),
+      loadBiometricsOverview(true),
     ]).catch(() => {});
 
     startBlockedAttempts();

@@ -754,7 +754,7 @@ pub fn run_capture_agent() {
         if !is_admin_mode() {
             let win = crate::common::inspect_upload_windows_ext();
             fast_dialog_poll = win.browser_open_dialog || win.any_open_dialog;
-            let _dialog_just_opened = !prev_dialog_seen && win.browser_open_dialog;
+            let dialog_just_opened = !prev_dialog_seen && win.browser_open_dialog;
             prev_dialog_seen = win.browser_open_dialog;
 
             let prev_browser_dialog = was_browser_dialog_open && !win.browser_open_dialog;

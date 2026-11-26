@@ -23,11 +23,13 @@ const DEFAULT_FEATURES = {
   notify_server_health: false,
   notify_cctv_health: false,
   notify_cctv_schedule: false,
+  notify_biometrics_offline: true,
   // الأوامر التفاعلية من واتساب المدير (جميعها متوقفة افتراضياً ليختار المدير ما يشاء)
   cmd_status: false,
   cmd_screenshot: false,
   cmd_camera: false,
   cmd_cctv: false,
+  cmd_biometrics: true,
   cmd_block_unblock: false,
   cmd_usb: false,
   cmd_group_control: false,
@@ -185,7 +187,11 @@ function lanAdminRequest(method, subPath, bodyObj = null) {
   });
 }
 
-export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null }) {
+export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null, biometrics = null }) {
+  let bioManager = biometrics;
+  function setBiometricsManager(mgr) {
+    bioManager = mgr;
+  }
   const authDir = path.join(dataDir, 'wa-bot-auth');
   const configPath = path.join(dataDir, 'wa-bot-config.json');
   const heartbeatPath = path.join(dataDir, 'wa-bot-heartbeat.json');
@@ -768,6 +774,37 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null }) 
     } catch (_) {}
   }
 
+  async function onBiometricStatusEvent({ kind, device }) {
+    try {
+      if (!config.enabled || state !== 'connected' || !device) return;
+      const f = config.features || {};
+      if (f.notify_biometrics_offline === false) return;
+      const vendorLabel = String(device.vendor || '').toLowerCase() === 'hikvision' ? 'Hikvision' : 'ZKTeco';
+      const branchTxt = device.branch_name ? ` (${device.branch_name})` : '';
+      if (kind === 'offline') {
+        const text =
+          `🔴 *تنبيه فصل جهاز بصمة — IT ELKHAWGA*\n` +
+          `━━━━━━━━━━━━━━\n` +
+          `👆 *جهاز البصمة:* ${device.name}${branchTxt}\n` +
+          `🏷️ *النوع:* ${vendorLabel}\n` +
+          `🌐 *العنوان:* \`${device.host}:${device.port}\`\n` +
+          `⚠️ *الحالة:* غير متصل بالشبكة المحلية الآن!\n` +
+          `🕒 *الوقت:* ${formatCairoTime(Date.now())}`;
+        await sendToRecipients({ text }, `تنبيه انقطاع جهاز البصمة (${device.name})`, 'warn');
+      } else if (kind === 'online') {
+        const text =
+          `🟢 *عودة اتصال جهاز بصمة — IT ELKHAWGA*\n` +
+          `━━━━━━━━━━━━━━\n` +
+          `👆 *جهاز البصمة:* ${device.name}${branchTxt}\n` +
+          `🏷️ *النوع:* ${vendorLabel}\n` +
+          `🌐 *العنوان:* \`${device.host}:${device.port}\`\n` +
+          `⚡ *زمن الاستجابة:* ${device.latency_ms || 5} ms\n` +
+          `🕒 *الوقت:* ${formatCairoTime(Date.now())}`;
+        await sendToRecipients({ text }, `إشعار عودة اتصال جهاز البصمة (${device.name})`);
+      }
+    } catch (_) {}
+  }
+
   async function getMergedDevices() {
     const byId = new Map();
     const nowMs = Date.now();
@@ -984,6 +1021,7 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null }) 
       f.cmd_screenshot ||
       f.cmd_camera ||
       f.cmd_cctv ||
+      f.cmd_biometrics !== false ||
       f.cmd_block_unblock ||
       f.cmd_usb ||
       f.cmd_group_control ||
@@ -1040,6 +1078,10 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null }) 
       if (f.cmd_cctv) {
         cmds.push('• *داهوا* ⬅ عرض قائمة الفروع والمخازن المربوطة');
         cmds.push('• *داهوا <اسم الفرع> <رقم الكاميرا>* ⬅ لقطة HD فورية من الـ DVR');
+      }
+      if (f.cmd_biometrics !== false) {
+        cmds.push('• *بصمات* أو *حالة البصمات* ⬅ حالة اتصال أجهزة البصمة (ZK & Hikvision)');
+        cmds.push('• *سحب البصمات* ⬅ سحب حركات الحضور والانصراف من جميع أجهزة البصمة فوراً');
       }
       if (f.cmd_block_unblock) {
         cmds.push('• *قفل <اسم الجهاز>* ⬅ حجب الإنترنت عن الجهاز');
@@ -1369,6 +1411,92 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null }) 
         await reply({ text: `⚠️ تعذر سحب صورة الكاميرا: ${(e && e.message) || 'تأكد من اتصال الفرع والـ DVR'}` });
       }
       return;
+    }
+
+    // 3b3. Biometrics Attendance Devices Status & Pull Logs commands ("بصمات" / "حالة البصمات" / "سحب البصمات")
+    const bioStatusMatch = ['بصمات', 'البصمات', 'بصمة', 'البصمة', 'حالة البصمات', 'حاله البصمات', 'اجهزة البصمة', 'أجهزة البصمة', 'biometrics'].includes(lower);
+    const bioPullMatch = ['سحب البصمات', 'سحب بصمات', 'سحب الحضور', 'تحديث البصمات', 'pull biometrics'].includes(lower)
+      ? { all: true, query: '' }
+      : (normalized.match(/^(?:سحب بصمة|سحب بصمات)\s+(.+)$/i)
+        ? { all: false, query: normalized.replace(/^(?:سحب بصمة|سحب بصمات)\s+/i, '').trim() }
+        : null);
+
+    if (bioStatusMatch || bioPullMatch) {
+      if (f.cmd_biometrics === false) {
+        await reply({ text: '⚠️ أوامر أجهزة البصمة عبر واتساب متوقفة حالياً من إعدادات البوت.' });
+        return;
+      }
+      if (!bioManager) {
+        await reply({ text: '⚠️ خدمة أجهزة البصمة غير مهيأة حالياً.' });
+        return;
+      }
+      if (bioStatusMatch) {
+        const st = await bioManager.checkAllDevicesHealth(false);
+        const devs = st.devices || [];
+        if (!devs.length) {
+          await reply({ text: '👆 لم تتم إضافة أي جهاز بصمة بعد — افتح تبويب «👆 أجهزة البصمة» في لوحة الإدارة لإضافة أجهزة ZKTeco و Hikvision.' });
+          return;
+        }
+        const sum = st.summary || {};
+        const lines = [
+          `👆 *حالة أجهزة البصمة والحضور (${devs.length} جهاز)*`,
+          `🟢 متصل: *${sum.online_devices || 0}* | 🔴 غير متصل: *${sum.offline_devices || 0}*`,
+          `📊 إجمالي الحركات المسحوبة: *${sum.total_logs || 0}* (اليوم: *${sum.today_logs || 0}*)`,
+          `━━━━━━━━━━━━━━`,
+        ];
+        for (const d of devs) {
+          const icon = d.online ? '🟢' : '🔴';
+          const vTag = d.vendor === 'hikvision' ? 'Hikvision' : 'ZKTeco';
+          const brTxt = d.branch_name ? ` (${d.branch_name})` : '';
+          const stateTxt = d.online ? `متصل (${d.latency_ms}ms)` : `مفصول (${d.last_error || 'غير متصل'})`;
+          lines.push(`${icon} *${d.name}*${brTxt} [${vTag}]\n   🌐 \`${d.host}:${d.port}\` — ${stateTxt}`);
+        }
+        lines.push(`━━━━━━━━━━━━━━`);
+        lines.push(`💡 لسحب حركات البصمة الآن أرسل: *سحب البصمات*`);
+        await reply({ text: lines.join('\n') });
+        pushLog('تم الرد على استعلام حالة أجهزة البصمة عبر واتساب');
+        return;
+      }
+
+      if (bioPullMatch) {
+        const list = (bioManager.listDevices().devices || []);
+        if (!list.length) {
+          await reply({ text: '👆 لا توجد أجهزة بصمة مضافة بعد.' });
+          return;
+        }
+        let targetId = '';
+        if (!bioPullMatch.all && bioPullMatch.query) {
+          const q = bioPullMatch.query.toLowerCase();
+          const matched = list.find((d) => d.name.toLowerCase().includes(q) || (d.branch_name || '').toLowerCase().includes(q) || d.host === q);
+          if (!matched) {
+            await reply({ text: `❌ لم يتم العثور على جهاز بصمة يطابق: "${bioPullMatch.query}"` });
+            return;
+          }
+          targetId = matched.id;
+        }
+        await reply({ text: `⏳ جاري الاتصال بأجهزة البصمة على الشبكة المحلية وسحب سجلات الحضور والانصراف...` });
+        try {
+          const pullRes = await bioManager.pullAttendanceLogs({ deviceId: targetId });
+          const lines = [
+            `✅ *اكتمل سحب سجلات البصمة بنجاح*`,
+            `📥 إجمالي الحركات المقروءة: *${pullRes.total_pulled || 0}*`,
+            `🆕 حركات جديدة حُفظت بالسيرفر: *${pullRes.new_inserted || 0}*`,
+            `━━━━━━━━━━━━━━`,
+          ];
+          for (const r of pullRes.results || []) {
+            if (r.ok) {
+              lines.push(`🟢 *${r.name}:* تم سحب ${r.pulled_count} حركة (${r.new_count} جديدة · إجمالي مخزن ${r.total_stored})`);
+            } else {
+              lines.push(`🔴 *${r.name}:* تعذر السحب (${r.error})`);
+            }
+          }
+          await reply({ text: lines.join('\n') });
+          pushLog('تم سحب سجلات البصمات بأمر واتساب');
+        } catch (err) {
+          await reply({ text: `⚠️ تعذر سحب البصمات: ${(err && err.message) || err}` });
+        }
+        return;
+      }
     }
 
     // 3c. USB Storage Lock / Unlock command (single device or group): "قفل usb <device>" / "فتح usb <device>" / "قفل فلاشة <device>"
@@ -1965,5 +2093,7 @@ export function createWhatsAppBot({ db, dataDir, getArchiveRoot, cctv = null }) 
     onAlert,
     onErpBackupEvent,
     onServerHealthEvent,
+    onBiometricStatusEvent,
+    setBiometricsManager,
   };
 }

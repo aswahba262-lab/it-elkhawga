@@ -181,6 +181,11 @@
           كاميرات الفروع
           <span class="nav-count" id="navCctvCount">0</span>
         </button>
+        <button class="nav-item" id="navBiometricsItem" data-view="biometrics" data-title="أجهزة البصمة والحضور والانصراف (ZKTeco &amp; Hikvision)" data-sub="مراقبة اتصال ماكينات البصمة لحظياً على الشبكة المحلية، سحب سجلات الحضور والانصراف، وتنبيهات واتساب عند الفصل">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"/></svg>
+          أجهزة البصمة
+          <span class="nav-count" id="navBiometricsCount">0</span>
+        </button>
         <button class="nav-item" data-view="relay" data-title="الربط السحابي" data-sub="ربط الأجهزة خارج الشبكة المحلية عبر Relay">
           <svg class="icon" viewBox="0 0 24 24"><path d="M12 3v6M12 15v6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M3 12h6M15 12h6M5.6 18.4l4.2-4.2M14.2 9.8l4.2-4.2"/></svg>
           الربط السحابي
@@ -1410,6 +1415,14 @@
               </div>
               <label class="switch"><input type="checkbox" data-wa-feat="notify_cctv_schedule"><span class="slider"></span></label>
             </div>
+
+            <div class="switch-row" style="padding:11px 13px;border-radius:11px;border:1px solid var(--border);background:var(--surface-2);">
+              <div>
+                <strong>👆 تنبيه فصل وعودة أجهزة البصمة (ZKTeco &amp; Hikvision)</strong>
+                <div class="hint" style="margin-top:2px;">يرسل تنبيهاً فورياً على واتساب عند فصل أي ماكينة بصمة عن الشبكة المحلية وإشعاراً عند عودتها للاتصال.</div>
+              </div>
+              <label class="switch"><input type="checkbox" data-wa-feat="notify_biometrics_offline"><span class="slider"></span></label>
+            </div>
           </div>
 
           <div style="font-weight:800;font-size:13.5px;color:var(--primary);margin-bottom:10px;">ثانياً: الأوامر التفاعلية من واتساب هاتفك إلى السيرفر (تقبل من أرقام الإدارة فقط — شغّل أو أوقف كل أمر على حدة)</div>
@@ -1524,6 +1537,14 @@
                 <div class="hint" style="margin-top:2px;">يسحب لقطة HD لأي فرع، أو <span class="mono">جولة</span> مصوّرة لكل الفروع، أو <span class="mono">هاردات</span> لفحص سلامة التسجيل.</div>
               </div>
               <label class="switch"><input type="checkbox" data-wa-feat="cmd_cctv"><span class="slider"></span></label>
+            </div>
+
+            <div class="switch-row" style="padding:11px 13px;border-radius:11px;border:1px solid var(--border);background:var(--surface-2);">
+              <div>
+                <strong>👆 أوامر حالة وسحب أجهزة البصمة (<span class="mono">بصمات</span> / <span class="mono">سحب البصمات</span>)</strong>
+                <div class="hint" style="margin-top:2px;">يفحص حالة اتصال كل ماكينات البصمة (ZK / Hikvision) أو يسحب حركات الحضور والانصراف فوراً عبر واتساب.</div>
+              </div>
+              <label class="switch"><input type="checkbox" data-wa-feat="cmd_biometrics"><span class="slider"></span></label>
             </div>
           </div>
 
@@ -1750,6 +1771,161 @@
 
         <!-- شاشة العرض الجدارية للكاميرات (CCTV Pro NVR Wall) -->
         <div id="cctvWallGrid" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;background:#030712;padding:6px;border-radius:12px;border:1px solid rgba(148,163,184,0.16);min-height:calc(100vh - 210px);align-content:stretch;"></div>
+        </div>
+      </section>
+
+      <!-- Biometrics & Attendance Center (ZKTeco + Hikvision) -->
+      <section class="view" id="view-biometrics">
+        <!-- 1. بطاقات المؤشرات السريعة لأجهزة البصمة -->
+        <div class="grid cols-4" style="gap:12px;margin-bottom:14px;">
+          <div class="card" style="margin-bottom:0;padding:14px 16px;border-right:4px solid #3b82f6;">
+            <div style="font-size:12px;color:var(--muted);font-weight:700;">👆 إجمالي ماكينات البصمة</div>
+            <div id="bioKpiTotalDevices" class="mono" style="font-size:26px;font-weight:900;margin-top:4px;">0</div>
+            <div class="hint" style="margin-top:2px;font-size:11px;">ZKTeco (4370) &amp; Hikvision ISAPI</div>
+          </div>
+          <div class="card" style="margin-bottom:0;padding:14px 16px;border-right:4px solid #10b981;">
+            <div style="font-size:12px;color:var(--muted);font-weight:700;">🟢 متصل الآن على الشبكة</div>
+            <div id="bioKpiOnlineDevices" class="mono" style="font-size:26px;font-weight:900;color:#10b981;margin-top:4px;">0</div>
+            <div class="hint" style="margin-top:2px;font-size:11px;">مراقبة نبض تلقائية كل 30 ثانية</div>
+          </div>
+          <div class="card" style="margin-bottom:0;padding:14px 16px;border-right:4px solid #ef4444;">
+            <div style="font-size:12px;color:var(--muted);font-weight:700;">🔴 غير متصل / مفصول</div>
+            <div id="bioKpiOfflineDevices" class="mono" style="font-size:26px;font-weight:900;color:#ef4444;margin-top:4px;">0</div>
+            <div class="hint" style="margin-top:2px;font-size:11px;">تنبيه واتساب فوري عند الفصل</div>
+          </div>
+          <div class="card" style="margin-bottom:0;padding:14px 16px;border-right:4px solid #8b5cf6;">
+            <div style="font-size:12px;color:var(--muted);font-weight:700;">📥 إجمالي البصمات المسحوبة</div>
+            <div style="display:flex;align-items:baseline;gap:8px;margin-top:4px;">
+              <span id="bioKpiTotalLogs" class="mono" style="font-size:26px;font-weight:900;color:#8b5cf6;">0</span>
+              <span id="bioKpiTodayLogsBadge" class="badge blue" style="font-size:11px;">اليوم: 0</span>
+            </div>
+            <div class="hint" style="margin-top:2px;font-size:11px;">محفوظة بقاعدة بيانات السيرفر</div>
+          </div>
+        </div>
+
+        <!-- 2. شريط الإجراءات والتحكم السريع -->
+        <div class="card" style="margin-bottom:14px;padding:12px 16px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-primary btn-sm" id="bioPullAllBtn" style="background:linear-gradient(135deg,#059669,#10b981);border:none;font-weight:800;">📥 سحب البصمات من جميع الأجهزة الآن</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="bioProbeAllBtn">🔄 فحص حالة الاتصال الآن</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="bioAutoScanLanBtn">🔎 كشف تلقائي لأجهزة البصمة على الشبكة</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="bioExportCsvBtn">📊 تصدير سجل البصمات Excel (CSV)</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-primary btn-sm" id="bioManageToggleBtn">➕ إضافة ماكينة بصمة (ZK / Hikvision)</button>
+            </div>
+          </div>
+          <div id="bioActionStatusBanner" style="display:none;margin-top:10px;padding:10px 14px;border-radius:10px;font-size:12.5px;font-weight:700;"></div>
+        </div>
+
+        <!-- 3. نموذج إضافة / تعديل جهاز بصمة (قابل للطي) -->
+        <div class="card" id="bioManagePanel" style="display:none;margin-bottom:14px;border:1.5px solid rgba(59,130,246,0.35);">
+          <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <span id="bioFormTitle">➕ إضافة ماكينة بصمة جديدة على الشبكة المحلية (ZKTeco / Hikvision)</span>
+            <button type="button" class="btn btn-ghost btn-sm" id="bioCloseManageBtn">✕ إغلاق</button>
+          </div>
+
+          <input type="hidden" id="bioEditIdInput" value="">
+
+          <div class="grid cols-3" style="gap:12px;margin-bottom:12px;">
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">👆 اسم ماكينة البصمة</span>
+              <input type="text" class="input" id="bioNameInput" placeholder="مثال: بصمة الإدارة · بصمة فرع الدقي">
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">🏢 الفرع / القسم</span>
+              <input type="text" class="input" id="bioBranchInput" placeholder="مثال: المقر الرئيسي · فرع أكتوبر · المخزن">
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">🏷️ نوع الماكينة والبروتوكول</span>
+              <select class="input" id="bioVendorSelect" style="font-weight:700;">
+                <option value="zk" selected>🟢 ZKTeco Attendance (TCP Port 4370)</option>
+                <option value="hikvision">🔵 Hikvision Access / Fingerprint (ISAPI HTTP Port 80)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="grid cols-3" style="gap:12px;margin-bottom:12px;">
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">🌐 عنوان الـ IP على الشبكة المحلية</span>
+              <input type="text" class="input mono" id="bioIpInput" dir="ltr" placeholder="192.168.1.201">
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">🔌 رقم البورت (4370 لـ ZK · 80 لـ Hikvision)</span>
+              <input type="number" class="input mono" id="bioPortInput" dir="ltr" value="4370" min="1" max="65535">
+            </div>
+            <div class="field" style="margin-bottom:0;" id="bioZkCommKeyWrap">
+              <span class="label">🔑 مفتاح الاتصال (CommKey — الافتراضي 0)</span>
+              <input type="text" class="input mono" id="bioCommKeyInput" dir="ltr" value="0" placeholder="0">
+            </div>
+          </div>
+
+          <div class="grid cols-2" id="bioHikvisionAuthRow" style="display:none;gap:12px;margin-bottom:12px;padding:12px;border-radius:10px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.25);">
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">👤 اسم مستخدم جهاز Hikvision</span>
+              <input type="text" class="input mono" id="bioUserInput" dir="ltr" value="admin" placeholder="admin">
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <span class="label">🔒 كلمة مرور جهاز Hikvision</span>
+              <input type="password" class="input mono" id="bioPassInput" dir="ltr" placeholder="أدخل كلمة مرور ماكينة Hikvision">
+            </div>
+          </div>
+
+          <div id="bioTestResultBanner" style="display:none;margin-bottom:12px;padding:10px 13px;border-radius:10px;font-size:12.5px;font-weight:700;"></div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-ghost" id="bioTestConnBtn">🔌 اختبار الاتصال وقراءة الرقم التسلسلي</button>
+              <button type="button" class="btn btn-ghost" id="bioResetFormBtn">تفريغ الحقول</button>
+            </div>
+            <button type="button" class="btn btn-primary" id="bioSaveDeviceBtn">💾 حفظ ماكينة البصمة</button>
+          </div>
+        </div>
+
+        <!-- 4. قائمة وبطاقات حالة ماكينات البصمة المباشرة -->
+        <div class="card" style="margin-bottom:14px;">
+          <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <span>📡 حالة اتصال ماكينات البصمة على الشبكة المحلية (مباشر)</span>
+            <span class="hint" id="bioLastProbeHint" style="font-size:11.5px;">يتم الفحص التلقائي كل 30 ثانية مع إشعار واتساب فوري عند فصل أي ماكينة</span>
+          </div>
+          <div id="bioDevicesGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;">
+            <div class="empty">لا توجد أجهزة بصمة مضافة بعد — اضغط «➕ إضافة ماكينة بصمة» أو «🔎 كشف تلقائي على الشبكة»</div>
+          </div>
+        </div>
+
+        <!-- 5. جدول سجل حركات الحضور والانصراف المسحوبة -->
+        <div class="card">
+          <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:10px;">
+            <span>📋 سجل حركات البصمة المسحوبة (الحضور والانصراف)</span>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <select class="input" id="bioLogDeviceFilter" style="width:auto;min-width:180px;height:34px;padding:4px 10px;font-size:12.5px;">
+                <option value="">كل ماكينات البصمة</option>
+              </select>
+              <input type="text" class="input" id="bioLogSearchInput" placeholder="بحث بكود الموظف أو الاسم أو الفرع أو التاريخ..." style="width:240px;height:34px;font-size:12.5px;">
+              <button type="button" class="btn btn-ghost btn-sm" id="bioRefreshLogsBtn">↻ تحديث السجل</button>
+            </div>
+          </div>
+
+          <div class="table-wrap" style="max-height:460px;overflow:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>كود الموظف</th>
+                  <th>اسم الموظف</th>
+                  <th>الفرع / القسم</th>
+                  <th>ماكينة البصمة</th>
+                  <th>النوع</th>
+                  <th>وقت البصمة</th>
+                  <th>نوع الحركة</th>
+                  <th>طريقة التحقق</th>
+                </tr>
+              </thead>
+              <tbody id="bioLogsTableBody">
+                <tr><td colspan="8" class="empty">لا توجد حركات بصمة مسحوبة بعد — اضغط «📥 سحب البصمات من جميع الأجهزة الآن»</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 

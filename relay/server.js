@@ -8,6 +8,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { createWhatsAppBot } from './whatsapp-bot.js';
 import { createDahuaCctvManager } from './dahua-cctv.js';
+import { createBiometricsManager } from './biometrics.js';
 
 const lanKeepAliveAgent = new http.Agent({
   keepAlive: true,
@@ -381,6 +382,13 @@ compactDatabaseIfNeeded();
 
 const cctv = createDahuaCctvManager({ db });
 const waBot = createWhatsAppBot({ db, dataDir: DATA_DIR, getArchiveRoot, cctv });
+const biometrics = createBiometricsManager({
+  db,
+  onDeviceStatusChange: (ev) => {
+    waBot.onBiometricStatusEvent(ev).catch(() => {});
+  },
+});
+waBot.setBiometricsManager(biometrics);
 
 function storeAlertWithSeparatedMedia({ id, deviceId, type, severity, message, rawMeta, createdAt, ignoreExisting }) {
   let obj = {};
@@ -597,6 +605,7 @@ const LOG_FILES = {
   errors: path.join(PROJECT_LOGS_DIR, '06-errors-and-diagnostics.log'),
   audit: path.join(PROJECT_LOGS_DIR, '07-admin-audit-trail.log'),
   localAgent: path.join(PROJECT_LOGS_DIR, '08-local-server-and-agent.log'),
+  biometrics: path.join(PROJECT_LOGS_DIR, '09-biometrics-attendance.log'),
 };
 const logThrottleCache = new Map();
 
@@ -1540,6 +1549,97 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return json(res, 502, { ok: false, error: (e && e.message) || 'تعذر جلب إطار الكاميرا' });
       }
+    }
+
+    // ----- Biometrics & Attendance Center (ZKTeco Port 4370 + Hikvision ISAPI) -----
+    if (req.method === 'POST' && (url.pathname === '/api/v1/admin/biometrics/action' || url.pathname === '/api/biometrics/action')) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const body = await readBody(req).catch(() => ({}));
+      const act = String(body.action || '');
+      const role = isAdminKeyOk
+        ? String(body.role || 'super').toLowerCase()
+        : String((jwtVerified && jwtVerified.claims && jwtVerified.claims.role) || 'admin').toLowerCase();
+      if (role === 'viewer' && ['save_device', 'delete_device', 'clear_logs'].includes(act)) {
+        return json(res, 200, { ok: false, error: 'صلاحية المشاهدة فقط لا تسمح بإضافة أو حذف أجهزة البصمة' });
+      }
+      try {
+        const out = await biometrics.handleAction({
+          action: act,
+          payload: body.payload || {},
+        });
+        if (['save_device', 'delete_device', 'pull_logs'].includes(act)) {
+          const actor = isAdminKeyOk
+            ? String(body.actor || 'admin')
+            : String((jwtVerified && jwtVerified.claims && jwtVerified.claims.sub) || 'admin');
+          audit(actor, `biometrics_${act}`, String((body.payload && (body.payload.name || body.payload.ip || body.payload.id)) || 'all'), 'ok', {});
+        }
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 200, { ok: false, error: (e && e.message) || 'تعذر تنفيذ إجراء جهاز البصمة' });
+      }
+    }
+
+    if (req.method === 'GET' && (url.pathname === '/api/biometrics/export.csv' || url.pathname === '/api/v1/admin/biometrics/export.csv')) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && (hdrTok === ADMIN_KEY || qTok === ADMIN_KEY));
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const deviceId = String(url.searchParams.get('device_id') || '').trim();
+      const search = String(url.searchParams.get('search') || '').trim();
+      const rows = biometrics.listAttendanceLogs({ deviceId, search, limit: 5000 });
+      const csvCell = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+      const punchLabel = (t) => {
+        const s = String(t || '');
+        if (s === 'check_in') return 'حضور';
+        if (s === 'check_out') return 'انصراف';
+        if (s === 'break_out') return 'خروج راحة';
+        if (s === 'break_in') return 'عودة راحة';
+        if (s === 'overtime_in') return 'إضافي حضور';
+        if (s === 'overtime_out') return 'إضافي انصراف';
+        return s || 'بصمة';
+      };
+      const verifyLabel = (m) => {
+        const s = String(m || '');
+        if (s === 'fingerprint') return 'بصمة إصبع';
+        if (s === 'face') return 'بصمة وجه';
+        if (s === 'card') return 'كارت';
+        if (s === 'password') return 'رقم سري';
+        return s || 'بصمة';
+      };
+      const lines = [
+        ['كود الموظف', 'اسم الموظف', 'الفرع / القسم', 'ماكينة البصمة', 'النوع', 'وقت البصمة', 'نوع الحركة', 'طريقة التحقق'].map(csvCell).join(','),
+      ];
+      for (const r of rows) {
+        lines.push([
+          r.employee_id,
+          r.employee_name || `موظف #${r.employee_id}`,
+          r.branch || '—',
+          r.device_name || '—',
+          r.vendor === 'hikvision' ? 'Hikvision' : 'ZKTeco',
+          r.punch_time,
+          punchLabel(r.punch_type),
+          verifyLabel(r.verify_mode),
+        ].map(csvCell).join(','));
+      }
+      const csvBuf = Buffer.from('\uFEFF' + lines.join('\r\n'), 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Length': csvBuf.length,
+        'Content-Disposition': `attachment; filename="Biometrics_Attendance_${new Date().toISOString().slice(0, 10)}.csv"`,
+        'Access-Control-Allow-Origin': CORS_ORIGIN,
+      });
+      return res.end(csvBuf);
     }
 
     // ----- WhatsApp Bot Center -----
@@ -2719,6 +2819,27 @@ const server = http.createServer(async (req, res) => {
         const rpcArgs = (rpcBody && rpcBody.args) || {};
         const actor = String(jwtVerified.claims.sub || 'admin');
         const role = String(jwtVerified.claims.role || 'admin').toLowerCase();
+        if (rpcCmd === 'biometrics_action') {
+          const act = String(rpcArgs.action || '');
+          if (role === 'viewer' && ['save_device', 'delete_device', 'clear_logs'].includes(act)) {
+            return json(res, 200, {
+              ok: true,
+              result: { ok: false, success: false, error: 'صلاحية المشاهدة فقط لا تسمح بإضافة أو حذف أجهزة البصمة' },
+            });
+          }
+          try {
+            const out = await biometrics.handleAction({
+              action: act,
+              payload: rpcArgs.payload || {},
+            });
+            return json(res, 200, { ok: true, result: out });
+          } catch (e) {
+            return json(res, 200, {
+              ok: true,
+              result: { ok: false, success: false, error: (e && e.message) || 'تعذر تنفيذ إجراء جهاز البصمة' },
+            });
+          }
+        }
         if (rpcCmd === 'cctv_action' || rpcCmd === 'cctv_list_dvrs' || rpcCmd === 'cctv_get_frame_b64') {
           const st = cctv.getSettings();
           if (st.super_only && role !== 'super') {

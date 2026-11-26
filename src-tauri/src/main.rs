@@ -179,6 +179,7 @@ fn main() {
             commands::cctv_set_settings,
             commands::cctv_get_frame_b64,
             commands::cctv_action,
+            commands::biometrics_action,
             commands::enroll_relay,
             commands::disconnect_relay,
         ])

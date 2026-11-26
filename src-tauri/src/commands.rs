@@ -4118,6 +4118,15 @@ pub fn dispatch_web_rpc(
                 )
             }
         }
+        "biometrics_action" => {
+            let act = str_arg(args, "action");
+            let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+            if role == "viewer" && matches!(act.as_str(), "save_device" | "delete_device" | "clear_logs") {
+                fail("صلاحية المشاهدة فقط لا تسمح بإضافة أو حذف أجهزة البصمة")
+            } else {
+                biometrics_action_sync(act, payload, Some(actor), Some(role))
+            }
+        }
         _ => return (404, json!({"ok": false, "error": "أمر غير معروف"})),
     };
     (200, json!({"ok": true, "result": result_val}))
@@ -4306,6 +4315,26 @@ fn cctv_get_frame_b64_sync(dvr_id: String, channel: u32, hd: bool) -> Value {
 #[tauri::command]
 pub async fn cctv_get_frame_b64(dvr_id: String, channel: u32, hd: Option<bool>) -> Result<Value, String> {
     run_bg(move || cctv_get_frame_b64_sync(dvr_id, channel, hd.unwrap_or(false))).await
+}
+
+// ---------- Biometrics & Attendance Center Commands (ZKTeco + Hikvision) ----------
+
+fn biometrics_action_sync(action: String, payload: Value, actor: Option<String>, role: Option<String>) -> Value {
+    let body = json!({
+        "action": action,
+        "payload": payload,
+        "actor": actor.unwrap_or_default(),
+        "role": role.unwrap_or_else(|| "super".to_string()),
+    });
+    match relay_request("/api/v1/admin/biometrics/action", "POST", Some(&body)) {
+        Ok(v) => v,
+        Err(e) => fail(e),
+    }
+}
+
+#[tauri::command]
+pub async fn biometrics_action(action: String, payload: Option<Value>) -> Result<Value, String> {
+    run_bg(move || biometrics_action_sync(action, payload.unwrap_or_else(|| json!({})), None, Some("super".into()))).await
 }
 
 // Unused helpers kept for signature parity with the previous implementation.
