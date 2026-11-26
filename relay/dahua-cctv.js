@@ -3429,17 +3429,16 @@ export function createDahuaCctvManager({ db }) {
       '-loglevel', 'error',
       '-fflags', '+genpts+discardcorrupt',
       '-flags', 'low_delay',
-      '-probesize', '2000000',
-      '-analyzeduration', '4500000',
+      '-probesize', '1000000',
+      '-analyzeduration', '3000000',
       '-rtsp_transport', 'tcp',
       '-timeout', '6000000',
-      '-use_wallclock_as_timestamps', '1',
       '-i', rtspUrl,
       '-an',
     ];
 
     if (safeMode === 'copy') {
-      // Zero-Transcode Remuxing (-c:v copy): 0% CPU, original camera quality, lowest latency!
+      // Zero-Transcode Remuxing (-c:v copy): 0% CPU, original camera quality, exact 1.0x hardware RTP clock!
       args.push('-c:v', 'copy');
     } else {
       // On-demand ultrafast H.264 fallback ONLY if a client browser lacks hardware HEVC support
@@ -3456,9 +3455,10 @@ export function createDahuaCctvManager({ db }) {
     }
 
     args.push(
+      '-flush_packets', '1',
       '-f', 'mp4',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset',
-      '-frag_duration', '80000',
+      '-movflags', 'empty_moov+default_base_moof+omit_tfhd_offset',
+      '-frag_duration', '100000',
       'pipe:1'
     );
 

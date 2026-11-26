@@ -5424,17 +5424,21 @@
         bytesCounter = 0;
         lastMeasureAt = nowMs;
 
-        // Keep live latency tight (< 400ms in realtime mode, ~2.8s in smooth3s mode)
+        // Smooth steady playback at 1.0x natural speed without cyclic hard-seeks or buffer underruns:
+        // Only hard-seek if the tab was backgrounded and lag exceeded 8 seconds; otherwise keep a steady cushion
+        // and use a gentle 1.03x rate nudge only if lag drifts above the cushion threshold.
         if (videoEl.buffered && videoEl.buffered.length > 0) {
           const bufEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
           const lagSec = Math.max(0, bufEnd - videoEl.currentTime);
-          const maxAllowedLag = cctvBufferMode === 'smooth3s' ? 3.4 : 0.75;
-          const targetLag = cctvBufferMode === 'smooth3s' ? 2.6 : 0.18;
-          if (lagSec > maxAllowedLag) {
-            try { videoEl.currentTime = Math.max(0, bufEnd - targetLag); } catch (_) {}
-          } else if (cctvBufferMode === 'realtime' && lagSec > 0.38) {
-            try { videoEl.playbackRate = 1.06; } catch (_) {}
-          } else if (videoEl.playbackRate !== 1.0) {
+          const hardJumpThreshold = 8.0;
+          const gentleCatchupThreshold = cctvBufferMode === 'smooth3s' ? 4.2 : 2.6;
+          const steadyTargetLag = cctvBufferMode === 'smooth3s' ? 2.8 : 1.3;
+          if (lagSec > hardJumpThreshold) {
+            try { videoEl.currentTime = Math.max(0, bufEnd - steadyTargetLag); } catch (_) {}
+            try { if (videoEl.playbackRate !== 1.0) videoEl.playbackRate = 1.0; } catch (_) {}
+          } else if (lagSec > gentleCatchupThreshold) {
+            try { if (videoEl.playbackRate !== 1.03) videoEl.playbackRate = 1.03; } catch (_) {}
+          } else if (lagSec <= steadyTargetLag + 0.3 && videoEl.playbackRate !== 1.0) {
             try { videoEl.playbackRate = 1.0; } catch (_) {}
           }
         }
@@ -5659,8 +5663,17 @@
 
       sourceBuffer.addEventListener('updateend', () => {
         appending = false;
-        if (!startedPlayback && videoEl && videoEl.readyState >= 1) {
+        if (!startedPlayback && videoEl && videoEl.readyState >= 2) {
           startedPlayback = true;
+          try {
+            if (videoEl.buffered && videoEl.buffered.length > 0) {
+              const initEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
+              const initCushion = cctvBufferMode === 'smooth3s' ? 2.4 : 1.1;
+              if (initEnd > initCushion + 0.4) {
+                videoEl.currentTime = Math.max(0, initEnd - initCushion);
+              }
+            }
+          } catch (_) {}
           videoEl.play().catch(() => {});
           markVideoPlaying(
             remuxMode === 'copy' ? 'MSE 0-Copy' : 'MSE H.264',
