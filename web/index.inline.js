@@ -6715,17 +6715,33 @@
     box.style.display = 'flex';
   }
 
+  function syncCctvModeRowsUi(modeVal) {
+    const mode = modeVal || (($('cctvModeSelect') && $('cctvModeSelect').value) || 'router');
+    if ($('cctvRouterRow')) $('cctvRouterRow').style.display = mode === 'router' ? '' : 'none';
+    if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = (mode === 'router' || mode === 'bridge') ? '' : 'none';
+    if ($('cctvAutoDetectRouterIpBtn')) $('cctvAutoDetectRouterIpBtn').style.display = mode === 'router' ? '' : 'none';
+    if ($('cctvBridgeDeviceLabel')) {
+      $('cctvBridgeDeviceLabel').textContent = mode === 'router'
+        ? '💻 اختر أي كمبيوتر بالفرع على نفس الراوتر (لسحب ومزامنة الـ Public IP تلقائياً بدون جسر كاميرات)'
+        : '💻 اختر كمبيوتر الفرع المتصل على نفس راوتر الـ DVR';
+    }
+    if ($('cctvBridgeDeviceHint')) {
+      $('cctvBridgeDeviceHint').innerHTML = mode === 'router'
+        ? '💡 <b>في وضع راوتر الفرع المباشر (Auto-DDNS):</b> اختيار أي كمبيوتر في الفرع يملأ خانة الـ <b>Public IP</b> فوراً ويحدّثها تلقائياً كلما تغيّر IP الراوتر، مع <b>0% استهلاك</b> من جهاز الموظف (البث يمر 100% من الراوتر مباشرةً).'
+        : 'يعمل برنامج <b>IT ELKHAWGA Client v1.1.0</b> على جهاز الفرع كجسر محلي آمن لجلب البث وفحص الهارد واسترجاع المقاطع لحظة الطلب فقط دون الحاجة لـ Static IP.';
+    }
+  }
+
   function resetCctvForm() {
     cctvDetectedChannelNames = null;
     if ($('cctvEditIdInput')) $('cctvEditIdInput').value = '';
     if ($('cctvFormTitle')) $('cctvFormTitle').textContent = '➕ إضافة جهاز Dahua DVR / XVR جديد (فرع أو مخزن)';
     if ($('cctvNameInput')) $('cctvNameInput').value = '';
     if ($('cctvModeSelect')) $('cctvModeSelect').value = 'router';
-    if ($('cctvRouterRow')) $('cctvRouterRow').style.display = '';
+    syncCctvModeRowsUi('router');
     if ($('cctvRouterHostInput')) $('cctvRouterHostInput').value = '';
     if ($('cctvRouterHttpPortInput')) $('cctvRouterHttpPortInput').value = '8085';
     if ($('cctvRouterRtspPortInput')) $('cctvRouterRtspPortInput').value = '554';
-    if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = 'none';
     if ($('cctvBridgeDeviceSelect')) $('cctvBridgeDeviceSelect').value = '';
     if ($('cctvHostInput')) $('cctvHostInput').value = '10.10.1.108';
     if ($('cctvHttpPortInput')) $('cctvHttpPortInput').value = '80';
@@ -6748,9 +6764,9 @@
       name: (($('cctvNameInput') && $('cctvNameInput').value) || '').trim(),
       connection_mode: mode,
       router_host: mode === 'router' ? (($('cctvRouterHostInput') && $('cctvRouterHostInput').value) || '').trim() : '',
-      router_http_port: Number(($('cctvRouterHttpPortInput') && $('cctvRouterHttpPortInput').value) || 8085) || 8085,
-      router_rtsp_port: Number(($('cctvRouterRtspPortInput') && $('cctvRouterRtspPortInput').value) || 554) || 554,
-      bridge_device_id: mode === 'bridge' ? (($('cctvBridgeDeviceSelect') && $('cctvBridgeDeviceSelect').value) || '').trim() : '',
+      router_http_port: Number(($('cctvRouterHttpPortInput') && $('cctvRouterHttpPortInput') || {}).value || 8085) || 8085,
+      router_rtsp_port: Number(($('cctvRouterRtspPortInput') && $('cctvRouterRtspPortInput') || {}).value || 554) || 554,
+      bridge_device_id: (mode === 'bridge' || mode === 'router') ? (($('cctvBridgeDeviceSelect') && $('cctvBridgeDeviceSelect').value) || '').trim() : '',
       backup_bridge_device_id: '',
       host: (($('cctvHostInput') && $('cctvHostInput').value) || '10.10.1.108').trim(),
       http_port: Number(($('cctvHttpPortInput') && $('cctvHttpPortInput').value) || 80) || 80,
@@ -7207,16 +7223,83 @@
     if ($('cctvModeSelect')) {
       $('cctvModeSelect').addEventListener('change', (e) => {
         const val = e.target.value;
-        if ($('cctvRouterRow')) $('cctvRouterRow').style.display = val === 'router' ? '' : 'none';
-        if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = val === 'bridge' ? '' : 'none';
-        if (val === 'bridge') refreshCctvBridgeDevicesDropdown();
+        syncCctvModeRowsUi(val);
+        if (val === 'bridge' || val === 'router') refreshCctvBridgeDevicesDropdown();
       });
     }
     if ($('cctvReloadDevicesBtn')) {
       $('cctvReloadDevicesBtn').addEventListener('click', () => refreshCctvBridgeDevicesDropdown());
     }
     if ($('cctvBridgeDeviceSelect')) {
-      $('cctvBridgeDeviceSelect').addEventListener('change', () => checkSelectedBridgeDeviceVersion());
+      $('cctvBridgeDeviceSelect').addEventListener('change', () => {
+        checkSelectedBridgeDeviceVersion();
+        const selId = ($('cctvBridgeDeviceSelect') && $('cctvBridgeDeviceSelect').value) || '';
+        const mode = ($('cctvModeSelect') && $('cctvModeSelect').value) || 'router';
+        if (selId && mode === 'router') {
+          const dev = cctvBridgeDevicesCache.find((d) => d.device_id === selId);
+          if (dev && dev.ip && !/^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.)/.test(String(dev.ip))) {
+            if ($('cctvRouterHostInput')) $('cctvRouterHostInput').value = String(dev.ip).trim();
+            toast('⚡ تم سحب الـ Public IP لراوتر الفرع تلقائياً (' + dev.ip + ') وتفعيله كمزامن DDNS');
+          }
+        }
+      });
+    }
+    if ($('cctvAutoDetectRouterIpBtn')) {
+      $('cctvAutoDetectRouterIpBtn').addEventListener('click', async () => {
+        const btn = $('cctvAutoDetectRouterIpBtn');
+        const banner = $('cctvTestResultBanner');
+        const payload = collectCctvFormPayload();
+        if (!payload.bridge_device_id && !payload.router_host) {
+          toast('اختر أي كمبيوتر متصل في الفرع أولاً أو اكتب الـ Public IP للراوتر', 'error');
+          return;
+        }
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> جاري سحب الـ IP وفحص الراوتر...';
+        try {
+          const res = await callCctvApi('cctvAction', 'cctv_action', {
+            action: 'detect_router_ip',
+            payload: {
+              dvr_id: payload.id || '',
+              bridge_device_id: payload.bridge_device_id,
+              router_host: payload.router_host,
+              router_http_port: payload.router_http_port,
+              host: payload.host,
+              http_port: payload.http_port,
+              username: payload.username,
+              password: payload.password,
+            },
+          });
+          if (res && res.router_host && $('cctvRouterHostInput')) {
+            $('cctvRouterHostInput').value = res.router_host;
+          }
+          if (res && res.detected_channels && $('cctvChannelsInput')) {
+            const std = [4, 8, 16, 24, 32, 64].find((n) => n >= res.detected_channels) || 16;
+            $('cctvChannelsInput').value = String(std);
+          }
+          if (res && res.channel_names) {
+            cctvDetectedChannelNames = res.channel_names;
+          }
+          if (banner) {
+            banner.style.display = 'block';
+            const isOk = Boolean(res && res.ok && res.port_open);
+            banner.style.background = isOk ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.14)';
+            banner.style.color = isOk ? '#10b981' : '#f59e0b';
+            banner.style.border = isOk ? '1px solid rgba(16,185,129,0.3)' : '1px solid rgba(245,158,11,0.35)';
+            banner.textContent = (res && (res.message || res.error)) || 'تم فحص راوتر الفرع';
+          }
+          if (res && res.router_host) {
+            toast('🌍 تم سحب الـ Public IP للراوتر: ' + res.router_host);
+          } else {
+            toast((res && res.error) || 'تعذر سحب الـ IP', 'error');
+          }
+        } catch (err) {
+          toast('خطأ: ' + (err.message || err), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
+      });
     }
     if ($('cctvUpgradeBridgeBtn')) {
       $('cctvUpgradeBridgeBtn').addEventListener('click', async () => {
@@ -7453,11 +7536,10 @@
         if ($('cctvNameInput')) $('cctvNameInput').value = dvr.name || '';
         const modeVal = dvr.connection_mode || 'router';
         if ($('cctvModeSelect')) $('cctvModeSelect').value = modeVal;
-        if ($('cctvRouterRow')) $('cctvRouterRow').style.display = modeVal === 'router' ? '' : 'none';
+        syncCctvModeRowsUi(modeVal);
         if ($('cctvRouterHostInput')) $('cctvRouterHostInput').value = dvr.router_host || '';
         if ($('cctvRouterHttpPortInput')) $('cctvRouterHttpPortInput').value = String(dvr.router_http_port || 8085);
         if ($('cctvRouterRtspPortInput')) $('cctvRouterRtspPortInput').value = String(dvr.router_rtsp_port || 554);
-        if ($('cctvBridgeDeviceRow')) $('cctvBridgeDeviceRow').style.display = modeVal === 'bridge' ? '' : 'none';
         if ($('cctvBridgeDeviceSelect')) $('cctvBridgeDeviceSelect').value = dvr.bridge_device_id || '';
         if ($('cctvHostInput')) $('cctvHostInput').value = dvr.host || '';
         if ($('cctvHttpPortInput')) $('cctvHttpPortInput').value = String(dvr.http_port || 80);

@@ -637,6 +637,14 @@ export function createDahuaCctvManager({ db }) {
       .replace(/^https?:\/\//i, '')
       .split('/')[0] || '';
     if (routerHost.includes(':')) routerHost = routerHost.split(':')[0];
+    if (mode === 'router' && !routerHost && bridgeDeviceId) {
+      try {
+        const refDev = db.prepare('SELECT ip FROM devices WHERE device_id=?').get(bridgeDeviceId);
+        if (refDev && isPublicIpv4(refDev.ip)) {
+          routerHost = String(refDev.ip).trim();
+        }
+      } catch (_) {}
+    }
     const routerHttpPort = Math.max(1, Math.min(65535, Number(payload.router_http_port || (existing && existing.router_http_port) || 8081) || 8081));
     const routerRtspPort = Math.max(1, Math.min(65535, Number(payload.router_rtsp_port || (existing && existing.router_rtsp_port) || 5540) || 5540));
 

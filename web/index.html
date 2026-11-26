@@ -1681,11 +1681,29 @@
             </div>
           </div>
 
+          <div class="field" id="cctvBridgeDeviceRow" style="margin-bottom:12px;padding:12px;border-radius:11px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.22);">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
+              <span class="label" id="cctvBridgeDeviceLabel" style="margin:0;">💻 اختر أي كمبيوتر بالفرع على نفس الراوتر (لمعرفة ومزامنة الـ Public IP تلقائياً بدون جسر كاميرات)</span>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button type="button" class="btn btn-primary btn-sm" id="cctvAutoDetectRouterIpBtn" style="padding:3px 10px;font-size:11.5px;background:linear-gradient(135deg,#059669,#10b981);border:none;">⚡ سحب الـ Public IP وفحص بورت الراوتر</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="cctvReloadDevicesBtn">↻ تحديث قائمة الأجهزة</button>
+              </div>
+            </div>
+            <select class="input" id="cctvBridgeDeviceSelect">
+              <option value="">— اختر أي جهاز كمبيوتر موجود في نفس الفرع لسحب ومزامنة الـ Public IP تلقائياً —</option>
+            </select>
+            <div id="cctvBridgeUpgradeBox" style="display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+              <div id="cctvBridgeUpgradeText" style="font-size:12.5px;font-weight:700;color:#f59e0b;">⚠ هذا الجهاز يعمل بإصدار أقدم من v1.1.0 ويحتاج تحديثاً صامتاً لتشغيل جميع المزايا المتقدمة.</div>
+              <button type="button" class="btn btn-primary btn-sm" id="cctvUpgradeBridgeBtn">⬆️ ترقية جهاز الفرع لـ v1.1.0 الآن (صامت)</button>
+            </div>
+            <div class="hint" id="cctvBridgeDeviceHint" style="margin-top:5px;">💡 <b>في وضع راوتر الفرع المباشر (Auto-DDNS):</b> اختيار أي كمبيوتر في الفرع يملأ خانة الـ <b>Public IP</b> فوراً ويحدّثها تلقائياً كلما تغيّر IP الراوتر، مع <b>0% استهلاك</b> من جهاز الموظف (البث يمر 100% من الراوتر مباشرةً).</div>
+          </div>
+
           <div class="field" id="cctvRouterRow" style="margin-bottom:12px;padding:12px;border-radius:11px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.28);">
             <div class="grid cols-3" style="gap:10px;">
               <div class="field" style="margin-bottom:0;">
-                <span class="label">🌍 الـ Public IP لراوتر الفرع</span>
-                <input type="text" class="input mono" id="cctvRouterHostInput" dir="ltr" placeholder="مثال: 154.182.208.246">
+                <span class="label">🌍 الـ Public IP لراوتر الفرع (يُعبأ تلقائياً عند اختيار جهاز أعلاه أو يدوياً)</span>
+                <input type="text" class="input mono" id="cctvRouterHostInput" dir="ltr" placeholder="مثال: 154.182.208.246 (أو اختر جهازاً أعلاه لسحبه تلقائياً)">
               </div>
               <div class="field" style="margin-bottom:0;">
                 <span class="label">منفذ HTTP بالراوتر (Port Forward)</span>
@@ -1697,21 +1715,6 @@
               </div>
             </div>
             <div class="hint" style="margin-top:6px;color:#10b981;font-weight:700;">✅ وضع الراوتر المباشر 100%: يتصل السيرفر مباشرةً براوتر الفرع دون المرور بأي جهاز كمبيوتر لدى الموظفين (`0%` استهلاك من أجهزة الموظفين ويعمل 24 ساعة حتى والأجهزة مغلقة).</div>
-          </div>
-
-          <div class="field" id="cctvBridgeDeviceRow" style="display:none;margin-bottom:12px;padding:12px;border-radius:11px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.22);">
-            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
-              <span class="label" style="margin:0;">💻 اختر كمبيوتر الفرع المتصل على نفس راوتر الـ DVR</span>
-              <button type="button" class="btn btn-ghost btn-sm" id="cctvReloadDevicesBtn">↻ تحديث قائمة الأجهزة</button>
-            </div>
-            <select class="input" id="cctvBridgeDeviceSelect">
-              <option value="">— اختر جهاز الكمبيوتر الموجود في نفس الفرع / المخزن —</option>
-            </select>
-            <div id="cctvBridgeUpgradeBox" style="display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-              <div id="cctvBridgeUpgradeText" style="font-size:12.5px;font-weight:700;color:#f59e0b;">⚠ هذا الجهاز يعمل بإصدار أقدم من v1.1.0 ويحتاج تحديثاً صامتاً لتشغيل جميع المزايا المتقدمة.</div>
-              <button type="button" class="btn btn-primary btn-sm" id="cctvUpgradeBridgeBtn">⬆️ ترقية جهاز الفرع لـ v1.1.0 الآن (صامت)</button>
-            </div>
-            <div class="hint" style="margin-top:5px;">يعمل برنامج <b>IT ELKHAWGA Client v1.1.0</b> على جهاز الفرع كجسر محلي آمن لجلب البث وفحص الهارد واسترجاع المقاطع لحظة الطلب فقط دون الحاجة لـ Static IP.</div>
           </div>
 
           <div class="grid cols-2" style="gap:12px;margin-bottom:12px;">
