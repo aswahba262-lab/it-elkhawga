@@ -5141,14 +5141,6 @@
       return;
     }
 
-    if (dvr.audio_scanned && Array.isArray(dvr.audio_channels) && !dvr.audio_channels.includes(ch)) {
-      const hint = dvr.audio_channels.length
-        ? (' — الكاميرات المزوّدة بصوت في «' + dvr.name + '»: كاميرا ' + dvr.audio_channels.join(' ، '))
-        : ' — لا توجد كاميرات مفعّل لها الصوت في إعدادات هذا الـ DVR';
-      toast('🔇 هذه الكاميرا غير مزوّدة بمايكروفون' + hint, 'error');
-      return;
-    }
-
     try {
       ensureCctvAudioContext();
     } catch (e) {

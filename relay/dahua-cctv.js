@@ -2846,6 +2846,19 @@ export function createDahuaCctvManager({ db }) {
     const inner = stripDhavAudioPayloads(rawBuf);
     if (!inner || !inner.length) return;
 
+    // Auto-learn working audio channel in DB if it delivered real audio bytes
+    try {
+      const dvrRow = db.prepare('SELECT audio_channels FROM cctv_dvrs WHERE id=?').get(dvrId);
+      if (dvrRow) {
+        const curArr = JSON.parse(dvrRow.audio_channels || '[]') || [];
+        if (Array.isArray(curArr) && !curArr.includes(ch)) {
+          curArr.push(ch);
+          curArr.sort((a, b) => a - b);
+          db.prepare('UPDATE cctv_dvrs SET audio_channels=? WHERE id=?').run(JSON.stringify(curArr), dvrId);
+        }
+      }
+    } catch (_) {}
+
     const ctLower = String(contentType || '').toLowerCase();
     const looksAdts =
       ctLower.includes('aac') ||
@@ -3008,7 +3021,10 @@ export function createDahuaCctvManager({ db }) {
     directAudioReqs.set(streamKey, req);
     req.on('error', (err) => {
       if (!st.chunks.length) {
-        st.error = 'هذه الكاميرا غير مزوّدة بمايكروفون أو تعذر فتح الصوت: ' + (err.message || '');
+        const isHangup = /socket hang up|ECONNRESET/i.test(String((err && err.message) || ''));
+        st.error = isHangup
+          ? `🔇 مايكروفون الكاميرا رقم ${ch} مغلق من داخل الكاميرا نفسها (فعّل خيار Audio / المايك من تطبيق Imou Life أو إعدادات Encode في الـ DVR)`
+          : ('هذه الكاميرا غير مزوّدة بمايكروفون أو تعذر فتح الصوت: ' + (err.message || ''));
         st.errorAt = Date.now();
       }
       directAudioReqs.delete(streamKey);
@@ -3021,20 +3037,17 @@ export function createDahuaCctvManager({ db }) {
     if (!dvr) throw new Error('جهاز الـ DVR غير موجود');
     const ch = Math.max(1, Math.min(64, Number(channel || 1) || 1));
 
-    // If audio_channels was already scanned on this DVR and this channel is NOT enabled, fail fast with a helpful message!
+    // If channel is not in cached audio_channels, automatically send AudioEnable=true to the DVR for this channel and attempt live audio stream!
     if (typeof dvr.audio_channels === 'string' && dvr.audio_channels.trim().startsWith('[')) {
       try {
         const knownAudio = JSON.parse(dvr.audio_channels) || [];
-        if (Array.isArray(knownAudio) && !knownAudio.includes(ch)) {
-          const hint = knownAudio.length
-            ? ` (الكاميرات المزوّدة بصوت في ${dvr.name}: ${knownAudio.join('، ')})`
-            : ' (لا توجد كاميرات مفعّل لها الصوت حالياً في إعدادات هذا الـ DVR)';
-          return {
-            ok: false,
-            no_mic: true,
-            audio_channels: knownAudio,
-            error: `🔇 الكاميرا رقم ${ch} غير مزوّدة بمايكروفون${hint}`,
-          };
+        if (Array.isArray(knownAudio) && !knownAudio.includes(ch) && sinceSeq === 0) {
+          const idx = ch - 1;
+          await executeDvrCgi(
+            dvr,
+            `/cgi-bin/configManager.cgi?action=setConfig&Encode[${idx}].MainFormat[0].AudioEnable=true&Encode[${idx}].ExtraFormat[0].AudioEnable=true`,
+            { timeoutMs: 3500 }
+          ).catch(() => {});
         }
       } catch (_) {}
     }
