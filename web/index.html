@@ -165,69 +165,62 @@
         </div>
       </div>
 
-      <nav class="nav" id="primaryHubNav">
-        <div class="nav-group-label">غرفة العمليات</div>
-        <button class="nav-item active" data-view="dashboard" data-hub="dashboard" data-title="غرفة القيادة" data-sub="نظرة شاملة حية على الأجهزة والفروع والكاميرات والأمان">
+      <nav class="nav">
+        <div class="nav-group-label">المراقبة والتحكم</div>
+        <button class="nav-item active" data-view="dashboard" data-title="الرئيسية" data-sub="حالة هذا الجهاز والتحكم السريع">
           <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
-          <span>غرفة القيادة</span>
+          الرئيسية
         </button>
-        <button class="nav-item" id="navCamerasItem" data-view="cameras" data-hub="cameras" data-title="استوديو الكاميرات (Dahua NVR)" data-sub="البث المباشر السريع لكاميرات الفروع والمخازن بملء الشاشة الكامل">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-          <span>كاميرات الفروع</span>
-          <span class="nav-count" id="navCctvCount">0</span>
-        </button>
-
-        <div class="nav-group-label">الأجهزة والشبكات</div>
-        <button class="nav-item" data-view="relay" data-hub="devices_hub" data-title="أجهزة الفروع السحابية (Relay)" data-sub="إدارة أجهزة الفروع والمبيعات والدعم المباشر عبر RustDesk">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M12 2a10 10 0 100 20 10 10 0 000-20z"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-          <span>أجهزة الفروع (Relay)</span>
-          <span class="nav-count" id="navRelayCount">0</span>
-        </button>
-        <button class="nav-item" data-view="devices" data-hub="devices_hub" data-title="أجهزة الشبكة المحلية (LAN)" data-sub="أجهزة الموظفين المتصلة داخل المقر الرئيسي والشبكة الداخلية">
+        <button class="nav-item" data-view="devices" data-title="الأجهزة" data-sub="أجهزة الموظفين المتصلة وحالتها المباشرة">
           <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-          <span>أجهزة الشبكة المحلية</span>
+          الأجهزة
           <span class="nav-count" id="navDeviceCount">0</span>
         </button>
-
-        <div class="nav-group-label">سياسات الإنترنت</div>
-        <button class="nav-item" data-view="groups" data-hub="policies_hub" data-title="مجموعات الفروع والأقسام" data-sub="صلاحيات كل فرع أو قسم وأوامر القفل والتصفح النظيف الجماعية">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
-          <span>المجموعات والأقسام</span>
+        <button class="nav-item" id="navCamerasItem" data-view="cameras" data-title="كاميرات الفروع والمخازن (Dahua)" data-sub="غرفة العمليات والبث المباشر لأجهزة Dahua DVR في كل الفروع والمخازن بدون الحاجة لـ Static IP">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          كاميرات الفروع
+          <span class="nav-count" id="navCctvCount">0</span>
         </button>
-        <button class="nav-item" data-view="sites" data-hub="policies_hub" data-title="قوائم المواقع المسموحة والمحظورة" data-sub="إدارة القوائم البيضاء والسوداء والقوالب الجاهزة">
+        <button class="nav-item" data-view="relay" data-title="الربط السحابي" data-sub="ربط الأجهزة خارج الشبكة المحلية عبر Relay">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 3v6M12 15v6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M3 12h6M15 12h6M5.6 18.4l4.2-4.2M14.2 9.8l4.2-4.2"/></svg>
+          الربط السحابي
+          <span class="nav-count" id="navRelayCount">0</span>
+        </button>
+        <button class="nav-item" data-view="groups" data-title="المجموعات" data-sub="مجموعات الأجهزة بمواقع وأوامر مستقلة">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M8 7a3 3 0 100-6 3 3 0 000 6zM2 19v-1a5 5 0 015-5h2a5 5 0 015 5v1M16 7a3 3 0 100-6M17 13h1a4 4 0 014 4v2"/></svg>
+          المجموعات
+        </button>
+        <div class="nav-group-label">السياسات والأمان</div>
+        <button class="nav-item" data-view="sites" data-title="المواقع" data-sub="إدارة المواقع المسموحة والمقفولة">
           <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.8 3 2.8 15 0 18M12 3c-2.8 3-2.8 15 0 18"/></svg>
-          <span>قوائم المواقع</span>
+          المواقع
         </button>
-
-        <div class="nav-group-label">الأمان وحماية البيانات</div>
-        <button class="nav-item" data-view="archive" data-hub="dlp_hub" data-title="أرشيف الملفات المرفوعة (DLP)" data-sub="معرض الصور والملفات المسحوبة من واتساب ويب والمتصفحات">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M9 15l2 2 4-4"/></svg>
-          <span>أرشيف الملفات</span>
+        <button class="nav-item" data-view="alerts" data-title="التنبيهات" data-sub="تنبيهات الأمان وسرقة/اختلاس البيانات">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          التنبيهات
+          <span class="nav-count" id="navAlertCount">0</span>
+        </button>
+        <button class="nav-item" data-view="archive" data-title="أرشيف الملفات المرفوعة" data-sub="نسخ طبق الأصل من الملفات المرفوعة من واتساب والإنترنت على السيرفر">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+          أرشيف الملفات
           <span class="nav-count" id="navArchiveCount">0</span>
         </button>
-        <button class="nav-item" data-view="alerts" data-hub="dlp_hub" data-title="التنبيهات الأمنية وسجل التدقيق" data-sub="تنبيهات تسريب البيانات والفلاشات ومحاولات التلاعب">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5.2-3.4 9.6-8 11-4.6-1.4-8-5.8-8-11V6l8-4z"/><path d="M12 8v4M12 16h.01"/></svg>
-          <span>التنبيهات الأمنية</span>
-          <span class="nav-count" id="navAlertCount" style="background:rgba(239,68,68,0.18);color:#f87171;">0</span>
-        </button>
-
-        <div class="nav-group-label">النظام والإدارة</div>
-        <button class="nav-item" data-view="wabot" data-hub="system_hub" data-title="بوت واتساب الذكي (QR Bot)" data-sub="ربط واتساب بـ QR وتخصيص الإشعارات والأوامر التفاعلية">
+        <button class="nav-item" data-view="wabot" data-title="بوت واتساب الذكي" data-sub="ربط واتساب بـ QR وتخصيص تشغيل أو إيقاف كل إشعار وأمر على حدة">
           <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z"/></svg>
-          <span>بوت واتساب</span>
+          بوت واتساب
           <span class="nav-count" id="navWaBotBadge" style="background:rgba(16,185,129,0.16);color:#10b981;display:none;">متصل</span>
         </button>
-        <button class="nav-item" data-view="settings" data-hub="system_hub" data-title="الإعدادات والنسخ الاحتياطي" data-sub="إعدادات الحماية والنسخ الاحتياطي التلقائي لـ elkhawaga.uk والسيرفر">
+        <button class="nav-item" data-view="admins" data-title="المديرين" data-sub="إدارة حسابات المديرين والأدوار">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H7a4 4 0 00-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+          المديرين
+        </button>
+        <button class="nav-item" data-view="settings" data-title="الإعدادات" data-sub="وضع الحجب وكلمة السر والتشغيل التلقائي">
           <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
-          <span>الإعدادات والباكاب</span>
+          الإعدادات
         </button>
-        <button class="nav-item" data-view="admins" data-hub="system_hub" data-title="إدارة المديرين والصلاحيات" data-sub="حسابات المديرين والأدوار ورابط الآيباد">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg>
-          <span>المديرين والآيباد</span>
-        </button>
-        <button class="nav-item" data-view="logs" data-hub="system_hub" data-title="سجل عمليات النظام" data-sub="سجل العمليات المحلية على السيرفر">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h12"/></svg>
-          <span>سجل النظام</span>
+        <button class="nav-item" data-view="logs" data-title="السجل" data-sub="كل العمليات التي تمت على هذا الجهاز">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h6"/></svg>
+          السجل
         </button>
       </nav>
 
@@ -304,9 +297,6 @@
           </div>
         </div>
       </div>
-
-      <!-- شريط التبويبات الفرعية الذكي داخل كل مركز قيادة (Sub-Hub Navigation Bar) -->
-      <div class="hub-subtabs-bar" id="hubSubtabsBar" style="display:none;"></div>
 
       <!-- Dashboard -->
       <section class="view active" id="view-dashboard">
@@ -876,14 +866,8 @@
           </div>
         </div>
 
-        <!-- Settings + Pairing (Collapsible Accordion Drawer for Clean Devices View) -->
-        <details class="card relay-config-drawer" style="margin-bottom:14px;padding:12px 16px;">
-          <summary style="cursor:pointer;font-weight:800;font-size:13.8px;color:var(--primary-2);display:flex;align-items:center;justify-content:space-between;user-select:none;">
-            <span>➕ ربط جهاز موظف جديد · إعدادات السيرفر السحابي وخادم RustDesk OSS المحلي</span>
-            <span class="badge blue" style="font-size:11px;">اضغط للفتح / الطي ▾</span>
-          </summary>
-          <div style="margin-top:14px;">
-        <div class="grid cols-2" style="margin-bottom:14px;">
+        <!-- Settings + Pairing -->
+        <div class="grid cols-2" style="margin-bottom:18px;">
           <!-- Relay settings -->
           <div class="card">
             <div class="card-title">
@@ -942,7 +926,7 @@
         </div>
 
         <!-- Local RustDesk Server OSS Card -->
-        <div class="card" style="margin-bottom:4px;border:1px solid rgba(16,185,129,0.28);">
+        <div class="card" style="margin-bottom:18px;border:1px solid rgba(16,185,129,0.28);">
           <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:10px;">
             <span style="display:flex;align-items:center;gap:8px;">
               ⚡ خادم الدعم الفني المحلي السريع (RustDesk Server OSS)
@@ -964,11 +948,9 @@
             </div>
           </div>
           <div class="hint" style="margin-top:10px;">
-            💡 <b>ميزة السرعة المزدوجة مفعّلة تلقائياً:</b> في الوضع الهجين تتصل أجهزة الشبكة المحلية ببعضها مباشرة عبر IP المحلي (المنفذ <code>21118</code> بسرعة الشبكة الداخلية دون إنترنت)، بينما يظل اتصال المهندسين من خارج الشركة متاحاً بدون الحاجة لفتح منافذ الراوتر.
+            💡 <b>ميزة السرعة المزدوجة مفعّلة تلقائياً:</b> في الوضع الهجين تتصل أجهزة الشبكة المحلية ببعضها مباشرة عبر IP المحلي (المنفذ <code>21118</code> بسرعة الشبكة الداخلية دون إنترنت)، بينما يظل اتصال المهندسين من خارج الشركة متاحاً بدون الحاجة لفتح منافذ الراوتر. وإذا قمت بعمل Port Forward للمنافذ <code>21115–21119</code> على الراوتر (أو استخدام Tailscale)، اضغط «تفعيل السيرفر المحلي» ليصبح كل الاتصال داخلياً وخارجياً عبر خادمك الخاص حصراً.
           </div>
         </div>
-          </div>
-        </details>
 
         <!-- Devices Cards / List -->
         <div class="card">
@@ -1569,61 +1551,79 @@
 
       <!-- Dahua CCTV Live Monitoring Center -->
       <section class="view" id="view-cameras">
-        <!-- شريط التحكم العلوي لغرفة المراقبة -->
-        <div class="card" style="margin-bottom:14px;padding:14px 16px;">
-          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:260px;">
-              <div style="min-width:220px;flex:1;max-width:330px;">
-                <select class="input" id="cctvBranchSelect" style="font-weight:700;">
-                  <option value="vip">⭐ شاشة الكاميرات المختصرة VIP (0 كاميرات)</option>
-                  <option value="all" selected>🌐 غرفة العمليات الموحدة (كل الفروع والمخازن)</option>
+        <div id="cctvTheaterStage" style="display:flex;flex-direction:column;gap:8px;width:100%;">
+        <!-- شريط التحكم العلوي المدمج لغرفة المراقبة -->
+        <div class="card" id="cctvTopControlCard" style="margin-bottom:0;padding:10px 14px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;min-width:260px;">
+              <div style="min-width:210px;flex:1;max-width:310px;">
+                <select class="input" id="cctvBranchSelect" style="font-weight:700;height:34px;padding:4px 10px;">
+                  <option value="all">🌐 غرفة العمليات الموحدة (كل الفروع والمخازن)</option>
                 </select>
               </div>
-              <button type="button" class="btn btn-ghost btn-sm" id="cctvVipQuickBtn" style="border-color:rgba(245,158,11,0.45);color:#d97706;font-weight:800;" title="عرض الكاميرات المختارة فقط من كل فرع لتقليل الحمل وتسريع البث">⭐ شاشة VIP (0)</button>
-              <button type="button" class="btn btn-ghost btn-sm" id="cctvOpenVipPickerBtn" title="اختيار كاميرا أو كاميرتين من كل فرع في قائمة واحدة">✨ تخصيص VIP</button>
-              <div id="cctvPageWrap" style="display:none;min-width:145px;">
-                <select class="input" id="cctvPageSelect"></select>
+              <div id="cctvPageWrap" style="display:none;min-width:130px;">
+                <select class="input" id="cctvPageSelect" style="height:34px;padding:4px 8px;"></select>
               </div>
-              <div id="cctvLayoutBar" style="display:inline-flex;gap:4px;padding:4px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border);">
-                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="1" title="كاميرا واحدة بجودة HD">1×1 HD</button>
-                <button type="button" class="btn btn-primary btn-sm" data-cctv-grid="2" title="شبكة 4 كاميرات">2×2</button>
-                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="3" title="شبكة 9 كاميرات">3×3</button>
-                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="4" title="شبكة 16 كاميرا">4×4</button>
+              <div id="cctvLayoutBar" style="display:inline-flex;gap:3px;padding:3px;border-radius:9px;background:var(--surface-2);border:1px solid var(--border);flex-wrap:wrap;">
+                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="1" title="1 كاميرا (1×1) بجودة Main Stream HD الكاملة">1</button>
+                <button type="button" class="btn btn-primary btn-sm" data-cctv-grid="2" title="4 كاميرات (2×2)">4</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="3" title="9 كاميرات (3×3)">9</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="4" title="16 كاميرا (4×4)">16</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="5" title="25 كاميرا (5×5)">25</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-cctv-grid="6" title="36 كاميرا (6×6)">36</button>
               </div>
-              <label style="display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:9px;background:var(--surface-2);border:1px solid var(--border);font-size:12px;font-weight:700;cursor:pointer;" title="إخفاء القنوات غير الموصلة أو المخفية تلقائياً من الشاشة الجدارية">
+              <select class="input" id="cctvEngineModeSelect" style="width:auto;min-width:170px;height:34px;padding:4px 9px;font-size:12px;font-weight:800;border-color:rgba(56,189,248,0.55);color:#38bdf8;" title="محرك تشغيل الفيديو: WebRTC منخفض التأخير + Direct fMP4/MSE بدون إعادة ترميز (H.264/HEVC) + HLS Fallback">
+                <option value="nextgen" selected>🚀 Next-Gen (WebRTC + MSE 0-Copy)</option>
+                <option value="webrtc">⚡ WebRTC WHEP Low-Latency</option>
+                <option value="mse">🎬 Direct fMP4 MSE (H.264 / H.265)</option>
+                <option value="hls">📡 HLS Low-Latency Stream</option>
+                <option value="legacy">🛡️ Legacy MJPEG Buffer (احتياطي)</option>
+              </select>
+              <select class="input" id="cctvStreamQualitySelect" style="width:auto;min-width:150px;height:34px;padding:4px 9px;font-size:12px;font-weight:700;" title="التبديل الذكي بين Main Stream (HD) و Sub Stream (SD) حسب عدد الكاميرات">
+                <option value="auto" selected>🧠 Auto Quality (Main/Sub)</option>
+                <option value="main">✨ Main Stream HD</option>
+                <option value="sub">⚡ Sub Stream SD</option>
+              </select>
+              <select class="input" id="cctvBufferModeSelect" style="width:auto;min-width:155px;height:34px;padding:4px 9px;font-size:12px;font-weight:700;border-color:rgba(16,185,129,0.45);color:#34d399;" title="وضع زمن التأخير: بث حي فوري منخفض التأخير أو بفرنج سلاسة 3 ثوانٍ">
+                <option value="realtime" selected>⚡ Low-Latency Live (&lt;0.4s)</option>
+                <option value="smooth3s">🌊 Smooth Buffer (3s)</option>
+              </select>
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvAspectFitBtn" title="تبديل وضع العرض: Fit to Screen (الحفاظ على الأبعاد الأصلية 16:9) أو Fill Screen (ملء الإطار بالكامل)">📐 Fit / Fill</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvSaveLayoutBtn" title="حفظ ترتيب وتقسيمة الكاميرات الحالية (Save Layout)">💾 حفظ Layout</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvResetLayoutBtn" title="استرجاع الترتيب الافتراضي للكاميرات">↺ استرجاع</button>
+              <button type="button" class="btn btn-primary btn-sm" id="cctvFullscreenWallBtn" style="background:linear-gradient(135deg,#0ea5e9,#2563eb);border:none;" title="استغلال الشاشة بالكامل لعرض الكاميرات بدون حواف (Fullscreen NVR Wall)">⛶ ملء الشاشة</button>
+              <label style="display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:8px;background:var(--surface-2);border:1px solid var(--border);font-size:11.5px;font-weight:700;cursor:pointer;" title="إخفاء القنوات غير الموصلة أو المخفية تلقائياً من الشاشة الجدارية">
                 <input type="checkbox" id="cctvAutoHideSwitch" checked>
                 <span>🙈 إخفاء الفارغ</span>
               </label>
             </div>
 
-            <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;">
-              <div id="cctvActiveAudioBar" style="display:none;align-items:center;gap:6px;padding:4px 10px;border-radius:9px;background:rgba(16,185,129,0.14);border:1px solid rgba(16,185,129,0.4);">
-                <button type="button" class="btn btn-success btn-sm" id="cctvMuteTopBtn" style="padding:3px 9px;font-size:11.5px;" title="إيقاف وكتم الصوت المباشر فوراً">🔊 كتم الصوت</button>
-                <span id="cctvActiveAudioLabel" style="font-size:11.5px;font-weight:800;color:#10b981;max-width:170px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>
-                <input type="range" id="cctvWallVolumeSlider" min="20" max="250" value="135" style="width:68px;accent-color:#10b981;cursor:pointer;" title="مستوى وتكبير صوت المايك (حتى 250%)">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <div id="cctvActiveAudioBar" style="display:none;align-items:center;gap:6px;padding:3px 9px;border-radius:8px;background:rgba(16,185,129,0.14);border:1px solid rgba(16,185,129,0.4);">
+                <button type="button" class="btn btn-success btn-sm" id="cctvMuteTopBtn" style="padding:2px 8px;font-size:11px;" title="إيقاف وكتم الصوت المباشر فوراً">🔊 كتم الصوت</button>
+                <span id="cctvActiveAudioLabel" style="font-size:11px;font-weight:800;color:#10b981;max-width:155px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>
+                <input type="range" id="cctvWallVolumeSlider" min="20" max="250" value="135" style="width:62px;accent-color:#10b981;cursor:pointer;" title="مستوى وتكبير صوت المايك (حتى 250%)">
               </div>
-              <button type="button" class="btn btn-ghost btn-sm" id="cctvAutoTourBtn" title="التقليب التلقائي بين صفحات وفروع الكاميرات كل 12 ثانية">🔄 دوران تلقائي</button>
-              <button type="button" class="btn btn-ghost btn-sm" id="cctvOpenPlaybackBtn" title="البحث في تسجيلات هارد الـ DVR وسحب مقاطع الأحداث">⏪ استرجاع التسجيلات</button>
-              <button type="button" class="btn btn-ghost btn-sm" id="cctvCheckHealthBtn" title="فحص سلامة هاردات التسجيل (HDD) وحالة أجهزة الـ DVR">🛡️ فحص الهاردات</button>
-              <label id="cctvSuperOnlyWrap" style="display:none;align-items:center;gap:6px;padding:6px 10px;border-radius:9px;background:var(--surface-2);border:1px solid var(--border);font-size:12px;font-weight:700;cursor:pointer;" title="إخفاء قسم الكاميرات عن المهندسين والمشاهدين وحصره بالسوبر أدمن فقط">
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvAutoTourBtn" title="التقليب التلقائي بين صفحات وفروع الكاميرات كل 12 ثانية">🔄 دوران</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvOpenPlaybackBtn" title="البحث في تسجيلات هارد الـ DVR وسحب مقاطع الأحداث">⏪ التسجيلات</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvCheckHealthBtn" title="فحص سلامة هاردات التسجيل (HDD) وحالة أجهزة الـ DVR">🛡️ الهاردات</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="cctvOpenLogsBtn" title="عرض سجل تشخيص اتصال الكاميرات وملف cctv-cameras.log">📋 اللوج</button>
+              <label id="cctvSuperOnlyWrap" style="display:none;align-items:center;gap:5px;padding:5px 8px;border-radius:8px;background:var(--surface-2);border:1px solid var(--border);font-size:11.5px;font-weight:700;cursor:pointer;" title="إخفاء قسم الكاميرات عن المهندسين والمشاهدين وحصره بالسوبر أدمن فقط">
                 <input type="checkbox" id="cctvSuperOnlySwitch">
-                <span>🔒 سوبر فقط</span>
+                <span>🔒 سوبر</span>
               </label>
               <button type="button" class="btn btn-success btn-sm" id="cctvPlayPauseBtn">⏸ إيقاف</button>
               <button type="button" class="btn btn-ghost btn-sm" id="cctvRefreshNowBtn" title="تحديث جميع الكاميرات الآن">↻</button>
-              <button type="button" class="btn btn-primary btn-sm" id="cctvManageToggleBtn">➕ إدارة أجهزة DVR</button>
+              <button type="button" class="btn btn-primary btn-sm" id="cctvManageToggleBtn">➕ أجهزة DVR / IP Cam</button>
             </div>
           </div>
 
-          <!-- شريط أزرار الفروع السريع للتبديل الفوري بضغطة واحدة -->
-          <div id="cctvBranchPillsBar" class="cctv-branch-pills"></div>
-
           <!-- شريط حالة صحة أجهزة الـ DVR والهاردات -->
-          <div id="cctvHealthSummaryBar" style="display:none;margin-top:10px;padding-top:9px;border-top:1px solid var(--border);gap:8px;flex-wrap:wrap;align-items:center;"></div>
+          <div id="cctvHealthSummaryBar" style="display:none;margin-top:7px;padding-top:7px;border-top:1px solid var(--border);gap:6px;flex-wrap:wrap;align-items:center;"></div>
 
-          <div id="cctvStreamStatusHint" class="hint" style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-            <span>🟢 البث الذكي يعمل عند فتح الشاشة فقط (`0% CPU` على أجهزة السيلز) · اضغط <b>🔇</b> على أي كاميرا مزوّدة بمايكروفون (<b>🎙️</b>) لسماع الصوت المباشر، أو اضغط <b>☆</b> لتثبيتها في شاشة الإدارة VIP.</span>
-            <span id="cctvActiveStatsBadge" class="mono" style="font-size:11.5px;opacity:0.85;"></span>
+          <div id="cctvStreamStatusHint" class="hint" style="margin-top:6px;font-size:11.5px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;">
+            <span>🚀 <b>Dahua Next-Generation Enterprise Video Player:</b> بوابة <b>MediaMTX WebRTC + fMP4/MSE Zero-Transcode (H.264 &amp; HEVC)</b> · اسحب وأفلت الكاميرات لتبديل أماكنها · <b>Double Click</b> للتكبير وملء الشاشة · اختصارات: <code>F</code> ملء الشاشة · <code>M</code> صوت · <code>S</code> لقطة · <code>P</code> نافذة عائمة PiP.</span>
+            <span id="cctvActiveStatsBadge" class="mono" style="font-size:11.5px;opacity:0.92;color:#38bdf8;font-weight:700;"></span>
           </div>
         </div>
 
@@ -1645,53 +1645,39 @@
             <div class="field" style="margin-bottom:0;">
               <span class="label">🔗 طريقة الاتصال بجهاز الـ DVR</span>
               <select class="input" id="cctvModeSelect">
-                <option value="router">🌍 ربط مباشر عبر راوتر الفرع (Port Forward + كشف تلقائي لـ IP الراوتر + تحويل احتياطي)</option>
-                <option value="bridge">🌉 جسر كمبيوترات الفرع المزدوج (Auto-Failover بدون تعديل الراوتر)</option>
-                <option value="direct">🖧 اتصال مباشر على شبكة السيرفر الرئيسي (LAN / Static IP / VPN)</option>
+                <option value="router" selected>🌐 راوتر الفرع مباشر 100% (Port Forwarding 24/7 بدون أجهزة الموظفين)</option>
+                <option value="direct">🖧 اتصال مباشر على نفس شبكة السيرفر الرئيسي (LAN / VPN)</option>
+                <option value="bridge">🌉 جسر الفرع السحابي (عبر كمبيوتر الفرع)</option>
               </select>
             </div>
           </div>
 
-          <div class="field" id="cctvRouterConfigBox" style="margin-bottom:12px;padding:12px 14px;border-radius:11px;background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.32);">
-            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
-              <span class="label" style="margin:0;color:#10b981;font-weight:800;">🌍 إعدادات الربط المباشر مع راوتر الفرع (يعمل 24 ساعة حتى مع إغلاق الكمبيوترات)</span>
-              <button type="button" class="btn btn-success btn-sm" id="cctvDetectRouterIpBtn">📡 سحب IP راوتر الفرع تلقائياً وفحص البورت</button>
-            </div>
-            <div class="grid cols-2" style="gap:10px;margin-bottom:8px;">
+          <div class="field" id="cctvRouterRow" style="margin-bottom:12px;padding:12px;border-radius:11px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.28);">
+            <div class="grid cols-3" style="gap:10px;">
               <div class="field" style="margin-bottom:0;">
-                <span class="label">🌐 الـ IP الخارجي لراوتر الفرع (Public IP أو DDNS)</span>
-                <input type="text" class="input mono" id="cctvRouterHostInput" dir="ltr" placeholder="يُسحب تلقائياً من الفرع أو اكتبه يدوياً">
+                <span class="label">🌍 الـ Public IP لراوتر الفرع</span>
+                <input type="text" class="input mono" id="cctvRouterHostInput" dir="ltr" placeholder="مثال: 154.182.208.246">
               </div>
               <div class="field" style="margin-bottom:0;">
-                <span class="label">🔌 البورت الخارجي المفتوح في راوتر الفرع (TCP)</span>
-                <input type="number" class="input mono" id="cctvRouterPortInput" dir="ltr" value="8085" min="1" max="65535">
+                <span class="label">منفذ HTTP بالراوتر (Port Forward)</span>
+                <input type="number" class="input mono" id="cctvRouterHttpPortInput" dir="ltr" value="8085" min="1" max="65535">
+              </div>
+              <div class="field" style="margin-bottom:0;">
+                <span class="label">منفذ RTSP بالراوتر (الافتراضي 554)</span>
+                <input type="number" class="input mono" id="cctvRouterRtspPortInput" dir="ltr" value="554" min="1" max="65535">
               </div>
             </div>
-            <div id="cctvRouterGuideText" class="hint" style="margin:0;line-height:1.65;color:var(--text);">
-              💡 <b>خطوة واحدة داخل راوتر الفرع (Port Forwarding / Virtual Server):</b> وجّه البورت الخارجي <code class="mono" id="cctvGuideExtPort">8085</code> إلى الـ IP الداخلي للـ DVR (<code class="mono" id="cctvGuideInternalIp">10.10.1.108</code>) على البورت الداخلي <code class="mono" id="cctvGuideInternalPort">80</code> (<code class="mono">TCP</code>).<br>
-              🔒 <b>ميزة خط الليزد لاين الثابت للشركة (Static IP: <code class="mono" dir="ltr">41.33.137.210</code>):</b> يمكنك وضع <code class="mono" dir="ltr">41.33.137.210</code> في خانة <b>Source IP / Remote Host</b> داخل راوتر الفرع ليصبح البورت مشفّراً ومحصوراً بسيرفر الشركة الرئيسي فقط 100%.
-            </div>
+            <div class="hint" style="margin-top:6px;color:#10b981;font-weight:700;">✅ وضع الراوتر المباشر 100%: يتصل السيرفر مباشرةً براوتر الفرع دون المرور بأي جهاز كمبيوتر لدى الموظفين (`0%` استهلاك من أجهزة الموظفين ويعمل 24 ساعة حتى والأجهزة مغلقة).</div>
           </div>
 
-          <div class="field" id="cctvBridgeDeviceRow" style="margin-bottom:12px;padding:12px;border-radius:11px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.22);">
+          <div class="field" id="cctvBridgeDeviceRow" style="display:none;margin-bottom:12px;padding:12px;border-radius:11px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.22);">
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
-              <span class="label" style="margin:0;">💻 كمبيوتر الفرع الأساسي والاحتياطي (لاكتشاف IP الراوتر تلقائياً + التبديل التلقائي الفوري)</span>
+              <span class="label" style="margin:0;">💻 اختر كمبيوتر الفرع المتصل على نفس راوتر الـ DVR</span>
               <button type="button" class="btn btn-ghost btn-sm" id="cctvReloadDevicesBtn">↻ تحديث قائمة الأجهزة</button>
             </div>
-            <div class="grid cols-2" style="gap:10px;">
-              <div>
-                <span class="label" style="font-size:11.5px;">1️⃣ كمبيوتر الفرع الأساسي</span>
-                <select class="input" id="cctvBridgeDeviceSelect">
-                  <option value="">— اختر جهاز الكمبيوتر الأول في الفرع —</option>
-                </select>
-              </div>
-              <div>
-                <span class="label" style="font-size:11.5px;">2️⃣ كمبيوتر الفرع الاحتياطي (Auto-Failover)</span>
-                <select class="input" id="cctvBackupBridgeSelect">
-                  <option value="">— تلقائي (أي جهاز آخر متصل في نفس الفرع) —</option>
-                </select>
-              </div>
-            </div>
+            <select class="input" id="cctvBridgeDeviceSelect">
+              <option value="">— اختر جهاز الكمبيوتر الموجود في نفس الفرع / المخزن —</option>
+            </select>
             <div id="cctvBridgeUpgradeBox" style="display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
               <div id="cctvBridgeUpgradeText" style="font-size:12.5px;font-weight:700;color:#f59e0b;">⚠ هذا الجهاز يعمل بإصدار أقدم من v1.1.0 ويحتاج تحديثاً صامتاً لتشغيل جميع المزايا المتقدمة.</div>
               <button type="button" class="btn btn-primary btn-sm" id="cctvUpgradeBridgeBtn">⬆️ ترقية جهاز الفرع لـ v1.1.0 الآن (صامت)</button>
@@ -1715,14 +1701,16 @@
                 <input type="number" class="input mono" id="cctvHttpPortInput" dir="ltr" value="80" min="1" max="65535">
               </div>
               <div class="field" style="margin-bottom:0;">
-                <span class="label">عدد الكاميرات (القنوات)</span>
+                <span class="label">نوع الجهاز / عدد الكاميرات (DVR أو IP Cam)</span>
                 <select class="input" id="cctvChannelsInput">
-                  <option value="4">4 كاميرات</option>
-                  <option value="8" selected>8 كاميرات</option>
-                  <option value="16">16 كاميرا</option>
-                  <option value="24">24 كاميرا</option>
-                  <option value="32">32 كاميرا</option>
-                  <option value="64">64 كاميرا</option>
+                  <option value="1">1 كاميرا (IP Cam مستقلة)</option>
+                  <option value="2">2 كاميرا (IP Cam)</option>
+                  <option value="4">4 كاميرات (DVR 4Ch)</option>
+                  <option value="8" selected>8 كاميرات (DVR 8Ch)</option>
+                  <option value="16">16 كاميرا (DVR 16Ch)</option>
+                  <option value="24">24 كاميرا (NVR 24Ch)</option>
+                  <option value="32">32 كاميرا (NVR 32Ch)</option>
+                  <option value="64">64 كاميرا (NVR 64Ch)</option>
                 </select>
               </div>
             </div>
@@ -1760,8 +1748,9 @@
           </div>
         </div>
 
-        <!-- شاشة العرض الجدارية للكاميرات (CCTV Wall) -->
-        <div id="cctvWallGrid" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;"></div>
+        <!-- شاشة العرض الجدارية للكاميرات (CCTV Pro NVR Wall) -->
+        <div id="cctvWallGrid" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;background:#030712;padding:6px;border-radius:12px;border:1px solid rgba(148,163,184,0.16);min-height:calc(100vh - 210px);align-content:stretch;"></div>
+        </div>
       </section>
 
       <!-- Logs -->
@@ -1791,69 +1780,73 @@
     </div>
   </div>
 
-  <div class="modal-overlay" id="cctvHdModal">
-    <div class="modal cctv-hud-modal">
-      <div id="cctvHdViewport" class="fill-screen cctv-hud-stage" title="اضغط مرتين (Double Click) لملء الشاشة الكامل · اسحب يميناً ويساراً على الآيباد والموبايل للتقليب">
-        <img id="cctvHdBackImg" alt="" draggable="false" style="position:absolute;width:100%;height:100%;max-width:100%;max-height:100%;display:none;transform-origin:center center;transition:transform 0.08s ease-out;pointer-events:none;">
-        <img id="cctvHdImg" alt="CCTV HD" draggable="false" style="position:relative;width:100%;height:100%;max-width:100%;max-height:100%;display:none;transform-origin:center center;transition:transform 0.08s ease-out;">
-        <div id="cctvHdEmpty" style="color:#94a3b8;font-size:14px;font-weight:700;padding:48px;text-align:center;">⏳ جاري الاتصال بالكاميرا...</div>
-
-        <!-- الشريط الزجاجي العلوي العائم (Floating Top Glass HUD) -->
-        <div class="cctv-hud-top" id="cctvHudTopBar">
-          <div class="cctv-hud-title-box">
-            <span class="badge green" id="cctvHdLiveBadge">● LIVE</span>
-            <div style="min-width:0;">
-              <h3 id="cctvHdTitle" style="margin:0;color:#f8fafc;font-size:15.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">بث مباشر للكاميرا</h3>
-              <div id="cctvHdSub" style="font-size:11.5px;color:#cbd5e1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">دبل كليك لملء الشاشة · اسحب للتقليب</div>
-            </div>
-          </div>
-          <div class="cctv-hud-top-actions">
-            <button class="hud-pill-btn" id="cctvHdStarBtn" type="button" title="تثبيت في شاشة VIP">☆ مفضلة</button>
-            <button class="hud-pill-btn" id="cctvHdRenameBtn" type="button" title="تسمية الكاميرا">✏ تسمية</button>
-            <button class="hud-pill-btn" id="cctvHdHideChanBtn" type="button" style="color:#fca5a5;" title="إخفاء هذه القناة">🙈 إخفاء</button>
-            <button class="hud-pill-btn danger" id="cctvHdCloseBtn" type="button" title="إغلاق (Esc)">✕ إغلاق</button>
+  <div class="modal-overlay" id="cctvHdModal" style="padding:0;background:#000000;">
+    <div class="modal" id="cctvHdModalCard" style="width:100vw;max-width:100vw;height:100vh;max-height:100vh;margin:0;padding:0;border:none;border-radius:0;display:flex;flex-direction:column;background:#000000;color:#f8fafc;position:relative;overflow:hidden;">
+      <!-- شريط علوي عائم شفاف فوق الكاميرا المكبرة بدون أخذ أي مساحة من الصورة (يختفي تلقائياً عند ثبات الماوس) -->
+      <div id="cctvHdTopHud" style="position:absolute;top:0;left:0;right:0;z-index:20;padding:10px 16px;background:linear-gradient(180deg,rgba(2,6,23,0.92) 0%,rgba(2,6,23,0.55) 70%,rgba(2,6,23,0) 100%);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;transition:opacity 0.32s ease,transform 0.32s ease;">
+        <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+          <button class="btn btn-ghost btn-sm" id="cctvHdCloseBtnTop" type="button" style="background:rgba(239,68,68,0.88);color:#ffffff;border:none;font-weight:800;padding:5px 12px;border-radius:8px;" title="إغلاق والعودة لشبكة الكاميرات (Esc)">✕ إغلاق</button>
+          <div>
+            <h3 id="cctvHdTitle" style="margin:0;color:#f8fafc;font-size:16px;text-shadow:0 2px 6px rgba(0,0,0,0.9);">بث مباشر عالي الدقة HD</h3>
+            <div id="cctvHdSub" style="font-size:11.5px;color:#cbd5e1;margin-top:1px;text-shadow:0 1px 4px rgba(0,0,0,0.9);">البث الرئيسي عالي الجودة (Main Stream HD) · اضغط مرتين على الصورة أو زر «⛶ شاشة كاملة» لملء الشاشة 100%</div>
           </div>
         </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <span class="badge green" id="cctvHdLiveBadge" style="font-size:11.5px;padding:4px 10px;">● LIVE HD</span>
+          <span class="badge blue mono" id="cctvHdCodecBadge" style="font-size:11px;padding:4px 9px;">WebRTC / MSE</span>
+          <button class="btn btn-primary btn-sm" id="cctvHdTrueFullscreenBtn" type="button" style="background:linear-gradient(135deg,#0ea5e9,#2563eb);border:none;font-weight:800;padding:5px 12px;" title="تكبير الكاميرا إلى شاشة مملوءة بالكامل 100% بدون شريط عنوان (Fullscreen — اختصار F)">⛶ شاشة مملوءة بالكامل</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdPipBtn" type="button" style="background:rgba(15,23,42,0.82);color:#38bdf8;border-color:rgba(56,189,248,0.35);font-weight:800;" title="نافذة فيديو عائمة فوق البرامج الأخرى (Picture-in-Picture — اختصار P)">⧉ PiP عائم</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdAudioBtn" type="button" style="background:rgba(15,23,42,0.82);color:#34d399;border-color:rgba(52,211,153,0.45);font-weight:800;" title="تشغيل أو كتم الصوت (اختصار M)">🔇 تشغيل الصوت</button>
+          <input type="range" id="cctvHdVolumeSlider" min="20" max="250" value="135" style="width:74px;accent-color:#10b981;cursor:pointer;display:none;" title="مستوى وتكبير صوت المايك (حتى 250%)">
+          <button class="btn btn-ghost btn-sm" id="cctvHdStreamSwitchBtn" type="button" style="background:rgba(15,23,42,0.82);color:#10b981;border-color:rgba(16,185,129,0.4);font-weight:800;" title="التبديل بين Main Stream HD و Sub Stream SD">✨ Main HD</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdFitToggleBtn" type="button" style="background:rgba(15,23,42,0.82);color:#38bdf8;border-color:rgba(56,189,248,0.35);" title="تبديل Fit to Screen (الحفاظ على الأبعاد) أو Fill Screen (ملء الشاشة بالكامل)">🖼️ Fill Screen</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdZoomOutBtn" type="button" style="background:rgba(15,23,42,0.82);color:#e2e8f0;border-color:rgba(148,163,184,0.3);">🔍−</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdZoomResetBtn" type="button" style="background:rgba(15,23,42,0.82);color:#e2e8f0;border-color:rgba(148,163,184,0.3);">1x</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdZoomInBtn" type="button" style="background:rgba(15,23,42,0.82);color:#e2e8f0;border-color:rgba(148,163,184,0.3);">🔍+</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdPtzToggleBtn" type="button" style="background:rgba(15,23,42,0.82);color:#38bdf8;border-color:rgba(56,189,248,0.35);">🕹️ PTZ</button>
+        </div>
+      </div>
 
-        <!-- أزرار التقليب الجانبية العائمة للآيباد والأندرويد والكمبيوتر -->
-        <button class="cctv-hud-side-nav prev" id="cctvHdPrevBtn" type="button" title="الكاميرا السابقة (السهم الأيمن)">❯</button>
-        <button class="cctv-hud-side-nav next" id="cctvHdNextBtn" type="button" title="الكاميرا التالية (السهم الأيسر)">❮</button>
+      <!-- مساحة عرض الكاميرا المكبرة: تملأ 100% من الشاشة بدون أي حواف مع مشغل <video> المسرع بكرت الشاشة -->
+      <div id="cctvHdViewport" style="position:relative;width:100vw;height:100vh;flex:1;background:#000000;overflow:hidden;display:flex;align-items:center;justify-content:center;user-select:none;touch-action:none;">
+        <video id="cctvHdVideo" muted playsinline autoplay style="width:100%;height:100%;display:none;object-fit:fill;background:#000000;transform-origin:center center;transition:transform 0.08s ease-out;"></video>
+        <img id="cctvHdImg" alt="CCTV HD" draggable="false" style="width:100%;height:100%;display:none;object-fit:fill;transform-origin:center center;transition:transform 0.08s ease-out;">
+        <div id="cctvHdEmpty" style="color:#94a3b8;font-size:14px;padding:48px;text-align:center;">⚡ جاري فتح البث الحي عالي الدقة HD...</div>
 
         <!-- لوحة تحكم الكاميرات المتحركة PTZ العائمة -->
-        <div id="cctvPtzPad" style="display:none;position:absolute;bottom:84px;right:18px;padding:12px;border-radius:16px;background:rgba(9,15,28,0.88);border:1px solid rgba(56,189,248,0.45);backdrop-filter:blur(14px);z-index:30;">
+        <div id="cctvPtzPad" style="display:none;position:absolute;bottom:64px;right:18px;z-index:25;padding:10px;border-radius:12px;background:rgba(15,23,42,0.9);border:1px solid rgba(56,189,248,0.45);backdrop-filter:blur(8px);">
           <div style="font-size:11px;color:#38bdf8;font-weight:800;text-align:center;margin-bottom:6px;">🕹️ تحريك وتكبير PTZ</div>
-          <div style="display:grid;grid-template-columns:repeat(3,38px);gap:5px;justify-content:center;margin-bottom:6px;">
+          <div style="display:grid;grid-template-columns:repeat(3,36px);gap:4px;justify-content:center;margin-bottom:6px;">
             <span></span>
-            <button type="button" class="hud-pill-btn" data-ptz-code="Up" style="padding:6px 0;justify-content:center;">⬆</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-ptz-code="Up" style="padding:6px 0;color:#f8fafc;">⬆</button>
             <span></span>
-            <button type="button" class="hud-pill-btn" data-ptz-code="Left" style="padding:6px 0;justify-content:center;">⬅</button>
-            <span style="display:flex;align-items:center;justify-content:center;font-size:11px;color:#94a3b8;font-weight:800;">PTZ</span>
-            <button type="button" class="hud-pill-btn" data-ptz-code="Right" style="padding:6px 0;justify-content:center;">➡</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-ptz-code="Left" style="padding:6px 0;color:#f8fafc;">⬅</button>
+            <span style="display:flex;align-items:center;justify-content:center;font-size:11px;color:#94a3b8;">PTZ</span>
+            <button type="button" class="btn btn-ghost btn-sm" data-ptz-code="Right" style="padding:6px 0;color:#f8fafc;">➡</button>
             <span></span>
-            <button type="button" class="hud-pill-btn" data-ptz-code="Down" style="padding:6px 0;justify-content:center;">⬇</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-ptz-code="Down" style="padding:6px 0;color:#f8fafc;">⬇</button>
             <span></span>
           </div>
-          <div style="display:flex;gap:5px;justify-content:center;">
-            <button type="button" class="hud-pill-btn" data-ptz-code="ZoomTele" style="font-size:11px;">➕ تقريب</button>
-            <button type="button" class="hud-pill-btn" data-ptz-code="ZoomWide" style="font-size:11px;">➖ تبعيد</button>
+          <div style="display:flex;gap:4px;justify-content:center;">
+            <button type="button" class="btn btn-ghost btn-sm" data-ptz-code="ZoomTele" style="padding:4px 8px;font-size:11px;color:#f8fafc;">➕ تقريب بصري</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-ptz-code="ZoomWide" style="padding:4px 8px;font-size:11px;color:#f8fafc;">➖ تبعيد</button>
           </div>
         </div>
+      </div>
 
-        <!-- شريط التحكم الزجاجي السفلي العائم (Apple TV / UniFi Protect Floating Glass Dock) -->
-        <div class="cctv-hud-dock" id="cctvHudBottomDock">
-          <button class="hud-pill-btn primary" id="cctvHdFullscreenBtn" type="button" title="ملء الشاشة الكامل (F أو دبل كليك)">⛶ ملء الشاشة</button>
-          <button class="hud-pill-btn" id="cctvHdQualityBtn" type="button" title="التبديل بين البث السريع SD والبث فائق الدقة HD 1080p">⚡ سريع SD</button>
-          <button class="hud-pill-btn" id="cctvHdAspectBtn" type="button" title="تبديل ملء الإطار 16:9 أو الأبعاد الأصلية">↔ ملء الإطار</button>
-          <button class="hud-pill-btn audio" id="cctvHdAudioBtn" type="button">🔇 الصوت</button>
-          <input type="range" id="cctvHdVolumeSlider" min="20" max="250" value="135" style="width:70px;accent-color:#10b981;cursor:pointer;display:none;" title="مستوى صوت المايك (حتى 250%)">
-          <div class="hud-zoom-group">
-            <button class="hud-pill-btn" id="cctvHdZoomOutBtn" type="button" title="تصغير">−</button>
-            <button class="hud-pill-btn" id="cctvHdZoomResetBtn" type="button" title="إعادة الزوم 1x">1x</button>
-            <button class="hud-pill-btn" id="cctvHdZoomInBtn" type="button" title="تكبير">+</button>
-          </div>
-          <button class="hud-pill-btn" id="cctvHdPtzToggleBtn" type="button" title="تحريك الكاميرا PTZ">🕹️ PTZ</button>
-          <button class="hud-pill-btn" id="cctvHdPlaybackJumpBtn" type="button" title="استرجاع تسجيلات هذه الكاميرا">⏪ التسجيلات</button>
-          <button class="hud-pill-btn success" id="cctvHdDownloadBtn" type="button" title="حفظ لقطة صورة فوراً">📸 لقطة</button>
+      <!-- شريط سفلي عائم للتنقل السريع بين الكاميرات واللقطات (يختفي تلقائياً عند ثبات الماوس) -->
+      <div id="cctvHdBottomHud" style="position:absolute;bottom:0;left:0;right:0;z-index:20;padding:10px 18px;background:linear-gradient(0deg,rgba(2,6,23,0.92) 0%,rgba(2,6,23,0.55) 70%,rgba(2,6,23,0) 100%);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;transition:opacity 0.32s ease,transform 0.32s ease;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-ghost btn-sm" id="cctvHdPrevBtn" type="button" style="background:rgba(15,23,42,0.84);color:#f8fafc;border-color:rgba(148,163,184,0.35);font-weight:700;">➡ الكاميرا السابقة</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdNextBtn" type="button" style="background:rgba(15,23,42,0.84);color:#f8fafc;border-color:rgba(148,163,184,0.35);font-weight:700;">الكاميرا التالية ⬅</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdStarBtn" type="button" style="background:rgba(15,23,42,0.84);color:#fbbf24;border-color:rgba(251,191,36,0.35);">☆ مفضلة</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdRenameBtn" type="button" style="background:rgba(15,23,42,0.84);color:#e2e8f0;border-color:rgba(148,163,184,0.3);">✏ تسمية</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdHideChanBtn" type="button" style="background:rgba(15,23,42,0.84);color:#fca5a5;border-color:rgba(248,113,113,0.3);">🙈 إخفاء القناة</button>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-ghost btn-sm" id="cctvHdPlaybackJumpBtn" type="button" style="background:rgba(15,23,42,0.84);color:#38bdf8;border-color:rgba(56,189,248,0.35);">⏪ تسجيلات الكاميرا</button>
+          <button class="btn btn-success btn-sm" id="cctvHdDownloadBtn" type="button">📸 حفظ لقطة HD</button>
+          <button class="btn btn-ghost btn-sm" id="cctvHdCloseBtn" type="button" style="background:rgba(239,68,68,0.85);color:#ffffff;border:none;font-weight:800;">✕ إغلاق</button>
         </div>
       </div>
     </div>
@@ -1861,14 +1854,14 @@
 
   <!-- نافذة استرجاع التسجيلات والبحث الزمني في هارد الـ DVR -->
   <div class="modal-overlay" id="cctvPlaybackModal">
-    <div class="modal" style="max-width:860px;max-height:92vh;overflow-y:auto;-webkit-overflow-scrolling:touch;display:flex;flex-direction:column;">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;position:sticky;top:0;z-index:5;background:var(--surface);padding-bottom:8px;border-bottom:1px solid var(--border);">
+    <div class="modal" style="max-width:780px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
         <h3 style="margin:0;">⏪ استرجاع التسجيلات وسحب مقاطع الأحداث عن بُعد</h3>
-        <button class="btn btn-ghost btn-sm" id="cctvPlaybackCloseTop" type="button">✕ إغلاق</button>
+        <button class="btn btn-ghost btn-sm" id="cctvPlaybackCloseTop" type="button">✕</button>
       </div>
-      <div class="hint" style="margin-bottom:12px;">يبحث مباشرة داخل هارد التسجيل (`HDD`) الخاص بجهاز Dahua DVR في الفرع ويسحب مقطع الحدث بصيغة <b>MP4</b> جاهزة للتشغيل على الكمبيوتر والآيباد والموبايل.</div>
+      <div class="hint" style="margin-bottom:12px;">يبحث مباشرة داخل هارد التسجيل (`HDD`) الخاص بجهاز Dahua DVR في الفرع ويسحب مقطع الحدث دون الحاجة لفتح `SmartPSS`.</div>
 
-      <div class="grid cols-3" style="gap:10px;margin-bottom:10px;">
+      <div class="grid cols-2" style="gap:10px;margin-bottom:10px;">
         <div class="field" style="margin-bottom:0;">
           <span class="label">🏢 الفرع / المخزن</span>
           <select class="input" id="cctvPbBranchSelect"></select>
@@ -1876,18 +1869,6 @@
         <div class="field" style="margin-bottom:0;">
           <span class="label">📹 رقم الكاميرا</span>
           <select class="input" id="cctvPbChannelSelect"></select>
-        </div>
-        <div class="field" style="margin-bottom:0;">
-          <span class="label">⏱️ مدة المقطع المسحوب</span>
-          <select class="input" id="cctvPbDurationSelect" style="font-weight:800;color:var(--primary-2);">
-            <option value="60">1 دقيقة (سريع جداً)</option>
-            <option value="180">3 دقائق</option>
-            <option value="300" selected>5 دقائق (موصى به)</option>
-            <option value="600">10 دقائق</option>
-            <option value="900">15 دقيقة (ربع ساعة)</option>
-            <option value="1800">30 دقيقة (نصف ساعة)</option>
-            <option value="0">المقطع كاملاً (حسب وقت النهاية)</option>
-          </select>
         </div>
       </div>
 
@@ -1904,53 +1885,15 @@
 
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
         <button type="button" class="btn btn-primary btn-sm" id="cctvPbSearchBtn">🔎 البحث في تسجيلات هارد الـ DVR</button>
-        <button type="button" class="btn btn-ghost btn-sm" id="cctvPbPlayQuickBtn" style="border-color:var(--primary-2);color:var(--primary-2);font-weight:800;" title="تشغيل المدة المحددة مباشرة من وقت البداية بدون بحث">▶ تشغيل مباشر من وقت البداية</button>
-        <button type="button" class="btn btn-success btn-sm" id="cctvPbQuickClipBtn" title="تحميل المدة المحددة من وقت البداية بصيغة MP4 مباشرة">⬇ تحميل MP4 من وقت البداية</button>
+        <button type="button" class="btn btn-success btn-sm" id="cctvPbQuickClipBtn" title="سحب أول 60 ثانية من وقت البداية المحدد مباشرة">⬇ سحب مقطع سريع (60 ثانية من وقت البداية)</button>
       </div>
 
-      <div id="cctvPbVideoWrap" style="display:none;margin-bottom:12px;padding:10px;border-radius:12px;background:#000;border:1px solid rgba(56,189,248,0.35);flex-shrink:0;">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
-          <span id="cctvPbVideoTitle" style="font-size:12.5px;font-weight:800;color:#38bdf8;">▶ تشغيل المقطع المسجل</span>
-          <div style="display:flex;gap:6px;">
-            <a id="cctvPbVideoDownloadLink" class="btn btn-success btn-sm" href="#" download style="text-decoration:none;padding:4px 10px;font-size:11.5px;">⬇ حفظ الفيديو (MP4)</a>
-            <button type="button" class="btn btn-ghost btn-sm" id="cctvPbClosePlayerBtn" style="padding:4px 8px;font-size:11.5px;color:#f87171;">✕ إخفاء المشغل</button>
-          </div>
-        </div>
-        <video id="cctvPbVideoPlayer" controls playsinline style="width:100%;max-height:280px;border-radius:8px;background:#000;display:block;"></video>
-      </div>
-
-      <div id="cctvPbResultsBox" class="cctv-pb-results-scroll" style="max-height:340px;min-height:140px;overflow-y:scroll;-webkit-overflow-scrolling:touch;padding:10px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border-strong);font-size:12.5px;">
+      <div id="cctvPbResultsBox" style="max-height:42vh;overflow:auto;padding:10px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border);font-size:12.5px;">
         اختر الفرع والكاميرا والفترة الزمنية ثم اضغط «🔎 البحث في تسجيلات هارد الـ DVR».
       </div>
 
-      <div class="modal-actions" style="margin-top:12px;">
+      <div class="modal-actions">
         <button class="btn btn-ghost" id="cctvPlaybackCloseBtn" type="button">إغلاق</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- نافذة تخصيص قائمة الكاميرات المختصرة VIP (اختيار 1 أو 2 كاميرا من كل فرع لتقليل الحمل) -->
-  <div class="modal-overlay" id="cctvVipModal">
-    <div class="modal" style="max-width:760px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;">
-        <h3 style="margin:0;">⭐ تخصيص قائمة الكاميرات المختصرة (VIP)</h3>
-        <button class="btn btn-ghost btn-sm" id="cctvVipCloseTop" type="button">✕</button>
-      </div>
-      <div class="hint" style="margin-bottom:12px;">
-        اختر <b>كاميرا أو كاميرتين فقط من كل فرع</b> (مثل الكاشير والبوابة)؛ عند حفظ القائمة ستفتح شاشة الكاميرات افتراضياً على هذه القائمة المختصرة فقط لتقليل عدد الشاشات وتخفيف الحمل لأقصى درجة.
-      </div>
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button type="button" class="btn btn-ghost btn-sm" id="cctvVipAutoPick1Btn">⚡ اختيار أول كاميرا من كل فرع</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="cctvVipAutoPick2Btn">⚡ اختيار أول كاميرتين من كل فرع</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="cctvVipClearBtn" style="color:var(--danger);">🗑 إلغاء تحديد الكل</button>
-        </div>
-        <span class="badge gold" id="cctvVipSelectedCountBadge">0 محددة</span>
-      </div>
-      <div id="cctvVipPickerBody" style="max-height:48vh;overflow:auto;display:grid;gap:10px;padding:4px;"></div>
-      <div class="modal-actions" style="margin-top:14px;">
-        <button class="btn btn-ghost" id="cctvVipCancelBtn" type="button">إغلاق</button>
-        <button class="btn btn-primary" id="cctvVipSaveBtn" type="button">💾 حفظ وعرض شاشة VIP الآن</button>
       </div>
     </div>
   </div>
@@ -2010,7 +1953,7 @@
     </div>
   </div>
 
-  <script src="tauri-shim.js?v=302"></script>
-  <script src="index.inline.js?v=302"></script>
+  <script src="tauri-shim.js?v=515"></script>
+  <script src="index.inline.js?v=515"></script>
 </body>
 </html>

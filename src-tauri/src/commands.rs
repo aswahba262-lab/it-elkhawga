@@ -991,7 +991,26 @@ fn get_devices_inner(server: Option<&ServerHandle>) -> Vec<Value> {
         }
     }
     let mut out: Vec<Value> = by_id.into_values().collect();
-    out.sort_by(|a, b| b["last_seen"].as_u64().unwrap_or(0).cmp(&a["last_seen"].as_u64().unwrap_or(0)));
+    out.sort_by(|a, b| {
+        let ao = a["online"].as_bool().unwrap_or(false);
+        let bo = b["online"].as_bool().unwrap_or(false);
+        if ao != bo {
+            return bo.cmp(&ao);
+        }
+        let name_of = |v: &Value| -> String {
+            v["label"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| v["hostname"].as_str().filter(|s| !s.trim().is_empty()))
+                .or_else(|| v["device_id"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase()
+        };
+        name_of(a)
+            .cmp(&name_of(b))
+            .then_with(|| a["device_id"].as_str().unwrap_or("").cmp(b["device_id"].as_str().unwrap_or("")))
+    });
     out
 }
 

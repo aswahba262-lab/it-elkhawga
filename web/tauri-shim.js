@@ -6,7 +6,7 @@
   let authToken = '';
   try {
     authToken = sessionStorage.getItem('ibp_auth_token') || localStorage.getItem('ibp_auth_token') || '';
-  } catch (e) {}
+  } catch (e) { }
 
   function setAuthToken(tok, remember) {
     authToken = tok || '';
@@ -22,7 +22,7 @@
         sessionStorage.removeItem('ibp_auth_token');
         localStorage.removeItem('ibp_auth_token');
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   const isTauri = Boolean(window.__TAURI__ && window.__TAURI__.core);
@@ -31,29 +31,29 @@
     const invoke = isTauri
       ? window.__TAURI__.core.invoke
       : async (cmd, args) => {
-          const headers = { 'Content-Type': 'application/json' };
-          if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
-          const resp = await fetch('/api/rpc', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ cmd, args: args || {} }),
-          });
-          const data = await resp.json().catch(() => ({}));
-          if (resp.status === 401) {
-            setAuthToken('');
-            const modal = document.getElementById('loginModal');
-            if (modal) {
-              modal.classList.add('show');
-              document.body.classList.add('auth-locked');
-            }
-            throw new Error(data.error || 'انتهت الجلسة، يرجى تسجيل الدخول');
+        const headers = { 'Content-Type': 'application/json' };
+        if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+        const resp = await fetch('/api/rpc', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ cmd, args: args || {} }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 401) {
+          setAuthToken('');
+          const modal = document.getElementById('loginModal');
+          if (modal) {
+            modal.classList.add('show');
+            document.body.classList.add('auth-locked');
           }
-          if (!resp.ok) {
-            throw new Error(data.error || ('HTTP ' + resp.status));
-          }
-          return data.result;
-        };
-    const listen = isTauri ? window.__TAURI__.event.listen : () => {};
+          throw new Error(data.error || 'انتهت الجلسة، يرجى تسجيل الدخول');
+        }
+        if (!resp.ok) {
+          throw new Error(data.error || ('HTTP ' + resp.status));
+        }
+        return data.result;
+      };
+    const listen = isTauri ? window.__TAURI__.event.listen : () => { };
 
     window.electronAPI = {
       setAuthToken,
@@ -262,33 +262,36 @@
 
         // Try local IT ELKHAWGA Admin helper on this laptop (127.0.0.1:8787) so view_only
         // in %APPDATA%\RustDesk\config\peers\<id>.toml is configured automatically.
-        try {
-          const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 900);
-          const localRes = await fetch('http://127.0.0.1:8787/api/local/rustdesk-session', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-ITK-Client': '1' },
-            body: JSON.stringify({ rustdeskId: id, password: pw, mode: sessionMode, deviceIp: deviceIp || '' }),
-            signal: ctrl.signal,
-          });
-          clearTimeout(timer);
-          if (localRes && localRes.ok) {
-            const jr = await localRes.json();
-            if (jr && jr.success) return jr;
+        // First send only Content-Type (compatible with v1.1.x CORS preflight), then retry
+        // with X-ITK-Client if v1.2.0 responds with 403.
+        const payloadStr = JSON.stringify({ rustdeskId: id, password: pw, mode: sessionMode, deviceIp: deviceIp || '' });
+        for (const hdrs of [
+          { 'Content-Type': 'application/json' },
+          { 'Content-Type': 'application/json', 'X-ITK-Client': '1' },
+        ]) {
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 900);
+            const localRes = await fetch('http://127.0.0.1:8787/api/local/rustdesk-session', {
+              method: 'POST',
+              headers: hdrs,
+              body: payloadStr,
+              signal: ctrl.signal,
+            });
+            clearTimeout(timer);
+            if (localRes && localRes.ok) {
+              const jr = await localRes.json();
+              if (jr && jr.success) return jr;
+            }
+            if (localRes && localRes.status !== 403) break;
+          } catch (_) {
+            break;
           }
-        } catch (_) {}
+        }
 
         if (sessionMode === 'camera') {
           window.location.href = 'rustdesk://view-camera/' + encodeURIComponent(id) + '?password=' + encodeURIComponent(pw);
           return { success: true };
-        }
-        if (sessionMode === 'watch') {
-          const ok = window.confirm(
-            'أنت تفتح اللوحة من متصفح بعيد بدون تشغيل برنامج IT ELKHAWGA Admin على هذا الجهاز.\n' +
-            '• لقفل التحكم بالماوس والكيبورد تلقائياً شغّل برنامج IT ELKHAWGA Admin على هذا الجهاز، أو فعّل وضع المشاهدة فقط (View Mode) من شريط RustDesk العلوي.\n\n' +
-            'هل تريد فتح اتصال RustDesk الآن؟'
-          );
-          if (!ok) return { success: false, cancelled: true };
         }
         window.location.href = 'rustdesk://connect/' + encodeURIComponent(id) + '?password=' + encodeURIComponent(pw);
         return { success: true };

@@ -64,7 +64,14 @@ fn main() {
     tauri::Builder::default()
         .manage(commands::AppState { server: Mutex::new(server) })
         .setup(move |app| {
-            if let Some(port) = admin_redirect_port {
+            if !common::is_admin_mode() {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.set_title("IT ELKHAWGA - Client | Ahmed Wahba");
+                    let _ = w.eval(
+                        "if (!window.location.pathname.endsWith('client.html')) { window.location.replace('client.html'); }",
+                    );
+                }
+            } else if let Some(port) = admin_redirect_port {
                 if let Some(w) = app.get_webview_window("main") {
                     let js = format!(
                         "if (!window.location.href.startsWith('http://127.0.0.1:{}')) {{ window.location.replace('http://127.0.0.1:{}/'); }}",

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-const POLL_SECONDS: u64 = 4;
+const POLL_SECONDS: u64 = 2;
 
 static SCREEN_WANTED: AtomicBool = AtomicBool::new(false);
 static STREAM_MODE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -47,36 +47,17 @@ struct CctvAudioBridgeSpec {
 static CCTV_AUDIO_SPEC: std::sync::Mutex<Option<CctvAudioBridgeSpec>> = std::sync::Mutex::new(None);
 
 fn sync_cctv_tasks_from_value(val: Option<&Value>) {
-    let now_t = epoch_ms();
     let mut g = CCTV_TASKS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(arr) = val.and_then(|v| v.as_array()) {
-        // Normalize server timestamps into client-local deadlines (`ttl_ms`) so clock skew between
-        // Server and Branch PCs never causes premature expiry or stuck leases!
-        let mut normalized: Vec<Value> = Vec::with_capacity(arr.len());
-        for raw_t in arr {
-            let mut item = raw_t.clone();
-            let ttl = item["ttl_ms"].as_u64().unwrap_or(12_000).clamp(1500, 30_000);
-            item["local_until"] = json!(now_t + ttl);
-            let a_ttl = item["audio_ttl_ms"].as_u64().unwrap_or(0);
-            if a_ttl > 0 {
-                item["local_audio_until"] = json!(now_t + a_ttl.clamp(1500, 20_000));
-            } else {
-                item["local_audio_until"] = json!(0);
-            }
-            normalized.push(item);
-        }
-        *g = normalized;
+        *g = arr.clone();
     } else {
         g.clear();
     }
+    let now_t = epoch_ms();
     let mut next_audio: Option<CctvAudioBridgeSpec> = None;
     for t in g.iter() {
         let ch = t["audio_channel"].as_u64().unwrap_or(0) as u32;
-        let a_until = t["local_audio_until"]
-            .as_u64()
-            .filter(|&u| u > 0)
-            .or_else(|| t["audio_until"].as_u64())
-            .unwrap_or(0);
+        let a_until = t["audio_until"].as_u64().unwrap_or(0);
         if ch > 0 && a_until > now_t {
             let dvr_id = t["dvr_id"].as_str().unwrap_or("").trim().to_string();
             let host = t["host"].as_str().unwrap_or("").trim().to_string();
@@ -230,6 +211,8 @@ fn is_company_erp_url_or_title(s: &str) -> bool {
     let lc = trimmed.to_ascii_lowercase();
     if lc.contains("elkhawaga.uk")
         || lc.contains("10.10.1.1")
+        || lc.contains("192.168.10.102")
+        || lc.contains("26.32.24.229")
         || trimmed.contains("نظام الخواجه")
         || trimmed.contains("طابور الاعتماد")
         || trimmed.contains("الخواجه")
@@ -599,6 +582,7 @@ pub fn run_capture_agent() {
             .into_iter()
             .map(|(k, ts, p)| (k, (ts, p)))
             .collect();
+    let mut last_clip_path = crate::common::read_clipboard_files().into_iter().next();
     let mut last_clip_seq = crate::common::clipboard_sequence_number();
     let mut last_explorer_path: Option<std::path::PathBuf> = None;
     let mut recent_candidate_file: Option<(std::path::PathBuf, Option<std::path::PathBuf>, u64, String, Instant)> = None;
@@ -626,38 +610,17 @@ pub fn run_capture_agent() {
         Option<Instant>,
     )> = None;
     let local_http = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+    let mut last_clean_shot_at: Option<Instant> = None;
     let mut prev_dialog_seen = false;
     let mut cached_link = read_client();
     let mut last_link_read = Instant::now();
+    let _ = (&mut last_pw, &mut last_rd_srv, &mut last_rd_key, &mut last_try, &mut last_ok);
     loop {
         if last_link_read.elapsed() >= Duration::from_secs(5) {
             cached_link = read_client();
             last_link_read = Instant::now();
         }
-        let link = &cached_link;
-        if link.rustdesk_server != last_rd_srv || link.rustdesk_key != last_rd_key {
-            last_rd_srv = link.rustdesk_server.clone();
-            last_rd_key = link.rustdesk_key.clone();
-            configure_rustdesk_server();
-            cached_rd_id.clear();
-            last_rd_check = None;
-        }
-        let pw = link.rustdesk_password.trim().to_string();
-        if !pw.is_empty() {
-            let changed = pw != last_pw;
-            let retry_due = last_ok.is_none() && last_try.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
-            let enforce_due = last_ok.map_or(false, |t| t.elapsed() >= Duration::from_secs(600));
-            if changed || retry_due || enforce_due {
-                last_try = Some(std::time::Instant::now());
-                let ok = crate::common::apply_rustdesk_permanent_password(&pw);
-                if ok && (changed || last_ok.is_none()) {
-                    log_action("RustDesk permanent password applied (unattended access)");
-                }
-                // Remember it either way: a failure is retried by `retry_due` once a minute.
-                last_pw = pw;
-                last_ok = if ok { Some(std::time::Instant::now()) } else { None };
-            }
-        }
+        let _ = &cached_link;
         // Report the RustDesk ID (cached, re-checked at most once every 60s when missing)
         // so we do not spawn external binaries every second.
         if cached_rd_id.is_empty() && last_rd_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60)) {
@@ -678,14 +641,8 @@ pub fn run_capture_agent() {
             }
         }
 
-        let probe_wins = crate::common::inspect_upload_windows_ext();
         let (requested, stream_mode, evidence_wanted, wa_active, wa_proxy_upload, recent_ext_file) = match local_http
-            .get(&format!(
-                "http://{}/local/screenshot?cw={}&ew={}",
-                LOCAL_API_ADDR,
-                if probe_wins.chrome_win_open { 1 } else { 0 },
-                if probe_wins.edge_win_open { 1 } else { 0 }
-            ))
+            .get(&format!("http://{}/local/screenshot", LOCAL_API_ADDR))
             .call()
         {
             Ok(r) => match r.into_json::<Value>() {
@@ -706,17 +663,14 @@ pub fn run_capture_agent() {
                 Err(_) => (false, String::new(), false, false, None, String::new()),
             },
             Err(_) => {
-                // Watchdog: if --agent (127.0.0.1:8788) is not running after reboot, wake it up.
-                if last_agent_wake.map_or(true, |t| t.elapsed() >= Duration::from_secs(10)) {
+                // Watchdog: if --agent (127.0.0.1:8788) is not running after reboot, wake the SYSTEM scheduled task.
+                // NEVER spawn --agent directly from --capture-agent (which runs as a non-elevated user),
+                // otherwise a non-elevated --agent would grab port 8788 and prevent the SYSTEM task from running!
+                if last_agent_wake.map_or(true, |t| t.elapsed() >= Duration::from_secs(15)) {
                     last_agent_wake = Some(std::time::Instant::now());
                     let mut sc = std::process::Command::new("schtasks");
                     sc.args(["/Run", "/TN", "IT ELKHAWGA Agent"]);
                     let _ = crate::common::hidden(&mut sc).output();
-                    if let Ok(exe) = std::env::current_exe() {
-                        let mut c = std::process::Command::new(&exe);
-                        c.arg("--agent");
-                        let _ = crate::common::hidden(&mut c).spawn();
-                    }
                 }
                 (false, String::new(), false, false, None, String::new())
             }
@@ -748,23 +702,21 @@ pub fn run_capture_agent() {
             // Wait briefly if a File Open dialog is still closing, then settle so the
             // actual WhatsApp/browser window renders instead of File Explorer.
             let wait_start = Instant::now();
-            while wait_start.elapsed() < Duration::from_millis(600) {
+            while wait_start.elapsed() < Duration::from_millis(1500) {
                 let w = crate::common::inspect_upload_windows_ext();
                 if !w.browser_open_dialog && !w.any_open_dialog {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(120));
+                std::thread::sleep(Duration::from_millis(150));
             }
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(750));
             let win_ev = crate::common::inspect_upload_windows_ext();
             let is_wa_ev = win_ev.wa_open || wa_active || win_ev.fg_is_wa;
             let shot = capture_upload_target_screen(&win_ev, is_wa_ev, &last_clean_wa_shot)
                 .or_else(|| captured_now.clone());
-            // Never grab the physical USB webcam during background DLP/tamper evidence capture
-            // so the employee's browser camera is always free for ERP QR-Code login (elkhawaga.uk).
-            let cam: Option<String> = None;
+            let cam = crate::common::capture_webcam_base64();
             let (mut recip_q, mut phone_q, mut site_q, _) =
-                crate::common::query_active_upload_context(false);
+                crate::common::query_active_upload_context(true);
             if recip_q.is_empty() && cached_ctx.3.elapsed() <= Duration::from_secs(120) {
                 recip_q = cached_ctx.0.clone();
                 if phone_q.is_empty() {
@@ -800,9 +752,9 @@ pub fn run_capture_agent() {
 
         let mut fast_dialog_poll = false;
         if !is_admin_mode() {
-            let win = probe_wins;
+            let win = crate::common::inspect_upload_windows_ext();
             fast_dialog_poll = win.browser_open_dialog || win.any_open_dialog;
-            let dialog_just_opened = !prev_dialog_seen && win.browser_open_dialog;
+            let _dialog_just_opened = !prev_dialog_seen && win.browser_open_dialog;
             prev_dialog_seen = win.browser_open_dialog;
 
             let prev_browser_dialog = was_browser_dialog_open && !win.browser_open_dialog;
@@ -815,8 +767,8 @@ pub fn run_capture_agent() {
                 was_browser_dialog_open = false;
             }
 
-            let _ = &mut last_explorer_poll;
-            // Lightweight zero-PowerShell, zero-GDI, zero-disk context tracking during normal browsing:
+            let _ = (&mut last_explorer_poll, &mut last_clean_shot_at, &mut last_clean_wa_shot);
+            // Lightweight zero-PowerShell, zero-GDI context tracking during normal browsing:
             if (win.browser_open || win.wa_open)
                 && last_ctx_poll.map_or(true, |t| t.elapsed() >= Duration::from_millis(3500))
             {
@@ -825,14 +777,11 @@ pub fn run_capture_agent() {
                 let ph = normalize_extracted_phone(&rc);
                 let title_is_wa = is_title_whatsapp(&win.best_title);
                 if (win.fg_is_wa || title_is_wa) && !is_noise_recipient_label(&rc) {
-                    let keep_ph = if !ph.is_empty() {
-                        ph.clone()
-                    } else if cached_wa_ctx.0 == rc {
-                        cached_wa_ctx.1.clone()
-                    } else {
-                        String::new()
-                    };
-                    cached_wa_ctx = (rc.clone(), keep_ph, Instant::now());
+                    cached_wa_ctx = (
+                        rc.clone(),
+                        if !ph.is_empty() { ph.clone() } else { cached_wa_ctx.1.clone() },
+                        Instant::now(),
+                    );
                 }
                 let st = win.best_title.trim().to_string();
                 if (!is_noise_recipient_label(&rc) || !ph.is_empty() || !st.is_empty())
@@ -848,14 +797,9 @@ pub fn run_capture_agent() {
                 }
             }
 
-            if dialog_just_opened {
+            if dialog_just_opened && (win.wa_open || win.fg_is_wa || is_title_whatsapp(&win.best_title)) {
                 let (rc, mut ph, st, exp_files, _) = crate::common::query_active_upload_context_ext(false);
                 let dialog_for_wa = win.wa_open && (win.fg_is_wa || is_title_whatsapp(&st) || st.to_ascii_lowercase().contains("whatsapp"));
-                if dialog_for_wa && win.wa_hwnd != 0 {
-                    if let Some(clean_img) = crate::common::capture_window_base64(win.wa_hwnd, 1366) {
-                        last_clean_wa_shot = Some((clean_img, Instant::now()));
-                    }
-                }
                 if ph.is_empty() && !rc.is_empty() && dialog_for_wa {
                     if let Some(p) = crate::common::lookup_whatsapp_phone_by_name(&rc) {
                         ph = p;
@@ -951,6 +895,13 @@ pub fn run_capture_agent() {
                         std::thread::sleep(Duration::from_millis(650));
 
                         let win_now = crate::common::inspect_upload_windows_ext();
+                        if !win_now.fg_is_wa
+                            && !is_title_whatsapp(&win_now.best_title)
+                            && (is_company_erp_url_or_title(&win_now.best_title)
+                                || is_company_erp_url_or_title(&cached_ctx.2))
+                        {
+                            last_wa_alert = Some((flc, Instant::now()));
+                        } else {
                         let (mut r_name, mut r_phone, mut page_site, _, in_wa_prev) =
                             crate::common::query_active_upload_context_ext(false);
                         let is_wa_target = win_now.wa_open
@@ -979,10 +930,7 @@ pub fn run_capture_agent() {
                                 Instant::now(),
                                 None,
                             ));
-                        } else if !is_company_erp_url_or_title(&win_now.best_title)
-                            && !is_company_erp_url_or_title(&page_site)
-                            && !is_company_erp_url_or_title(&cached_ctx.2)
-                        {
+                        } else if !is_company_erp_url_or_title(&page_site) {
                             if is_noise_recipient_label(&r_name) && cached_ctx.3.elapsed() <= Duration::from_secs(120) {
                                 r_name = cached_ctx.0.clone();
                             }
@@ -993,29 +941,28 @@ pub fn run_capture_agent() {
                                     win_now.best_title.clone()
                                 };
                             }
-                            if !is_company_erp_url_or_title(&page_site) {
-                                std::thread::sleep(Duration::from_millis(300));
-                                let win_web = crate::common::inspect_upload_windows_ext();
-                                let shot = capture_upload_target_screen(&win_web, false, &last_clean_wa_shot)
-                                    .or_else(|| captured_now.clone());
-                                let cam: Option<String> = None;
-                                let fpath_str = p.to_string_lossy().to_string();
-                                let staged_str = staged.as_ref().map(|s| s.to_string_lossy().to_string());
-                                send_whatsapp_upload_report(
-                                    &fname,
-                                    fsize,
-                                    &fpath_str,
-                                    staged_str.as_deref(),
-                                    &r_name,
-                                    &r_phone,
-                                    &page_site,
-                                    "capture_web_dialog",
-                                    shot.as_deref(),
-                                    cam.as_deref(),
-                                    None,
-                                );
-                                last_wa_alert = Some((flc, Instant::now()));
-                            }
+                            std::thread::sleep(Duration::from_millis(500));
+                            let win_web = crate::common::inspect_upload_windows_ext();
+                            let shot = capture_upload_target_screen(&win_web, false, &last_clean_wa_shot)
+                                .or_else(|| captured_now.clone());
+                            let cam = crate::common::capture_webcam_base64();
+                            let fpath_str = p.to_string_lossy().to_string();
+                            let staged_str = staged.as_ref().map(|s| s.to_string_lossy().to_string());
+                            send_whatsapp_upload_report(
+                                &fname,
+                                fsize,
+                                &fpath_str,
+                                staged_str.as_deref(),
+                                &r_name,
+                                &r_phone,
+                                &page_site,
+                                "capture_web_dialog",
+                                shot.as_deref(),
+                                cam.as_deref(),
+                                None,
+                            );
+                            last_wa_alert = Some((flc, Instant::now()));
+                        }
                         }
                     }
                 }
@@ -1025,10 +972,24 @@ pub fn run_capture_agent() {
             if cur_clip_seq != last_clip_seq {
                 let cur_clip = crate::common::read_clipboard_files().into_iter().next();
                 if let Some(ref p) = cur_clip {
-                    let fsize = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                    let staged = stage_user_session_file(p);
-                    recent_candidate_file =
-                        Some((p.clone(), staged, fsize, "clipboard".into(), Instant::now()));
+                    if cur_clip != last_clip_path || cur_clip_seq != last_clip_seq {
+                        let fsize = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        let staged = stage_user_session_file(p);
+                        recent_candidate_file =
+                            Some((p.clone(), staged, fsize, "clipboard".into(), Instant::now()));
+                    }
+                    last_clip_path = cur_clip;
+                } else if win.wa_open || win.browser_open {
+                    if let Some(png_p) = crate::common::stage_clipboard_dib_png(&staging_dir()) {
+                        let fsize = std::fs::metadata(&png_p).map(|m| m.len()).unwrap_or(0);
+                        recent_candidate_file = Some((
+                            png_p.clone(),
+                            Some(png_p),
+                            fsize,
+                            "clipboard_image".into(),
+                            Instant::now(),
+                        ));
+                    }
                 }
                 last_clip_seq = cur_clip_seq;
             }
@@ -1098,7 +1059,7 @@ pub fn run_capture_agent() {
                         }
                         let shot = capture_upload_target_screen(&win_now, true, &last_clean_wa_shot)
                             .or_else(|| captured_now.clone());
-                        let cam: Option<String> = None;
+                        let cam = crate::common::capture_webcam_base64();
                         let fpath_str = p_path.to_string_lossy().to_string();
                         let staged_str = stg_opt.as_ref().map(|s| s.to_string_lossy().to_string());
                         send_whatsapp_upload_report(
@@ -1181,7 +1142,7 @@ pub fn run_capture_agent() {
                                 }
                                 let shot = capture_upload_target_screen(&win_now, true, &last_clean_wa_shot)
                                     .or(captured_now);
-                                let cam: Option<String> = None;
+                                let cam = crate::common::capture_webcam_base64();
                                 send_whatsapp_upload_report(
                                     &fname,
                                     fsize,
@@ -1205,7 +1166,7 @@ pub fn run_capture_agent() {
         std::thread::sleep(Duration::from_millis(if fast_dialog_poll || mode_code != 0 {
             350
         } else {
-            3500
+            2500
         }));
     }
 }
@@ -1251,7 +1212,61 @@ fn start_usb_monitor() {
     });
 }
 
+#[cfg(windows)]
+fn is_process_elevated() -> bool {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            ProcessHandle: *mut std::ffi::c_void,
+            DesiredAccess: u32,
+            TokenHandle: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            TokenHandle: *mut std::ffi::c_void,
+            TokenInformationClass: u32,
+            TokenInformation: *mut std::ffi::c_void,
+            TokenInformationLength: u32,
+            ReturnLength: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: u32 = 20;
+    unsafe {
+        let mut tok: *mut std::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 || tok.is_null() {
+            return false;
+        }
+        let mut elevated: u32 = 0;
+        let mut ret_len: u32 = 0;
+        let ok = GetTokenInformation(
+            tok,
+            TOKEN_ELEVATION,
+            (&mut elevated as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut ret_len,
+        ) != 0;
+        CloseHandle(tok);
+        ok && elevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn is_process_elevated() -> bool {
+    true
+}
+
 pub fn run() {
+    if !is_admin_mode() && !is_process_elevated() {
+        let mut sc = std::process::Command::new("schtasks");
+        sc.args(["/Run", "/TN", "IT ELKHAWGA Agent"]);
+        let _ = crate::common::hidden(&mut sc).output();
+        return;
+    }
     ensure_data();
     grant_users_data_access();
     crate::common::ensure_rustdesk_stealth_config();
@@ -1291,29 +1306,32 @@ pub fn run() {
     // elevated SYSTEM `--agent` process so Registry updates never hit Access Denied.
     if !is_admin_mode() {
         std::thread::spawn(|| {
+            crate::common::ensure_whatsapp_web_extension();
             let init_ephem = read_client().ephemeral_browser || read_config().ephemeral_browser;
             crate::common::apply_ephemeral_browser_policy(init_ephem);
             crate::common::enforce_rustdesk_employee_lockdown(&read_client().rustdesk_password);
             if init_ephem {
-                crate::common::wipe_browser_data_if_closed(true);
+                crate::common::wipe_browser_data_if_closed(false);
             } else {
                 crate::common::protect_erp_browser_vault_if_closed();
             }
             let mut last_ephem = init_ephem;
-            let (mut was_chrome_open, mut was_edge_open) = crate::common::are_browsers_running();
+            let mut was_chrome_open = crate::common::is_process_running("chrome.exe");
+            let mut was_edge_open = crate::common::is_process_running("msedge.exe");
             let mut last_rd_lock_tick = Instant::now();
             loop {
-                std::thread::sleep(Duration::from_secs(6));
+                std::thread::sleep(Duration::from_secs(10));
                 let link_now = read_client();
                 let ephem = link_now.ephemeral_browser || read_config().ephemeral_browser;
                 if ephem != last_ephem {
                     crate::common::apply_ephemeral_browser_policy(ephem);
                     if ephem {
-                        crate::common::wipe_browser_data_if_closed(true);
+                        crate::common::wipe_browser_data_if_closed(false);
                     }
                     last_ephem = ephem;
                 }
-                let (chrome_open, edge_open) = crate::common::are_browsers_running();
+                let chrome_open = crate::common::is_process_running("chrome.exe");
+                let edge_open = crate::common::is_process_running("msedge.exe");
                 let browser_just_closed = (was_chrome_open && !chrome_open) || (was_edge_open && !edge_open);
                 was_chrome_open = chrome_open;
                 was_edge_open = edge_open;
@@ -1397,18 +1415,12 @@ pub fn run() {
                 let now_t = epoch_ms();
                 let active_tasks: Vec<Value> = {
                     let mut g = CCTV_TASKS.lock().unwrap_or_else(|e| e.into_inner());
-                    g.retain(|t| {
-                        t["local_until"]
-                            .as_u64()
-                            .or_else(|| t["until"].as_u64())
-                            .unwrap_or(0)
-                            > now_t
-                    });
+                    g.retain(|t| t["until"].as_u64().unwrap_or(0) > now_t);
                     g.clone()
                 };
 
                 if active_tasks.is_empty() {
-                    std::thread::sleep(Duration::from_millis(600));
+                    std::thread::sleep(Duration::from_millis(250));
                     continue;
                 }
 
@@ -1426,7 +1438,6 @@ pub fn run() {
                     let username = task["username"].as_str().unwrap_or("admin").to_string();
                     let password = task["password"].as_str().unwrap_or("").to_string();
                     let hd = task["hd"].as_bool().unwrap_or(false);
-                    let max_conc = (task["concurrency"].as_u64().unwrap_or(4) as usize).clamp(1, 4);
                     let channels: Vec<u32> = task["channels"]
                         .as_array()
                         .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
@@ -1435,7 +1446,7 @@ pub fn run() {
                         continue;
                     }
                     total_channels += channels.len();
-                    for chunk in channels.chunks(max_conc) {
+                    for chunk in channels.chunks(4) {
                         std::thread::scope(|s| {
                             for &ch in chunk {
                                 let dvr_id_ref = &dvr_id;
@@ -1662,13 +1673,20 @@ fn apply_client_self_update(cmd_id: &str) -> Result<(), String> {
             return;
         };
 
-        let temp_exe = std::env::temp_dir().join("it-elkhawga-client-update.exe");
-        if let Err(e) = std::fs::write(&temp_exe, &bytes) {
-            log_action(&format!("Client self-update write failed: {}", e));
-            UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
-            return;
-        }
-        // Only record last_command_id AFTER the valid installer binary is verified on disk
+        // Save installer to C:\ProgramData\InternetBlocker\itk-client-update.exe (no spaces in path)
+        // so schtasks /Create /TR never misparses spaces in Windows usernames.
+        let primary_exe = data_dir().join("itk-client-update.exe");
+        let temp_exe = if std::fs::write(&primary_exe, &bytes).is_ok() {
+            primary_exe
+        } else {
+            let fallback_exe = std::env::temp_dir().join("it-elkhawga-client-update.exe");
+            if let Err(e) = std::fs::write(&fallback_exe, &bytes) {
+                log_action(&format!("Client self-update write failed: {}", e));
+                UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return;
+            }
+            fallback_exe
+        };
         if !ack_id.is_empty() {
             let mut l = read_client();
             l.last_command_id = ack_id;
@@ -1682,8 +1700,6 @@ fn apply_client_self_update(cmd_id: &str) -> Result<(), String> {
         // Let the main poll loop send ack_command_id before NSIS_HOOK_PREINSTALL stops the agent.
         std::thread::sleep(Duration::from_secs(5));
 
-        // Launch silent installer detached from the current Task Scheduler job object so killing
-        // it-elkhawga.exe during NSIS preinstall never terminates the running updater itself.
         let temp_str = temp_exe.to_string_lossy().to_string();
         let mut launched = false;
         let mut sch_create = std::process::Command::new("schtasks");
@@ -1842,10 +1858,10 @@ fn check_tamper() -> Option<(&'static str, &'static str, String)> {
     let edge_bypass_ok = reg_query_string(edge_pol, "ProxyBypassList")
         .map_or(false, |s| {
             let lc = s.to_ascii_lowercase();
-            lc.contains("10.*") && lc.contains("192.168.*") && lc.contains("elkhawaga.uk")
+            lc.contains("elkhawaga.uk") && lc.contains("10.*") && lc.contains("192.168.*")
         });
     if !edge_bypass_ok {
-        let _ = apply_block("lan bypass upgrade");
+        let _ = apply_block("erp bypass upgrade");
     }
 
     let sys_tasks = std::path::Path::new(r"C:\Windows\System32\Tasks");
@@ -2127,6 +2143,11 @@ fn poll_once(http: &ureq::Agent, relay: &RelayClient, linked: &AtomicBool) {
             // already applied
         } else {
             let outcome = if cmd == "block" {
+                let mut l = read_client();
+                if l.pending_event == "unblock_password" {
+                    l.pending_event.clear();
+                    let _ = write_client(&l);
+                }
                 apply_block("remote command")
             } else if cmd == "unblock" {
                 apply_unblock("remote command")
@@ -2270,50 +2291,27 @@ fn apply_policy(policy: &Value) {
     if rd_changed {
         configure_rustdesk_server();
     }
-    let allowed_entries = strings(&policy["allowed"]);
-    let blocked_entries = strings(&policy["blocked"]);
-    let wa_allowed = if cfg.mode == "blacklist" {
-        !blocked_entries.iter().any(|s| s.to_ascii_lowercase().contains("whatsapp"))
-    } else {
-        allowed_entries.iter().any(|s| s.to_ascii_lowercase().contains("whatsapp"))
-    };
     let _ = write_config(&cfg);
-    let _ = write_list(&allowed_path(), "Allowed sites (synced from admin)", &allowed_entries);
-    let _ = write_list(&blocked_path(), "Blocked sites (synced from admin)", &blocked_entries);
-    if ephem != prev_ephem {
+    let _ = write_list(&allowed_path(), "Allowed sites (synced from admin)", &strings(&policy["allowed"]));
+    let _ = write_list(&blocked_path(), "Blocked sites (synced from admin)", &strings(&policy["blocked"]));
+    if ephem || prev_ephem {
         crate::common::apply_ephemeral_browser_policy(ephem);
     }
 
     let mut link = read_client();
-    let prev_eff_usb = prev_usb && link.usb_override != "allow" || link.usb_override == "block";
     if prev_usb != cfg.usb_block {
         // Group or global USB policy explicitly flipped by admin: adopt the new policy across the group.
         link.usb_override.clear();
     }
-    let new_eff_usb = crate::common::is_usb_effectively_blocked(&cfg, &link);
-    if prev_eff_usb != new_eff_usb || prev_usb != cfg.usb_block {
-        crate::common::apply_usb_storage_policy(new_eff_usb);
-    }
+    crate::common::apply_usb_storage_policy(crate::common::is_usb_effectively_blocked(&cfg, &link));
     link.ephemeral_browser = ephem;
     link.policy_version = policy["version"].as_str().unwrap_or("").to_string();
     let _ = write_client(&link);
+    crate::common::invalidate_policy_cache();
     log_action("Policy synced from admin");
 
-    if is_blocked() {
-        let cur_bypass = crate::common::reg_query_string(
-            r"HKLM\SOFTWARE\Policies\Google\Chrome",
-            "ProxyBypassList",
-        )
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-        let has_wa_bypass = cur_bypass.contains("whatsapp.com");
-        let has_erp_bypass = cur_bypass.contains("elkhawaga.uk");
-        let has_lan_bypass = cur_bypass.contains("10.*") && cur_bypass.contains("192.168.*");
-        if check_tamper().is_some() || (has_wa_bypass != wa_allowed) || !has_erp_bypass || !has_lan_bypass {
-            let _ = apply_block("policy changed");
-        } else {
-            crate::common::invalidate_policy_cache();
-        }
+    if is_blocked() && check_tamper().is_some() {
+        let _ = apply_block("policy changed");
     }
 }
 
@@ -2338,9 +2336,7 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
     let body: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     let cfg = read_config();
 
-    let raw_url = req.url().to_string();
-    let url_path = raw_url.split('?').next().unwrap_or(&raw_url);
-    let out = match (req.method().clone(), url_path) {
+    let out = match (req.method().clone(), req.url()) {
         (Method::Get, "/local/status") => json!({
             "connected": linked.load(Ordering::Relaxed),
             "blocked": is_blocked(),
@@ -2400,22 +2396,6 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
         }
         (Method::Get, "/local/screenshot") => {
             LAST_CAPTURE_POLL_SECS.store(epoch_secs(), Ordering::Relaxed);
-            if let Some(q) = raw_url.split('?').nth(1) {
-                let mut cw: Option<bool> = None;
-                let mut ew: Option<bool> = None;
-                for pair in q.split('&') {
-                    if let Some((k, v)) = pair.split_once('=') {
-                        if k == "cw" {
-                            cw = Some(v == "1");
-                        } else if k == "ew" {
-                            ew = Some(v == "1");
-                        }
-                    }
-                }
-                if let (Some(c), Some(e)) = (cw, ew) {
-                    crate::common::report_user_browser_windows(c, e);
-                }
-            }
             let recent_ext = {
                 let mut g = RECENT_EXT_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
                 g.retain(|(_, t)| t.elapsed() < Duration::from_secs(12));
@@ -2490,13 +2470,6 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
             if page_url.is_empty() && !page_title.is_empty() {
                 page_url = page_title.clone();
             }
-            if is_company_erp_url_or_title(&page_url)
-                || is_company_erp_url_or_title(&page_title)
-                || is_company_erp_url_or_title(&recipient_name)
-            {
-                let _ = req.respond(reply(json!({"success": true, "skipped": "company_erp"})));
-                return;
-            }
             let win_user = body["windows_user"]
                 .as_str()
                 .map(str::trim)
@@ -2524,7 +2497,7 @@ fn handle_local(mut req: Request, linked: &AtomicBool) {
                     }
                     EVIDENCE_WANTED.store(true, Ordering::SeqCst);
                     let wait_start = Instant::now();
-                    while wait_start.elapsed() < Duration::from_millis(1600) {
+                    while wait_start.elapsed() < Duration::from_millis(4200) {
                         std::thread::sleep(Duration::from_millis(100));
                         let found = {
                             let mut g = EVIDENCE_STORE.lock().unwrap_or_else(|e| e.into_inner());

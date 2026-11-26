@@ -1,6 +1,6 @@
 [package]
 name = "it-elkhawga"
-version = "1.2.0"
+version = "1.2.6"
 description = "IT ELKHAWGA - Company device and internet control"
 authors = ["Ahmed Wahba"]
 edition = "2021"

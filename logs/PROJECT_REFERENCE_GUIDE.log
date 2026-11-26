@@ -1,0 +1,38 @@
+================================================================================
+IT ELKHAWGA ENTERPRISE (v1.2.6) — MASTER PROJECT ARCHITECTURE & LOGS REFERENCE
+Generated: 2026-11-26
+Workspace: C:\Users\IT APP\Desktop\blockwebsite
+================================================================================
+
+[1] ACTIVE LOG FILES DIRECTORY (C:\Users\IT APP\Desktop\blockwebsite\logs\)
+--------------------------------------------------------------------------------
+00-master-all-events.log       -> Unified chronological log of all events across the entire platform.
+01-devices-and-commands.log    -> Device enrollments, snapshots, online/offline state, block/unblock/USB/power commands & password events.
+02-auto-updates.log            -> Client auto-update queuing (v1.2.6), installer downloads (/api/v1/client-setup.exe), and version upgrades.
+03-policies-and-groups.log     -> Global allowed/blocked sites updates, branch group policies, Clean Browser & USB lock toggles.
+04-dlp-uploads-and-alerts.log  -> Captured WhatsApp Web / browser uploaded files (device, user, recipient, phone, path) & tamper/exfil alerts.
+05-cctv-cameras.log            -> Live CCTV router probes, RTSP TCP streams (Main/Sub stream), 3s ring buffer diagnostics & HDD health.
+06-errors-and-diagnostics.log  -> Warnings, errors, and exception stack traces across Relay, CCTV, and network handlers.
+07-admin-audit-trail.log       -> Full administrative audit trail of every action performed by Super Admin or IT Admins.
+08-local-server-and-agent.log  -> Mirrored local Rust server & agent log (from C:\ProgramData\InternetBlocker\activity.log).
+
+[2] CORE SERVICES & PORTS
+--------------------------------------------------------------------------------
+- Cloud Relay & Web/iPad Gateway : Port 8790 (node.exe -> C:\Users\IT APP\Desktop\blockwebsite\relay\server.js)
+  * Database                     : C:\ProgramData\IT-ELKHAWGA-Relay\relay.db (SQLite WAL)
+  * DLP Archive Storage          : C:\ProgramData\IT-ELKHAWGA-Relay\uploads\ (or custom archive root)
+- Local Admin HTTP Server        : Port 8787 (C:\Users\IT APP\Desktop\blockwebsite\final-release\admin\it-elkhawga-admin.exe --server)
+  * Local Config & State         : C:\ProgramData\InternetBlocker\config.json
+- Employee Client Local Proxy    : Port 8899 (127.0.0.1:8899 on employee PCs, v1.2.6)
+
+[3] SOURCE CODE COMPONENT MAP
+--------------------------------------------------------------------------------
+- relay/server.js                : Main Cloud Relay HTTP server, device polling, auto-updater, DLP archive, and Unified Logger.
+- relay/dahua-cctv.js            : 100% Router Direct CCTV engine, Low-Latency TCP RTSP ffmpeg pipeline, and 3-Second Smooth Jitter Ring Buffer.
+- relay/whatsapp-bot.js          : Automated WhatsApp notification bot for ERP backups and server health alerts.
+- src-tauri/src/proxy.rs         : Employee PC MITM & SNI proxy (instant 0ms rejection for NOISE_DOMAINS, WhatsApp/Web file upload DLP).
+- src-tauri/src/common.rs        : Ephemeral Clean Browser (protects all 4 elkhawaga.uk token stores: Cookies, LocalStorage, IndexedDB, SessionStorage), ProxyOverride bypass, USB storage registry lock, RustDesk zero-spawn TOML reader.
+- src-tauri/src/agent.rs         : Background SYSTEM enforcement loop, in-memory 0ms policy cache refresh, and silent NSIS self-updater.
+- src-tauri/src/server.rs        : Local LAN Admin HTTP server (:8787) and hourly automated ERP backup scheduler.
+- web/index.html & index.inline.js: Admin / iPad dashboard UI, frameless 100vw x 100vh CCTV Cinema Fullscreen with auto-hiding HUD, and 3s buffered playout ticker.
+================================================================================

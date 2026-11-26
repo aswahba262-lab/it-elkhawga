@@ -53,37 +53,14 @@ try {
 $userInetKeys = $userInetKeys | Select-Object -Unique
 
 # Always route traffic through our local proxy on 127.0.0.1:8080 when blocking is active
-# (in both whitelist and blacklist modes) so blocked sites are enforced, logged, and trigger notifications,
-# while bypassing the local proxy for the company ERP (elkhawaga.uk) and for WhatsApp Web when allowed
-# so real-time WebSockets, media CDNs, and ERP pages run at 100% native speed without proxy socket bottlenecks.
-$allowedList = Read-List $allowedSitesFile
-$blockedList = Read-List $blockedSitesFile
-$waAllowed = $false
-if ($mode -eq "blacklist") {
-    $waBlocked = $blockedList | Where-Object { $_ -match "whatsapp" }
-    if (-not $waBlocked) { $waAllowed = $true }
-} else {
-    $waInAllowed = $allowedList | Where-Object { $_ -match "whatsapp" }
-    if ($waInAllowed) { $waAllowed = $true }
-}
+# (in both whitelist and blacklist modes) while bypassing local LAN & company ERP (elkhawaga.uk)
+# so company ERP requests run at 100% direct wire speed with zero proxy latency.
+$overrideList = "<local>;localhost;127.0.0.1;10.*;192.168.*;26.32.24.229;elkhawaga.uk;*.elkhawaga.uk;*.ts.net"
 
-$overrideParts = @("<local>", "<-loopback>", "localhost", "127.0.0.1", "10.*", "192.168.*", "172.16.*", "172.17.*", "172.18.*", "172.19.*", "172.20.*", "172.21.*", "172.22.*", "172.23.*", "172.24.*", "172.25.*", "172.26.*", "172.27.*", "172.28.*", "172.29.*", "172.30.*", "172.31.*", "*.local", "elkhawaga.uk", "*.elkhawaga.uk")
-if ($config -and $config.erp_domains) {
-    foreach ($ed in $config.erp_domains) {
-        $cleanEd = ([string]$ed).Trim().ToLower()
-        if ($cleanEd -and $cleanEd -notmatch "[:/]") {
-            $overrideParts += $cleanEd
-            $overrideParts += "*.$cleanEd"
-        }
-    }
-}
-if ($waAllowed) {
-    $overrideParts += @("whatsapp.com", "*.whatsapp.com", "whatsapp.net", "*.whatsapp.net")
-}
-$overrideList = ($overrideParts | Select-Object -Unique) -join ";"
-
-if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
-try { Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord } catch { }
+try {
+    if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
+    Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord
+} catch { }
 
 foreach ($k in (@($inetKey) + $userInetKeys)) {
     if (Test-Path $k) {
@@ -95,14 +72,19 @@ foreach ($k in (@($inetKey) + $userInetKeys)) {
 Write-Host "OK: proxy set (mode: $mode)" -ForegroundColor Green
 
 # 2. Chrome / Edge policies.
-# Disable DNS-over-HTTPS and QUIC/UDP bypass while blocked and pin local proxy.
+# Disable DNS-over-HTTPS, QUIC/UDP bypass, search keystroke network spam, and MSN New Tab feeds while blocked.
 foreach ($key in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\Policies\Microsoft\Edge")) {
     try {
         if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
         Set-ItemProperty -Path $key -Name "DnsOverHttpsMode" -Value "off" -Type String
         Set-ItemProperty -Path $key -Name "QuicAllowed" -Value 0 -Type DWord
+        Set-ItemProperty -Path $key -Name "SearchSuggestEnabled" -Value 0 -Type DWord
+        if ($key -like "*Microsoft\Edge") {
+            Set-ItemProperty -Path $key -Name "NewTabPageContentEnabled" -Value 0 -Type DWord
+            Set-ItemProperty -Path $key -Name "NewTabPageFeedsEnabled" -Value 0 -Type DWord
+        }
 
-        $bypass = (($overrideList -split ";") | Where-Object { $_ }) -join ","
+        $bypass = "<local>;localhost;127.0.0.1;10.*;192.168.*;26.32.24.229;elkhawaga.uk;*.elkhawaga.uk;*.ts.net"
         Set-ItemProperty -Path $key -Name "ProxyMode" -Value "fixed_servers" -Type String
         Set-ItemProperty -Path $key -Name "ProxyServer" -Value "127.0.0.1:8080" -Type String
         Set-ItemProperty -Path $key -Name "ProxyBypassList" -Value $bypass -Type String
@@ -131,28 +113,8 @@ if ($hadBlock) {
     } catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
 }
 
-# 4. Ensure local LAN Direct RustDesk port (21118 TCP) is allowed on Private/Domain profiles for fast IT support
-try {
-    netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk Direct" 2>&1 | Out-Null
-    netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk Direct" dir=in action=allow protocol=TCP localport=21118 profile=private,domain 2>&1 | Out-Null
-} catch { }
-
-# 5. Flush DNS and tell WinINET to reload
+# 4. Flush DNS
 ipconfig /flushdns | Out-Null
-
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class InternetRefresh {
-    [DllImport("wininet.dll")]
-    public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
-    public static void Refresh() {
-        InternetSetOption(IntPtr.Zero, 39, IntPtr.Zero, 0);
-        InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
-    }
-}
-"@
-[InternetRefresh]::Refresh()
 
 Write-Host "INTERNET BLOCKED" -ForegroundColor Green
 exit 0

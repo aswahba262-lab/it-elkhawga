@@ -90,7 +90,7 @@ Write-Host "OK: proxy disabled" -ForegroundColor Green
 
 # 2. Chrome / Edge policies set by block-internet.ps1
 foreach ($key in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\Policies\Microsoft\Edge")) {
-    foreach ($n in @("DnsOverHttpsMode", "QuicAllowed", "ProxyMode", "ProxyServer", "ProxyBypassList")) {
+    foreach ($n in @("DnsOverHttpsMode", "QuicAllowed", "ProxyMode", "ProxyServer", "ProxyBypassList", "SearchSuggestEnabled", "NewTabPageContentEnabled", "NewTabPageFeedsEnabled")) {
         Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue
     }
 }
@@ -103,30 +103,21 @@ $endMarker = "# === BLOCKED SITES END ==="
 
 $newHosts = @()
 $inBlock = $false
-foreach ($line in (Get-Content $hostsFile)) {
-    if ($line -eq $startMarker) { $inBlock = $true; continue }
+$hadBlock = $false
+foreach ($line in (Get-Content $hostsFile -ErrorAction SilentlyContinue)) {
+    if ($line -eq $startMarker) { $inBlock = $true; $hadBlock = $true; continue }
     if ($line -eq $endMarker) { $inBlock = $false; continue }
     if (-not $inBlock) { $newHosts += $line }
 }
-$newHosts | Out-File $hostsFile -Encoding ASCII -Force
-Write-Host "OK: hosts cleaned" -ForegroundColor Green
-
-# 4. Flush DNS and tell WinINET to reload
-ipconfig /flushdns | Out-Null
-
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class InternetRefresh {
-    [DllImport("wininet.dll")]
-    public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
-    public static void Refresh() {
-        InternetSetOption(IntPtr.Zero, 39, IntPtr.Zero, 0);
-        InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
-    }
+if ($hadBlock) {
+    try {
+        $newHosts | Out-File $hostsFile -Encoding ASCII -Force
+        Write-Host "OK: hosts cleaned" -ForegroundColor Green
+    } catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
 }
-"@
-[InternetRefresh]::Refresh()
+
+# 4. Flush DNS
+ipconfig /flushdns | Out-Null
 
 Write-Host "INTERNET UNBLOCKED" -ForegroundColor Green
 exit 0

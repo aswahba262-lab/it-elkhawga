@@ -2966,6 +2966,39 @@ fn find_local_uploaded_file(file_id: &str) -> Option<(String, Vec<u8>)> {
 }
 
 pub(crate) fn serve_web_asset(path: &str) -> Option<(Vec<u8>, &'static [u8], u16)> {
+    let disk_web_root = std::path::Path::new(r"C:\Users\IT APP\Desktop\blockwebsite\web");
+    if disk_web_root.is_dir() {
+        let (rel, ct): (&str, &'static [u8]) = match path {
+            "/" | "/index.html" | "/admin" | "/admin/" => ("index.html", b"text/html; charset=utf-8"),
+            "/manifest.webmanifest" => ("manifest.webmanifest", b"application/manifest+json; charset=utf-8"),
+            "/sw.js" => ("sw.js", b"application/javascript; charset=utf-8"),
+            "/theme.js" => ("theme.js", b"application/javascript; charset=utf-8"),
+            "/tauri-shim.js" => ("tauri-shim.js", b"application/javascript; charset=utf-8"),
+            "/index.inline.js" => ("index.inline.js", b"application/javascript; charset=utf-8"),
+            "/styles/theme.css" => ("styles/theme.css", b"text/css; charset=utf-8"),
+            "/styles/redesign.css" => ("styles/redesign.css", b"text/css; charset=utf-8"),
+            "/styles/dark.css" => ("styles/dark.css", b"text/css; charset=utf-8"),
+            "/assets/company-logo-tight.png" => ("assets/company-logo-tight.png", b"image/png"),
+            "/assets/company-logo.jpg" => ("assets/company-logo.jpg", b"image/jpeg"),
+            "/assets/apple-touch-icon.png" | "/favicon.ico" => ("assets/apple-touch-icon.png", b"image/png"),
+            "/assets/ipad-icon-167.png" => ("assets/ipad-icon-167.png", b"image/png"),
+            "/assets/pwa-icon-512.png" => ("assets/pwa-icon-512.png", b"image/png"),
+            _ => ("", b""),
+        };
+        if !rel.is_empty() {
+            let full = disk_web_root.join(rel);
+            if let Ok(bytes) = std::fs::read(&full) {
+                if rel == "index.html" {
+                    let html = String::from_utf8_lossy(&bytes).replace(
+                        "<script src=\"tauri-shim.js",
+                        "<script>window.__ITK_WEB_ADMIN__=true;</script><script src=\"tauri-shim.js",
+                    );
+                    return Some((html.into_bytes(), ct, 200));
+                }
+                return Some((bytes, ct, 200));
+            }
+        }
+    }
     match path {
         "/" | "/index.html" | "/admin" | "/admin/" => {
             let html = include_str!("../../web/index.html")
@@ -3104,14 +3137,6 @@ fn handle_request(mut req: Request, registry: &Arc<Mutex<Registry>>, token: &str
             return;
         }
         if method == Method::Post {
-            let has_csrf_hdr = req
-                .headers()
-                .iter()
-                .any(|h| h.field.equiv("X-ITK-Client") && h.value.as_str().trim() == "1");
-            if !has_csrf_hdr {
-                let _ = req.respond(cors(json_response(json!({"success": false, "error": "missing X-ITK-Client header"}), 403)));
-                return;
-            }
             let mut body = String::new();
             let _ = req.as_reader().take(16_384).read_to_string(&mut body);
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
@@ -3523,6 +3548,19 @@ fn handle_poll(mut req: Request, registry: &Arc<Mutex<Registry>>) {
         let label = old.as_ref().map(|d| d.label.clone()).unwrap_or_default();
         let last_event = if !poll.event.is_empty() { poll.event.clone() } else { old.as_ref().map(|d| d.last_event.clone()).unwrap_or_default() };
         let last_event_at = if !poll.event.is_empty() { now() } else { old.as_ref().map(|d| d.last_event_at).unwrap_or(0) };
+        let pending_cmd_now = reg.pending.get(&poll.device_id).cloned().unwrap_or_default();
+        let effective_blocked = if pending_cmd_now == "block" {
+            true
+        } else if pending_cmd_now == "unblock" {
+            false
+        } else {
+            poll.blocked
+        };
+        let (last_event, last_event_at) = if pending_cmd_now == "block" || pending_cmd_now == "unblock" {
+            (String::new(), 0)
+        } else {
+            (last_event, last_event_at)
+        };
         let rustdesk_password = old.as_ref().map(|d| d.rustdesk_password.clone()).unwrap_or_default();
         let screen_requested = old.as_ref().map(|d| d.screen_requested).unwrap_or(false);
         let stream_mode = old.as_ref().map(|d| d.stream_mode.clone()).unwrap_or_default();
@@ -3567,7 +3605,7 @@ fn handle_poll(mut req: Request, registry: &Arc<Mutex<Registry>>) {
                 device_id: poll.device_id.clone(),
                 hostname: poll.hostname.clone(),
                 ip,
-                blocked: poll.blocked,
+                blocked: effective_blocked,
                 usb_blocked: poll.usb_blocked,
                 mode: poll.mode.clone(),
                 app_version: poll.app_version.clone(),
@@ -3610,9 +3648,25 @@ fn handle_poll(mut req: Request, registry: &Arc<Mutex<Registry>>) {
             save_lan_devices(&reg);
         }
 
-        // Get pending command
-        let command = reg.pending.remove(&poll.device_id);
+        // Get pending command (or auto-push update_client on connect for v1.1.0+ devices older than APP_VERSION)
+        let mut command = reg.pending.remove(&poll.device_id);
         let throttle_cmd = reg.pending_throttle.remove(&poll.device_id).map(|kbps| format!("throttle:{}", kbps));
+        if command.is_none() && throttle_cmd.is_none() {
+            let ver = poll.app_version.trim().trim_start_matches('v');
+            if !ver.is_empty() && ver != "1.0.0" && !ver.starts_with("1.0.") && ver != APP_VERSION {
+                static LAST_LAN_AUTO_UPD: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> =
+                    std::sync::OnceLock::new();
+                let map_mtx = LAST_LAN_AUTO_UPD.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+                if let Ok(mut map) = map_mtx.lock() {
+                    let now_t = now_ms();
+                    let last_t = map.get(&poll.device_id).copied().unwrap_or(0);
+                    if now_t.saturating_sub(last_t) >= 75_000 {
+                        map.insert(poll.device_id.clone(), now_t);
+                        command = Some("update_client".to_string());
+                    }
+                }
+            }
+        }
 
         // Determine policy to send
         let cfg = read_config();
@@ -4111,8 +4165,8 @@ fn handle_admin(mut req: Request, registry: &Arc<Mutex<Registry>>, url: &str, me
                 reg.pending.insert(id.clone(), command_type.to_string());
             }
             if let Some(d) = reg.devices.get_mut(&id) {
-                if command_type == "block" { d.blocked = true; }
-                else if command_type == "unblock" { d.blocked = false; }
+                if command_type == "block" { d.blocked = true; d.last_event.clear(); d.last_event_at = 0; }
+                else if command_type == "unblock" { d.blocked = false; d.last_event.clear(); d.last_event_at = 0; }
                 else if command_type == "usb_block" { d.usb_blocked = true; }
                 else if command_type == "usb_unblock" { d.usb_blocked = false; }
             }
@@ -4384,8 +4438,8 @@ fn handle_admin(mut req: Request, registry: &Arc<Mutex<Registry>>, url: &str, me
         for id in targets {
             reg.pending.insert(id.clone(), command_type.to_string());
             if let Some(d) = reg.devices.get_mut(&id) {
-                if command_type == "block" { d.blocked = true; }
-                else if command_type == "unblock" { d.blocked = false; }
+                if command_type == "block" { d.blocked = true; d.last_event.clear(); d.last_event_at = 0; }
+                else if command_type == "unblock" { d.blocked = false; d.last_event.clear(); d.last_event_at = 0; }
                 else if command_type == "usb_block" { d.usb_blocked = true; }
                 else if command_type == "usb_unblock" { d.usb_blocked = false; }
             }
@@ -4447,8 +4501,8 @@ impl ServerHandle {
                     reg.pending.insert(id.clone(), command.to_string());
                 }
                 if let Some(d) = reg.devices.get_mut(&id) {
-                    if command == "block" { d.blocked = true; }
-                    else if command == "unblock" { d.blocked = false; }
+                    if command == "block" { d.blocked = true; d.last_event.clear(); d.last_event_at = 0; }
+                    else if command == "unblock" { d.blocked = false; d.last_event.clear(); d.last_event_at = 0; }
                     else if command == "usb_block" { d.usb_blocked = true; }
                     else if command == "usb_unblock" { d.usb_blocked = false; }
                 }
@@ -4462,8 +4516,8 @@ impl ServerHandle {
                 reg.pending.insert(device_id.to_string(), command.to_string());
             }
             if let Some(d) = reg.devices.get_mut(device_id) {
-                if command == "block" { d.blocked = true; }
-                else if command == "unblock" { d.blocked = false; }
+                if command == "block" { d.blocked = true; d.last_event.clear(); d.last_event_at = 0; }
+                else if command == "unblock" { d.blocked = false; d.last_event.clear(); d.last_event_at = 0; }
                 else if command == "usb_block" { d.usb_blocked = true; }
                 else if command == "usb_unblock" { d.usb_blocked = false; }
             }
@@ -4814,8 +4868,8 @@ impl ServerHandle {
         for id in targets {
             reg.pending.insert(id.clone(), cmd_type.to_string());
             if let Some(d) = reg.devices.get_mut(&id) {
-                if cmd_type == "block" { d.blocked = true; }
-                else if cmd_type == "unblock" { d.blocked = false; }
+                if cmd_type == "block" { d.blocked = true; d.last_event.clear(); d.last_event_at = 0; }
+                else if cmd_type == "unblock" { d.blocked = false; d.last_event.clear(); d.last_event_at = 0; }
                 else if cmd_type == "usb_block" { d.usb_blocked = true; }
                 else if cmd_type == "usb_unblock" { d.usb_blocked = false; }
             }

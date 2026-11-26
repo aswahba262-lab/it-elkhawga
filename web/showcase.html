@@ -1,0 +1,1420 @@
+<!doctype html>
+<html lang="ar" dir="rtl" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>نموذج المعاينة قبل التنفيذ — IT ELKHAWAGA Enterprise SaaS Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=Cairo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    /* ==========================================================================
+       PHASE 2 PREVIEW: Enterprise SaaS Design System Tokens (Dark Navy & Clean Light)
+       ========================================================================== */
+    :root,
+    html[data-theme="dark"] {
+      --bg-app: #0b0f19;
+      --bg-surface: #111827;
+      --bg-surface-2: #1e293b;
+      --bg-surface-hover: #263349;
+      --bg-topbar: rgba(17, 24, 39, 0.88);
+      --border-subtle: #1f2937;
+      --border-default: #334155;
+      --text-primary: #f8fafc;
+      --text-secondary: #cbd5e1;
+      --text-muted: #94a3b8;
+      --brand-blue: #2563eb;
+      --brand-blue-hover: #1d4ed8;
+      --brand-blue-soft: rgba(37, 99, 235, 0.14);
+      --status-green: #10b981;
+      --status-green-soft: rgba(16, 185, 129, 0.14);
+      --status-red: #ef4444;
+      --status-red-soft: rgba(239, 68, 68, 0.14);
+      --status-amber: #f59e0b;
+      --status-amber-soft: rgba(245, 158, 11, 0.14);
+      --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.25);
+      --shadow-drawer: -16px 0 45px rgba(0, 0, 0, 0.65);
+    }
+
+    html[data-theme="light"] {
+      --bg-app: #f8fafc;
+      --bg-surface: #ffffff;
+      --bg-surface-2: #f1f5f9;
+      --bg-surface-hover: #e2e8f0;
+      --bg-topbar: rgba(255, 255, 255, 0.92);
+      --border-subtle: #e2e8f0;
+      --border-default: #cbd5e1;
+      --text-primary: #0f172a;
+      --text-secondary: #334155;
+      --text-muted: #64748b;
+      --brand-blue: #2563eb;
+      --brand-blue-hover: #1d4ed8;
+      --brand-blue-soft: rgba(37, 99, 235, 0.10);
+      --status-green: #059669;
+      --status-green-soft: rgba(5, 150, 105, 0.10);
+      --status-red: #dc2626;
+      --status-red-soft: rgba(220, 38, 38, 0.10);
+      --status-amber: #d97706;
+      --status-amber-soft: rgba(217, 119, 6, 0.10);
+      --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+      --shadow-drawer: -16px 0 45px rgba(15, 23, 42, 0.15);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'IBM Plex Sans Arabic', 'Cairo', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-app);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    .mono {
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      direction: ltr;
+      unicode-bidi: embed;
+    }
+
+    /* ===== PREVIEW CONTROL RIBBON (FOR USER APPROVAL) ===== */
+    .preview-banner {
+      background: #090d16;
+      color: #f8fafc;
+      border-bottom: 1px solid #1e293b;
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+      z-index: 2000;
+    }
+    .preview-banner-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .preview-tag {
+      background: #2563eb;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+    }
+    .preview-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .p-btn {
+      appearance: none;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #e2e8f0;
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .p-btn:hover { border-color: #3b82f6; color: #fff; }
+    .p-btn.active { background: #2563eb; border-color: #3b82f6; color: #fff; }
+
+    /* ===== VIEWPORT SIMULATOR ===== */
+    .sim-wrapper {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      background: #05080f;
+      overflow: hidden;
+    }
+    .sim-frame {
+      width: 100%;
+      height: calc(100vh - 53px);
+      background: var(--bg-app);
+      display: flex;
+      overflow: hidden;
+      position: relative;
+      transition: max-width 0.25s ease;
+    }
+    .sim-frame.vp-ipad {
+      max-width: 980px;
+      border-inline: 6px solid #334155;
+    }
+    .sim-frame.vp-mobile {
+      max-width: 430px;
+      border-inline: 6px solid #334155;
+    }
+
+    /* ===== ENTERPRISE SAAS SHELL ===== */
+    .saas-sidebar {
+      width: 256px;
+      flex-shrink: 0;
+      background: var(--bg-surface);
+      border-left: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      user-select: none;
+    }
+    .saas-brand {
+      height: 64px;
+      padding: 0 18px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .saas-brand-logo {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: var(--brand-blue);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 14px;
+      letter-spacing: 0.5px;
+    }
+    .saas-brand-title {
+      font-size: 14.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.2;
+    }
+    .saas-brand-sub {
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    .saas-nav {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .saas-nav-section {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      padding: 12px 10px 4px;
+      letter-spacing: 0.3px;
+    }
+    .saas-nav-section:first-child { padding-top: 2px; }
+    .saas-nav-item {
+      appearance: none;
+      border: none;
+      background: transparent;
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: 8px;
+      color: var(--text-secondary);
+      font-family: inherit;
+      font-size: 13.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      text-align: right;
+      transition: background 0.15s, color 0.15s;
+    }
+    .saas-nav-item:hover {
+      background: var(--bg-surface-2);
+      color: var(--text-primary);
+    }
+    .saas-nav-item.active {
+      background: var(--brand-blue-soft);
+      color: var(--brand-blue);
+      font-weight: 700;
+    }
+    html[data-theme="dark"] .saas-nav-item.active {
+      color: #60a5fa;
+    }
+    .saas-nav-item svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 1.85;
+      fill: none;
+      flex-shrink: 0;
+    }
+    .saas-nav-badge {
+      margin-right: auto;
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 1px 8px;
+      border-radius: 999px;
+      background: var(--bg-surface-2);
+      color: var(--text-secondary);
+    }
+    .saas-nav-badge.alert {
+      background: var(--status-red-soft);
+      color: var(--status-red);
+    }
+
+    .saas-sidebar-foot {
+      padding: 12px 14px;
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* ===== MAIN WORKSPACE ===== */
+    .saas-main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    .saas-topbar {
+      height: 64px;
+      padding: 0 24px;
+      background: var(--bg-topbar);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    .saas-page-head h1 {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .saas-page-head p {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .saas-topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      font-weight: 600;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .status-dot.green { background: var(--status-green); }
+    .status-dot.red { background: var(--status-red); }
+    .status-dot.amber { background: var(--status-amber); }
+
+    .saas-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .view-pane { display: none; flex-direction: column; gap: 20px; }
+    .view-pane.active { display: flex; }
+
+    /* ===== KPI METRIC CARDS (CLEAN MINIMAL SAAS) ===== */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 16px;
+    }
+    .kpi-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 18px 20px;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .kpi-box-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .kpi-box-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .kpi-box-icon svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 1.9;
+      fill: none;
+    }
+    .kpi-box-val {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.1;
+    }
+    .kpi-box-foot {
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* ===== SECTION PANELS & TABLES ===== */
+    .panel-grid-2 {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr;
+      gap: 16px;
+    }
+    .saas-panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+    .saas-panel-head {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .saas-panel-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .saas-panel-body {
+      padding: 16px 20px;
+    }
+
+    /* ===== FILTER & ACTION BAR ===== */
+    .toolbar-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 12px 16px;
+    }
+    .search-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0 12px;
+      height: 38px;
+      min-width: 260px;
+      flex: 1;
+      max-width: 380px;
+    }
+    .search-box input {
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 13.5px;
+      width: 100%;
+    }
+    .filter-tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .f-tab {
+      appearance: none;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface-2);
+      color: var(--text-secondary);
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .f-tab.active {
+      background: var(--brand-blue);
+      border-color: var(--brand-blue);
+      color: #fff;
+    }
+
+    /* ===== CLEAN ENTERPRISE DEVICE CARDS (NO BUTTON CLUTTER!) ===== */
+    .devices-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 16px;
+    }
+    .ent-device-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      transition: border-color 0.15s, transform 0.15s;
+      cursor: pointer;
+    }
+    .ent-device-card:hover {
+      border-color: var(--brand-blue);
+      transform: translateY(-1px);
+    }
+    .ent-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .ent-dev-identity {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .ent-dev-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: var(--bg-surface-2);
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .ent-dev-icon.online {
+      background: var(--status-green-soft);
+      color: var(--status-green);
+    }
+    .ent-dev-name {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .ent-dev-host {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .badge-pill.online { background: var(--status-green-soft); color: var(--status-green); }
+    .badge-pill.offline { background: var(--status-red-soft); color: var(--status-red); }
+    .badge-pill.amber { background: var(--status-amber-soft); color: var(--status-amber); }
+    .badge-pill.blue { background: var(--brand-blue-soft); color: var(--brand-blue); }
+    html[data-theme="dark"] .badge-pill.blue { color: #60a5fa; }
+
+    /* Clean 2x3 Metadata Table inside Card */
+    .ent-meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px 12px;
+      padding: 12px;
+      background: var(--bg-surface-2);
+      border-radius: 8px;
+      font-size: 12.5px;
+    }
+    .ent-meta-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .ent-meta-label {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .ent-meta-val {
+      font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Clean Card Footer: Only 3 Essential Actions (No Clutter!) */
+    .ent-card-foot {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-top: 4px;
+    }
+    .btn-saas {
+      appearance: none;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface-2);
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn-saas:hover {
+      background: var(--bg-surface-hover);
+      border-color: var(--border-default);
+    }
+    .btn-saas.primary {
+      background: var(--brand-blue);
+      border-color: var(--brand-blue);
+      color: #fff;
+    }
+    .btn-saas.primary:hover {
+      background: var(--brand-blue-hover);
+    }
+    .btn-saas.danger {
+      background: var(--status-red-soft);
+      border-color: transparent;
+      color: var(--status-red);
+    }
+    .btn-saas.success {
+      background: var(--status-green-soft);
+      border-color: transparent;
+      color: var(--status-green);
+    }
+
+    /* ===== SLIDE-OVER DEVICE PROFILE DRAWER (WITH TABS) ===== */
+    .drawer-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.55);
+      backdrop-filter: blur(3px);
+      z-index: 1200;
+      display: none;
+      justify-content: flex-end;
+    }
+    .drawer-backdrop.open {
+      display: flex;
+    }
+    .device-drawer {
+      width: min(560px, 100%);
+      height: 100%;
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border-subtle);
+      box-shadow: var(--shadow-drawer);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .drawer-head {
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .drawer-tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: var(--bg-surface-2);
+      overflow-x: auto;
+    }
+    .d-tab {
+      appearance: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: var(--text-muted);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 12px 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .d-tab.active {
+      color: var(--brand-blue);
+      border-bottom-color: var(--brand-blue);
+      font-weight: 700;
+    }
+    html[data-theme="dark"] .d-tab.active {
+      color: #60a5fa;
+      border-bottom-color: #60a5fa;
+    }
+    .drawer-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .drawer-pane { display: none; flex-direction: column; gap: 16px; }
+    .drawer-pane.active { display: flex; }
+
+    /* Responsive Mobile/Tablet adjustments */
+    @media (max-width: 900px) {
+      .sim-frame { flex-direction: column; }
+      .saas-sidebar {
+        width: 100%;
+        height: auto;
+        border-left: none;
+        border-bottom: 1px solid var(--border-subtle);
+      }
+      .saas-nav {
+        flex-direction: row;
+        overflow-x: auto;
+        padding: 8px 12px;
+      }
+      .saas-nav-section, .saas-sidebar-foot { display: none; }
+      .saas-nav-item { width: auto; white-space: nowrap; }
+      .panel-grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- TOP APPROVAL & SIMULATOR BAR -->
+  <div class="preview-banner">
+    <div class="preview-banner-right">
+      <span class="preview-tag">المرحلة 1 — معاينة التصميم قبل التنفيذ</span>
+      <span style="font-size:13.5px;font-weight:700;">Enterprise SaaS IT Management Platform (بدون تكديس أزرار + ملف تفاصيل لكل جهاز + وضع ليلي ونهاري)</span>
+    </div>
+    <div class="preview-controls">
+      <button class="p-btn active" onclick="switchTheme('dark', this)">🌙 الوضع الليلي (Navy Dark)</button>
+      <button class="p-btn" onclick="switchTheme('light', this)">☀️ الوضع النهاري (Clean Light)</button>
+      <span style="color:#334155;">|</span>
+      <button class="p-btn active" onclick="switchViewport('desktop', this)">💻 كمبيوتر</button>
+      <button class="p-btn" onclick="switchViewport('ipad', this)">📱 iPad</button>
+      <button class="p-btn" onclick="switchViewport('mobile', this)">📲 موبايل</button>
+    </div>
+  </div>
+
+  <!-- SIMULATOR WORKSPACE -->
+  <div class="sim-wrapper">
+    <div class="sim-frame" id="simFrame">
+
+      <!-- ORGANIZED 12-MODULE ENTERPRISE SIDEBAR -->
+      <aside class="saas-sidebar">
+        <div class="saas-brand">
+          <div class="saas-brand-logo">IT</div>
+          <div>
+            <div class="saas-brand-title">IT ELKHAWAGA</div>
+            <div class="saas-brand-sub">Enterprise IT &amp; DLP Suite</div>
+          </div>
+        </div>
+
+        <nav class="saas-nav">
+          <div class="saas-nav-section">المراقبة والقيادة</div>
+          <button class="saas-nav-item active" onclick="showPane('dashboard', 'لوحة القيادة المركزية', 'نظرة شاملة حية على أجهزة الفروع والشبكة والكاميرات والأمان', this)">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+            <span>لوحة القيادة</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('devices', 'إدارة أجهزة الفروع (Cloud / Relay)', 'إدارة ومراقبة أجهزة الموظفين في الفروع مع ملف تفصيلي لكل جهاز', this)">
+            <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            <span>أجهزة الفروع (Cloud)</span>
+            <span class="saas-nav-badge">14</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('devices', 'أجهزة الشبكة المحلية (LAN)', 'الأجهزة المتصلة مباشرة داخل الشبكة الداخلية للمقر الرئيسي', this)">
+            <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            <span>أجهزة الشبكة المحلية</span>
+            <span class="saas-nav-badge">6</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('rustdesk', 'الدعم الفني عن بُعد (RustDesk)', 'إدارة جلسات الدعم الفني وخادم RustDesk OSS المحلي والسحابي', this)">
+            <svg viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+            <span>الدعم عن بُعد (RustDesk)</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('cctv', 'إدارة كاميرات المراقبة (CCTV)', 'بث مباشر واسترجاع تسجيلات MP4 لأجهزة DVR/NVR في الفروع', this)">
+            <svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+            <span>كاميرات المراقبة CCTV</span>
+            <span class="saas-nav-badge">3 DVR</span>
+          </button>
+
+          <div class="saas-nav-section">البنية التحتية والسياسات</div>
+          <button class="saas-nav-item" onclick="showPane('devices', 'الفروع والمجموعات', 'تنظيم الأجهزة حسب الفروع والأقسام وتطبيق سياسات التصفح النظيف', this)">
+            <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+            <span>الفروع والمجموعات</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('dashboard', 'البنية التحتية وقواعد الإنترنت', 'إدارة القوائم البيضاء والسوداء وحالة اتصال الفروع', this)">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+            <span>قواعد الإنترنت والشبكة</span>
+          </button>
+
+          <div class="saas-nav-section">الأمان والتقارير</div>
+          <button class="saas-nav-item" onclick="showPane('dashboard', 'الأمان وأرشيف الملفات (DLP)', 'أرشيف الملفات المرفوعة عبر واتساب ويب وسياسات حماية منافذ USB', this)">
+            <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <span>الأمان وأرشيف الملفات</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('dashboard', 'التنبيهات والأحداث الأمنية', 'تنبيهات رفع الملفات، توصيل الفلاشات، ومحاولات التصفح المحظورة', this)">
+            <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
+            <span>التنبيهات والأحداث</span>
+            <span class="saas-nav-badge alert">3</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('dashboard', 'سجلات التدقيق والتقارير (Audit Logs)', 'سجل كامل لجميع أوامر المديرين والعمليات المنفذة', this)">
+            <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+            <span>سجلات التدقيق والتقارير</span>
+          </button>
+          <button class="saas-nav-item" onclick="showPane('dashboard', 'الإعدادات والنسخ الاحتياطي', 'إعدادات السيرفر، المديرين، بوت واتساب، والنسخ الاحتياطي الساعي لـ elkhawaga.uk', this)">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+            <span>الإعدادات والنسخ الاحتياطي</span>
+          </button>
+        </nav>
+
+        <div class="saas-sidebar-foot">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="status-dot green"></span>
+            <span style="font-weight:600;color:var(--text-secondary);">السيرفر متصل (v1.2.0)</span>
+          </div>
+          <span class="mono">8790</span>
+        </div>
+      </aside>
+
+      <!-- MAIN CONTENT AREA -->
+      <div class="saas-main">
+        <!-- TOPBAR -->
+        <header class="saas-topbar">
+          <div class="saas-page-head">
+            <h1 id="pageHeading">لوحة القيادة المركزية</h1>
+            <p id="pageSubheading">نظرة شاملة حية على أجهزة الفروع والشبكة والكاميرات والأمان</p>
+          </div>
+          <div class="saas-topbar-right">
+            <div class="status-chip"><span class="status-dot green"></span><span>متصل الآن: <b>1</b></span></div>
+            <div class="status-chip"><span class="status-dot red"></span><span>مقفول (Whitelist): <b>14</b></span></div>
+            <div class="status-chip"><span class="status-dot amber"></span><span>تنبيهات: <b>3</b></span></div>
+            <button class="btn-saas primary" onclick="showPane('devices', 'إدارة أجهزة الفروع (Cloud / Relay)', 'اضغط على أي جهاز لفتح ملف التحكم الكامل')">💻 عرض الأجهزة (14)</button>
+          </div>
+        </header>
+
+        <!-- SCROLLABLE WORKSPACE -->
+        <main class="saas-content">
+
+          <!-- ==================== PANE 1: MAIN DASHBOARD ==================== -->
+          <div class="view-pane active" id="pane-dashboard">
+            <!-- 4 Clean Enterprise KPIs -->
+            <div class="kpi-row">
+              <div class="kpi-box" onclick="showPane('devices', 'إدارة أجهزة الفروع', 'جميع الأجهزة المسجلة')" style="cursor:pointer;">
+                <div class="kpi-box-top">
+                  <span>إجمالي الأجهزة (Cloud + LAN)</span>
+                  <div class="kpi-box-icon" style="background:var(--brand-blue-soft);color:var(--brand-blue);">
+                    <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                  </div>
+                </div>
+                <div class="kpi-box-val">14</div>
+                <div class="kpi-box-foot">
+                  <span style="color:var(--status-green);font-weight:700;">● 1 متصل الآن</span>
+                  <span>• 13 غير متصل</span>
+                </div>
+              </div>
+
+              <div class="kpi-box">
+                <div class="kpi-box-top">
+                  <span>حالة الحماية والإنترنت</span>
+                  <div class="kpi-box-icon" style="background:var(--status-green-soft);color:var(--status-green);">
+                    <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                  </div>
+                </div>
+                <div class="kpi-box-val">Whitelist</div>
+                <div class="kpi-box-foot">
+                  <span>التصفح النظيف مفعّل • حماية ERP نشطة</span>
+                </div>
+              </div>
+
+              <div class="kpi-box" onclick="showPane('cctv', 'إدارة كاميرات المراقبة CCTV', 'حالة أجهزة التسجيل والكاميرات')" style="cursor:pointer;">
+                <div class="kpi-box-top">
+                  <span>أنظمة الكاميرات (CCTV)</span>
+                  <div class="kpi-box-icon" style="background:var(--brand-blue-soft);color:var(--brand-blue);">
+                    <svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+                  </div>
+                </div>
+                <div class="kpi-box-val">3 DVR</div>
+                <div class="kpi-box-foot">
+                  <span style="color:var(--status-green);font-weight:700;">24 قناة بث مباشر</span>
+                  <span>• استرجاع MP4</span>
+                </div>
+              </div>
+
+              <div class="kpi-box">
+                <div class="kpi-box-top">
+                  <span>التنبيهات وأرشيف DLP</span>
+                  <div class="kpi-box-icon" style="background:var(--status-amber-soft);color:var(--status-amber);">
+                    <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/></svg>
+                  </div>
+                </div>
+                <div class="kpi-box-val">3</div>
+                <div class="kpi-box-foot">
+                  <span style="color:var(--status-amber);font-weight:700;">ملفات واتساب مؤرشفة</span>
+                  <span>• USB مؤمّن</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Two-Column Enterprise Overview: Branch Connectivity + Recent Security Activity -->
+            <div class="panel-grid-2">
+              <div class="saas-panel">
+                <div class="saas-panel-head">
+                  <span class="saas-panel-title">حالة اتصال الفروع والأجهزة النشطة</span>
+                  <button class="btn-saas" onclick="showPane('devices', 'إدارة أجهزة الفروع', 'جميع الأجهزة')">عرض كل الأجهزة ◂</button>
+                </div>
+                <div class="saas-panel-body" style="padding:0;">
+                  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                    <thead>
+                      <tr style="border-bottom:1px solid var(--border-subtle);color:var(--text-muted);text-align:right;background:var(--bg-surface-2);">
+                        <th style="padding:10px 16px;">الجهاز / الفرع</th>
+                        <th style="padding:10px 12px;">الحالة</th>
+                        <th style="padding:10px 12px;">الإنترنت و USB</th>
+                        <th style="padding:10px 12px;">الإصدار</th>
+                        <th style="padding:10px 16px;">إجراء سريع</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr style="border-bottom:1px solid var(--border-subtle);">
+                        <td style="padding:12px 16px;">
+                          <div style="font-weight:700;color:var(--text-primary);">doki sales (فرع الدقي)</div>
+                          <div class="mono" style="font-size:11.5px;color:var(--text-muted);">DOKI-BRANSH • 197.39.239.187</div>
+                        </td>
+                        <td style="padding:12px;"><span class="badge-pill online">● متصل الآن</span></td>
+                        <td style="padding:12px;"><span class="badge-pill amber">🔒 مقفول • USB مقفول</span></td>
+                        <td style="padding:12px;"><span class="mono badge-pill blue">v1.2.0</span></td>
+                        <td style="padding:12px 16px;">
+                          <button class="btn-saas primary" style="padding:5px 10px;font-size:12px;" onclick="openDeviceDrawer('doki sales', 'DOKI-BRANSH', '197.39.239.187', '149283741', true, 'v1.2.0', 'Sales')">فتح ملف الجهاز</button>
+                        </td>
+                      </tr>
+                      <tr style="border-bottom:1px solid var(--border-subtle);">
+                        <td style="padding:12px 16px;">
+                          <div style="font-weight:700;color:var(--text-primary);">maadi sales-1 (فرع المعادي)</div>
+                          <div class="mono" style="font-size:11.5px;color:var(--text-muted);">MAADI-SALES • 156.204.112.45</div>
+                        </td>
+                        <td style="padding:12px;"><span class="badge-pill offline">● غير متصل</span></td>
+                        <td style="padding:12px;"><span class="badge-pill amber">🔒 مقفول • USB مقفول</span></td>
+                        <td style="padding:12px;"><span class="mono badge-pill amber">v1.1.2 ➔ v1.2.0</span></td>
+                        <td style="padding:12px 16px;">
+                          <button class="btn-saas" style="padding:5px 10px;font-size:12px;" onclick="openDeviceDrawer('maadi sales-1', 'MAADI-SALES', '156.204.112.45', '382910442', false, 'v1.1.2', 'Sales')">فتح ملف الجهاز</button>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:12px 16px;">
+                          <div style="font-weight:700;color:var(--text-primary);">Zayed sales-1 (فرع الشيخ زايد)</div>
+                          <div class="mono" style="font-size:11.5px;color:var(--text-muted);">DESKTOP-K1U8H4Q • 154.184.169.166</div>
+                        </td>
+                        <td style="padding:12px;"><span class="badge-pill offline">● غير متصل</span></td>
+                        <td style="padding:12px;"><span class="badge-pill amber">🔒 مقفول • USB مقفول</span></td>
+                        <td style="padding:12px;"><span class="mono badge-pill amber">v1.1.6 ➔ v1.2.0</span></td>
+                        <td style="padding:12px 16px;">
+                          <button class="btn-saas" style="padding:5px 10px;font-size:12px;" onclick="openDeviceDrawer('Zayed sales-1', 'DESKTOP-K1U8H4Q', '154.184.169.166', '826637811', false, 'v1.1.6', 'فروع')">فتح ملف الجهاز</button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="saas-panel">
+                <div class="saas-panel-head">
+                  <span class="saas-panel-title">أحدث الأنشطة والتنبيهات الأمنية</span>
+                </div>
+                <div class="saas-panel-body" style="display:flex;flex-direction:column;gap:12px;">
+                  <div style="padding:12px;border-radius:8px;background:var(--bg-surface-2);border-right:3px solid var(--status-green);">
+                    <div style="font-size:13px;font-weight:700;">تم تحديث جهاز فرع الدقي (doki sales) إلى v1.2.0</div>
+                    <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">تحديث صامت ناجح • تحسين سرعة المتصفح واستثناء الشبكة المحلية</div>
+                  </div>
+                  <div style="padding:12px;border-radius:8px;background:var(--bg-surface-2);border-right:3px solid var(--status-amber);">
+                    <div style="font-size:13px;font-weight:700;">📤 أرشفة ملف مرفوع على واتساب ويب — maadi sales-1</div>
+                    <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">treasury-15-20261124-32.pdf (28.9 KB) • تم حفظ نسخة طبق الأصل</div>
+                  </div>
+                  <div style="padding:12px;border-radius:8px;background:var(--bg-surface-2);border-right:3px solid var(--brand-blue);">
+                    <div style="font-size:13px;font-weight:700;">☁️ النسخ الاحتياطي التلقائي لـ elkhawaga.uk</div>
+                    <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">يعمل بانتظام كل ساعة • آخر نسخة سليمة ومفحوصة SHA-256</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ==================== PANE 2: CLEAN DEVICE MANAGEMENT ==================== -->
+          <div class="view-pane" id="pane-devices">
+            <div class="toolbar-row">
+              <div class="search-box">
+                <span>🔍</span>
+                <input type="text" placeholder="ابحث باسم الجهاز، الموظف، الفرع، IP، أو RustDesk..." />
+              </div>
+              <div class="filter-tabs">
+                <button class="f-tab active">الكل (14)</button>
+                <button class="f-tab">متصل الآن (1)</button>
+                <button class="f-tab">غير متصل (13)</button>
+                <button class="f-tab">الإنترنت مقفول (14)</button>
+                <button class="f-tab">USB مقفول (14)</button>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <button class="btn-saas danger">🔒 قفل الكل</button>
+                <button class="btn-saas success">🔓 فتح الكل</button>
+                <button class="btn-saas primary">⬆️ تحديث الكل</button>
+              </div>
+            </div>
+
+            <!-- CLEAN ENTERPRISE DEVICE CARDS (NO CROWDED BUTTONS!) -->
+            <div class="devices-grid">
+              <!-- Device Card 1 -->
+              <div class="ent-device-card" onclick="openDeviceDrawer('doki sales', 'DOKI-BRANSH', '197.39.239.187', '149283741', true, 'v1.2.0', 'Sales')">
+                <div class="ent-card-head">
+                  <div class="ent-dev-identity">
+                    <div class="ent-dev-icon online">💻</div>
+                    <div>
+                      <div class="ent-dev-name">doki sales</div>
+                      <div class="ent-dev-host mono">DOKI-BRANSH</div>
+                    </div>
+                  </div>
+                  <span class="badge-pill online">● متصل الآن</span>
+                </div>
+
+                <div class="ent-meta-grid">
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">القسم / الفرع</span>
+                    <span class="ent-meta-val">Sales (فرع الدقي)</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">عنوان الشبكة (IP)</span>
+                    <span class="ent-meta-val mono">197.39.239.187</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">نوع الاتصال</span>
+                    <span class="ent-meta-val">Cloud Relay • v1.2.0</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">حالة الحماية</span>
+                    <span class="ent-meta-val" style="color:var(--status-amber);">🔒 مقفول • 🔌 USB مقفول</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">معرّف RustDesk</span>
+                    <span class="ent-meta-val mono" style="color:var(--brand-blue);">149283741</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">آخر ظهور</span>
+                    <span class="ent-meta-val">متصل حالياً</span>
+                  </div>
+                </div>
+
+                <div class="ent-card-foot" onclick="event.stopPropagation();">
+                  <button class="btn-saas primary" style="flex:1;" onclick="alert('سيفتح اتصال RustDesk المباشر للجهاز 149283741')">🛠️ اتصال RustDesk</button>
+                  <button class="btn-saas" onclick="openDeviceDrawer('doki sales', 'DOKI-BRANSH', '197.39.239.187', '149283741', true, 'v1.2.0', 'Sales')">👁️ شاشة حية</button>
+                  <button class="btn-saas" onclick="openDeviceDrawer('doki sales', 'DOKI-BRANSH', '197.39.239.187', '149283741', true, 'v1.2.0', 'Sales')">⚙️ تفاصيل وتحكم ◂</button>
+                </div>
+              </div>
+
+              <!-- Device Card 2 -->
+              <div class="ent-device-card" onclick="openDeviceDrawer('maadi sales-1', 'MAADI-SALES', '156.204.112.45', '382910442', false, 'v1.1.2', 'Sales')">
+                <div class="ent-card-head">
+                  <div class="ent-dev-identity">
+                    <div class="ent-dev-icon">💻</div>
+                    <div>
+                      <div class="ent-dev-name">maadi sales-1</div>
+                      <div class="ent-dev-host mono">MAADI-SALES</div>
+                    </div>
+                  </div>
+                  <span class="badge-pill offline">● غير متصل</span>
+                </div>
+
+                <div class="ent-meta-grid">
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">القسم / الفرع</span>
+                    <span class="ent-meta-val">Sales (فرع المعادي)</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">عنوان الشبكة (IP)</span>
+                    <span class="ent-meta-val mono">156.204.112.45</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">نوع الاتصال</span>
+                    <span class="ent-meta-val">Cloud Relay • مجدول v1.2.0</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">حالة الحماية</span>
+                    <span class="ent-meta-val" style="color:var(--status-amber);">🔒 مقفول • 🔌 USB مقفول</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">معرّف RustDesk</span>
+                    <span class="ent-meta-val mono" style="color:var(--brand-blue);">382910442</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">آخر ظهور</span>
+                    <span class="ent-meta-val">منذ 5 ساعات</span>
+                  </div>
+                </div>
+
+                <div class="ent-card-foot" onclick="event.stopPropagation();">
+                  <button class="btn-saas primary" style="flex:1;" onclick="openDeviceDrawer('maadi sales-1', 'MAADI-SALES', '156.204.112.45', '382910442', false, 'v1.1.2', 'Sales')">🛠️ اتصال RustDesk</button>
+                  <button class="btn-saas" onclick="openDeviceDrawer('maadi sales-1', 'MAADI-SALES', '156.204.112.45', '382910442', false, 'v1.1.2', 'Sales')">👁️ شاشة حية</button>
+                  <button class="btn-saas" onclick="openDeviceDrawer('maadi sales-1', 'MAADI-SALES', '156.204.112.45', '382910442', false, 'v1.1.2', 'Sales')">⚙️ تفاصيل وتحكم ◂</button>
+                </div>
+              </div>
+
+              <!-- Device Card 3 -->
+              <div class="ent-device-card" onclick="openDeviceDrawer('Nozha Sales-2', 'NOZHA2-SALES', '156.210.88.14', '882193004', false, 'v1.1.7', 'Sales')">
+                <div class="ent-card-head">
+                  <div class="ent-dev-identity">
+                    <div class="ent-dev-icon">💻</div>
+                    <div>
+                      <div class="ent-dev-name">Nozha Sales-2</div>
+                      <div class="ent-dev-host mono">NOZHA2-SALES</div>
+                    </div>
+                  </div>
+                  <span class="badge-pill offline">● غير متصل</span>
+                </div>
+
+                <div class="ent-meta-grid">
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">القسم / الفرع</span>
+                    <span class="ent-meta-val">Sales (فرع النزهة)</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">عنوان الشبكة (IP)</span>
+                    <span class="ent-meta-val mono">156.210.88.14</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">نوع الاتصال</span>
+                    <span class="ent-meta-val">Cloud Relay • مجدول v1.2.0</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">حالة الحماية</span>
+                    <span class="ent-meta-val" style="color:var(--status-amber);">🔒 مقفول • 🔌 USB مقفول</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">معرّف RustDesk</span>
+                    <span class="ent-meta-val mono" style="color:var(--brand-blue);">882193004</span>
+                  </div>
+                  <div class="ent-meta-item">
+                    <span class="ent-meta-label">آخر ظهور</span>
+                    <span class="ent-meta-val">منذ 6 ساعات</span>
+                  </div>
+                </div>
+
+                <div class="ent-card-foot" onclick="event.stopPropagation();">
+                  <button class="btn-saas primary" style="flex:1;" onclick="openDeviceDrawer('Nozha Sales-2', 'NOZHA2-SALES', '156.210.88.14', '882193004', false, 'v1.1.7', 'Sales')">🛠️ اتصال RustDesk</button>
+                  <button class="btn-saas" onclick="openDeviceDrawer('Nozha Sales-2', 'NOZHA2-SALES', '156.210.88.14', '882193004', false, 'v1.1.7', 'Sales')">👁️ شاشة حية</button>
+                  <button class="btn-saas" onclick="openDeviceDrawer('Nozha Sales-2', 'NOZHA2-SALES', '156.210.88.14', '882193004', false, 'v1.1.7', 'Sales')">⚙️ تفاصيل وتحكم ◂</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ==================== PANE 3: CCTV MANAGEMENT ==================== -->
+          <div class="view-pane" id="pane-cctv">
+            <div class="saas-panel">
+              <div class="saas-panel-head">
+                <div>
+                  <div class="saas-panel-title">أنظمة كاميرات الفروع (DVR / NVR Management)</div>
+                  <div style="font-size:12px;color:var(--text-muted);">تنظيم حسب الفرع مع إخفاء بيانات الاعتماد وعناوين الشبكة العامة</div>
+                </div>
+                <div style="display:flex;gap:8px;">
+                  <button class="btn-saas">⏪ استرجاع التسجيلات (MP4)</button>
+                  <button class="btn-saas primary">+ إضافة جهاز DVR</button>
+                </div>
+              </div>
+              <div class="saas-panel-body">
+                <div class="devices-grid">
+                  <div class="ent-device-card">
+                    <div class="ent-card-head">
+                      <div>
+                        <div class="ent-dev-name">فرع المعادي (Maadi DVR)</div>
+                        <div class="ent-dev-host">8 كاميرات • Dahua XVR</div>
+                      </div>
+                      <span class="badge-pill online">● متصل (8/8)</span>
+                    </div>
+                    <div class="ent-card-foot">
+                      <button class="btn-saas primary" style="flex:1;">📹 فتح البث المباشر</button>
+                      <button class="btn-saas">⏪ التسجيلات</button>
+                    </div>
+                  </div>
+                  <div class="ent-device-card">
+                    <div class="ent-card-head">
+                      <div>
+                        <div class="ent-dev-name">فرع النزهة (Nozha DVR)</div>
+                        <div class="ent-dev-host">8 كاميرات • Dahua XVR</div>
+                      </div>
+                      <span class="badge-pill online">● متصل (8/8)</span>
+                    </div>
+                    <div class="ent-card-foot">
+                      <button class="btn-saas primary" style="flex:1;">📹 فتح البث المباشر</button>
+                      <button class="btn-saas">⏪ التسجيلات</button>
+                    </div>
+                  </div>
+                  <div class="ent-device-card">
+                    <div class="ent-card-head">
+                      <div>
+                        <div class="ent-dev-name">فرع الدقي (Doki DVR)</div>
+                        <div class="ent-dev-host">8 كاميرات • بانتظار إعادة تشغيل الـ DVR</div>
+                      </div>
+                      <span class="badge-pill amber">⚠ يحتاج ريستارت DVR</span>
+                    </div>
+                    <div class="ent-card-foot">
+                      <button class="btn-saas" style="flex:1;">🔄 فحص الاتصال</button>
+                      <button class="btn-saas">⚙️ الإعدادات</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ==================== PANE 4: RUSTDESK MANAGEMENT ==================== -->
+          <div class="view-pane" id="pane-rustdesk">
+            <div class="saas-panel">
+              <div class="saas-panel-head">
+                <span class="saas-panel-title">مركز إدارة الدعم الفني عن بُعد (RustDesk Central)</span>
+                <span class="badge-pill online">● الوضع الهجين نشط (LAN Direct + Cloud)</span>
+              </div>
+              <div class="saas-panel-body">
+                <p style="font-size:13.5px;color:var(--text-secondary);">جميع أجهزة الفروع مربوطة بمعرّف RustDesk وكلمة مرور الدخول الصامت للمهندسين المصرّح لهم مع تسجيل كامل في سجل التدقيق (Audit Log).</p>
+              </div>
+            </div>
+          </div>
+
+        </main>
+      </div>
+
+      <!-- ==================== SLIDE-OVER DEVICE PROFILE DRAWER ==================== -->
+      <div class="drawer-backdrop" id="deviceDrawerBackdrop" onclick="closeDeviceDrawer()">
+        <aside class="device-drawer" onclick="event.stopPropagation();">
+          <div class="drawer-head">
+            <div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <h2 id="drwName" style="font-size:18px;font-weight:700;">doki sales</h2>
+                <span class="badge-pill online" id="drwStatus">● متصل الآن</span>
+              </div>
+              <div class="mono" id="drwMeta" style="font-size:12px;color:var(--text-muted);margin-top:2px;">DOKI-BRANSH • 197.39.239.187 • v1.2.0</div>
+            </div>
+            <button class="btn-saas" onclick="closeDeviceDrawer()">✕ إغلاق</button>
+          </div>
+
+          <!-- 5 Organized Device Profile Tabs -->
+          <div class="drawer-tabs">
+            <button class="d-tab active" onclick="switchDrawerTab('ov', this)">نظرة عامة والتحكم</button>
+            <button class="d-tab" onclick="switchDrawerTab('net', this)">الشبكة والمواقع</button>
+            <button class="d-tab" onclick="switchDrawerTab('rd', this)">الدعم عن بُعد (RustDesk)</button>
+            <button class="d-tab" onclick="switchDrawerTab('events', this)">الأحداث وملفات DLP</button>
+            <button class="d-tab" onclick="switchDrawerTab('maint', this)">الصيانة والطاقة</button>
+          </div>
+
+          <div class="drawer-body">
+            <!-- Tab 1: Overview & Controls -->
+            <div class="drawer-pane active" id="drw-pane-ov">
+              <div style="background:var(--bg-surface-2);border:1px solid var(--border-subtle);border-radius:12px;padding:16px;text-align:center;">
+                <div style="font-size:28px;margin-bottom:6px;">🖥️</div>
+                <div style="font-size:13.5px;font-weight:700;">المعاينة الحية لشاشة الجهاز والكاميرا</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">اضغط لبدء البث المباشر للشاشة أو التقاط صورة فورية</div>
+                <div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap;">
+                  <button class="btn-saas primary">👁️ بث الشاشة الحية</button>
+                  <button class="btn-saas">📸 لقطة شاشة فورية</button>
+                  <button class="btn-saas">📷 فتح كاميرا الويب</button>
+                </div>
+              </div>
+
+              <div class="saas-panel">
+                <div class="saas-panel-head"><span class="saas-panel-title" style="font-size:13.5px;">التحكم الفوري في صلاحيات الجهاز</span></div>
+                <div class="saas-panel-body" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                  <button class="btn-saas success">🔓 فتح الإنترنت للجهاز</button>
+                  <button class="btn-saas danger">🔒 قفل الإنترنت (Whitelist)</button>
+                  <button class="btn-saas">🔌 فتح منافذ USB</button>
+                  <button class="btn-saas danger">🔌 قفل منافذ USB</button>
+                </div>
+              </div>
+
+              <div class="saas-panel">
+                <div class="saas-panel-head"><span class="saas-panel-title" style="font-size:13.5px;">المجموعة وتحديد السرعة</span></div>
+                <div class="saas-panel-body" style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span>القسم / المجموعة:</span>
+                    <select style="background:var(--bg-surface-2);border:1px solid var(--border-subtle);color:var(--text-primary);padding:6px 12px;border-radius:8px;font-family:inherit;">
+                      <option>Sales (المبيعات)</option>
+                      <option>فروع</option>
+                      <option>المجموعة الافتراضية</option>
+                    </select>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span>تحديد سرعة الإنترنت:</span>
+                    <div style="display:flex;gap:6px;">
+                      <select style="background:var(--bg-surface-2);border:1px solid var(--border-subtle);color:var(--text-primary);padding:6px 12px;border-radius:8px;font-family:inherit;">
+                        <option>بدون حد</option>
+                        <option>2 Mbps</option>
+                        <option>4 Mbps</option>
+                        <option>8 Mbps</option>
+                      </select>
+                      <button class="btn-saas primary">تطبيق</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 2: Network & Domains -->
+            <div class="drawer-pane" id="drw-pane-net">
+              <div class="saas-panel">
+                <div class="saas-panel-head"><span class="saas-panel-title" style="font-size:13.5px;">المواقع المفتوحة حالياً على الجهاز</span></div>
+                <div class="saas-panel-body" style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <span class="badge-pill online mono">✓ elkhawaga.uk</span>
+                  <span class="badge-pill online mono">✓ web.whatsapp.com</span>
+                </div>
+              </div>
+              <div class="saas-panel">
+                <div class="saas-panel-head"><span class="saas-panel-title" style="font-size:13.5px;">محاولات التصفح المحظورة من هذا الجهاز</span></div>
+                <div class="saas-panel-body" style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <span class="badge-pill offline mono">🚫 facebook.com</span>
+                  <span class="badge-pill offline mono">🚫 youtube.com</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 3: Remote Support (RustDesk) -->
+            <div class="drawer-pane" id="drw-pane-rd">
+              <div class="saas-panel">
+                <div class="saas-panel-head"><span class="saas-panel-title" style="font-size:13.5px;">بيانات الاتصال عن بُعد (RustDesk)</span></div>
+                <div class="saas-panel-body" style="display:flex;flex-direction:column;gap:12px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="color:var(--text-muted);font-size:13px;">معرّف RustDesk ID:</span>
+                    <span class="mono" id="drwRdId" style="font-weight:700;font-size:15px;color:var(--brand-blue);">149283741</span>
+                  </div>
+                  <div style="display:flex;gap:8px;">
+                    <button class="btn-saas primary" style="flex:1;">🛠️ بدء جلسة دعم RustDesk الآن</button>
+                    <button class="btn-saas">🔑 تغيير كلمة سر RustDesk</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 4: Events & DLP -->
+            <div class="drawer-pane" id="drw-pane-events">
+              <div style="padding:14px;border-radius:10px;background:var(--bg-surface-2);font-size:13px;">
+                سجل الملفات المرفوعة عبر واتساب والتنبيهات الأمنية الخاصة بهذا الجهاز.
+              </div>
+            </div>
+
+            <!-- Tab 5: Maintenance & Power -->
+            <div class="drawer-pane" id="drw-pane-maint">
+              <div class="saas-panel">
+                <div class="saas-panel-head"><span class="saas-panel-title" style="font-size:13.5px;">الصيانة وإدارة الطاقة</span></div>
+                <div class="saas-panel-body" style="display:flex;flex-direction:column;gap:10px;">
+                  <button class="btn-saas primary">⬆️ تحديث برنامج الموظف صامتاً (إلى v1.2.0)</button>
+                  <button class="btn-saas">✎ تعديل اسم الجهاز / الموظف</button>
+                  <button class="btn-saas">⟳ إعادة تشغيل الجهاز (Restart)</button>
+                  <button class="btn-saas danger">⏻ إيقاف تشغيل الجهاز (Shutdown)</button>
+                  <button class="btn-saas danger">🗑 حذف الجهاز من المنظومة</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    function switchTheme(mode, btn) {
+      document.documentElement.setAttribute('data-theme', mode);
+      btn.parentElement.querySelectorAll('.p-btn').forEach((b, idx) => {
+        if (idx < 2) b.classList.remove('active');
+      });
+      btn.classList.add('active');
+    }
+
+    function switchViewport(vp, btn) {
+      const parent = btn.parentElement;
+      Array.from(parent.querySelectorAll('.p-btn')).slice(2).forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const frame = document.getElementById('simFrame');
+      frame.classList.remove('vp-ipad', 'vp-mobile');
+      if (vp === 'ipad') frame.classList.add('vp-ipad');
+      if (vp === 'mobile') frame.classList.add('vp-mobile');
+    }
+
+    function showPane(paneId, title, sub, navBtn) {
+      document.querySelectorAll('.view-pane').forEach(p => p.classList.remove('active'));
+      const target = document.getElementById('pane-' + paneId);
+      if (target) target.classList.add('active');
+      document.getElementById('pageHeading').textContent = title;
+      document.getElementById('pageSubheading').textContent = sub;
+      if (navBtn) {
+        document.querySelectorAll('.saas-nav-item').forEach(b => b.classList.remove('active'));
+        navBtn.classList.add('active');
+      }
+    }
+
+    function openDeviceDrawer(name, host, ip, rd, online, ver, group) {
+      document.getElementById('drwName').textContent = name;
+      document.getElementById('drwMeta').textContent = host + ' • ' + ip + ' • ' + ver + ' • ' + group;
+      document.getElementById('drwRdId').textContent = rd;
+      const st = document.getElementById('drwStatus');
+      st.textContent = online ? '● متصل الآن' : '● غير متصل';
+      st.className = 'badge-pill ' + (online ? 'online' : 'offline');
+      document.getElementById('deviceDrawerBackdrop').classList.add('open');
+    }
+
+    function closeDeviceDrawer() {
+      document.getElementById('deviceDrawerBackdrop').classList.remove('open');
+    }
+
+    function switchDrawerTab(tabId, btn) {
+      document.querySelectorAll('.d-tab').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.drawer-pane').forEach(p => p.classList.remove('active'));
+      const pane = document.getElementById('drw-pane-' + tabId);
+      if (pane) pane.classList.add('active');
+    }
+  </script>
+</body>
+</html>

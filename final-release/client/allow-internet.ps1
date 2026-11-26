@@ -103,13 +103,18 @@ $endMarker = "# === BLOCKED SITES END ==="
 
 $newHosts = @()
 $inBlock = $false
-foreach ($line in (Get-Content $hostsFile)) {
-    if ($line -eq $startMarker) { $inBlock = $true; continue }
+$hadBlock = $false
+foreach ($line in (Get-Content $hostsFile -ErrorAction SilentlyContinue)) {
+    if ($line -eq $startMarker) { $inBlock = $true; $hadBlock = $true; continue }
     if ($line -eq $endMarker) { $inBlock = $false; continue }
     if (-not $inBlock) { $newHosts += $line }
 }
-$newHosts | Out-File $hostsFile -Encoding ASCII -Force
-Write-Host "OK: hosts cleaned" -ForegroundColor Green
+if ($hadBlock) {
+    try {
+        $newHosts | Out-File $hostsFile -Encoding ASCII -Force
+        Write-Host "OK: hosts cleaned" -ForegroundColor Green
+    } catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
+}
 
 # 4. Flush DNS and tell WinINET to reload
 ipconfig /flushdns | Out-Null

@@ -10,6 +10,10 @@ dist/
 relay/data/*.db
 relay/data/*.db-wal
 relay/data/*.db-shm
+*.log
+logs/*.log
+!logs/PROJECT_REFERENCE_GUIDE.log
+backups/
 # Large binaries
 *.exe
 *.exe.old

@@ -296,16 +296,6 @@ fn is_background_noise_host(host: &str) -> bool {
         "do.dsp.mp.microsoft.com",
         "telecommandsvc.microsoft.com",
         "officeclient.microsoft.com",
-        "microsoft.com",
-        "windows.com",
-        "windows.net",
-        "bing.com",
-        "msn.com",
-        "live.com",
-        "officeapps.live.com",
-        "skype.com",
-        "office.com",
-        "office.net",
         "ecs.office.com",
         "c2r.ts.cdn.office.net",
         "msftconnecttest.com",
@@ -314,40 +304,53 @@ fn is_background_noise_host(host: &str) -> bool {
         "gfx.ms",
         "onestore.ms",
         "azureedge.net",
-        "azure.com",
         "trafficmanager.net",
         "msedge.net",
         "b-msedge.net",
         "a-msedge.net",
-        "spo-msedge.net",
-        "l-msedge.net",
         "s-msedge.net",
+        "l-msedge.net",
         "t-msedge.net",
+        "spo-msedge.net",
         "edge.microsoft.com",
         "microsoftedgeservices.com",
-        "nelreports.net",
         "smartscreen.microsoft.com",
         "smartscreen-prod.microsoft.com",
+        "svc.cloud.microsoft",
+        "nel.cloudflare.com",
+        "nelreports.net",
         "footprintdns.com",
         "msidentity.com",
         "msauth.net",
         "msftauth.net",
-        "passport.net",
-        "microsoftonline.com",
+        "ntp.msn.com",
+        "arc.msn.com",
+        "msn.com",
+        "assets.msn.com",
+        "api.msn.com",
+        "c.msn.com",
+        "msftstatic.com",
+        "r.msftstatic.com",
+        "th.bing.com",
+        "c.bing.com",
+        "r.bing.com",
+        "live.com",
+        "login.live.com",
+        "office.com",
+        "office.net",
+        "office365.com",
+        "microsoft.com",
+        "windows.com",
+        "windows.net",
+        "go.microsoft.com",
         "virtualearth.net",
         "googleapis.com",
-        "accounts.google.com",
-        "clients1.google.com",
-        "clients2.google.com",
-        "clients3.google.com",
-        "clients4.google.com",
-        "clients5.google.com",
-        "clients6.google.com",
         "update.googleapis.com",
         "safebrowsing.googleapis.com",
         "optimizationguide-pa.googleapis.com",
         "content-autofill.googleapis.com",
         "clientservices.googleapis.com",
+        "passwordsleakcheck-pa.googleapis.com",
         "fonts.googleapis.com",
         "ajax.googleapis.com",
         "gstatic.com",
@@ -402,11 +405,6 @@ fn is_background_noise_host(host: &str) -> bool {
         "sentry.io",
         "whatsapp.net",
         "anydesk.com",
-        "mozilla.com",
-        "mozilla.net",
-        "firefox.com",
-        "opera.com",
-        "brave.com",
     ];
     if NOISE_DOMAINS.iter().any(|d| host_matches_domain(&h, d)) {
         return true;
@@ -446,8 +444,8 @@ fn is_local_or_private_lan_host(h: &str) -> bool {
 }
 
 fn host_always_allowed_with(h: &str, snap: &ProxyPolicySnapshot) -> bool {
-    // Always allow the local machine, private LAN IPs (branch routers 192.168.x.x / 10.x.x.x, DVRs, printers),
-    // and the relay/control plane, otherwise a blocked device could never access local LAN routers or poll.
+    // Always allow the local machine, private LAN IPs (branch routers/ERP/printers), and the
+    // relay/control plane, otherwise a blocked device could never poll for an unblock command.
     if is_local_or_private_lan_host(h) {
         return true;
     }
@@ -903,6 +901,7 @@ fn root_ca_dir() -> std::path::PathBuf {
 }
 
 static ROOT_CA: OnceLock<Result<RootCaState, String>> = OnceLock::new();
+static CA_TRUSTED_ONCE: OnceLock<()> = OnceLock::new();
 
 fn get_root_ca() -> Option<&'static RootCaState> {
     ROOT_CA
@@ -914,46 +913,49 @@ fn get_root_ca() -> Option<&'static RootCaState> {
 /// Ensures the local IT ELKHAWGA Root CA exists on disk and is trusted in the
 /// Windows certificate store (and Firefox enterprise roots) so denied HTTPS
 /// destinations render our browser block page cleanly.
+/// Runs at most once per agent process lifetime to avoid spawning `certutil.exe` repeatedly.
 pub fn ensure_root_ca_trusted() {
-    if get_root_ca().is_none() {
-        return;
-    }
-    let cer_path = root_ca_dir().join("ca-cert.cer");
-    if !cer_path.exists() {
-        return;
-    }
-    let mut cmd = Command::new("certutil");
-    hidden(&mut cmd).args(["-addstore", "-f", "Root"]).arg(&cer_path);
-    match cmd.output() {
-        Ok(out) if out.status.success() => {
-            log_action("PROXY Root CA trusted in Windows certificate store");
+    CA_TRUSTED_ONCE.get_or_init(|| {
+        if get_root_ca().is_none() {
+            return;
         }
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            log_action(&format!(
-                "PROXY certutil Root CA warning ({:?}): {} {}",
-                out.status.code(),
-                stdout.trim(),
-                stderr.trim()
-            ));
+        let cer_path = root_ca_dir().join("ca-cert.cer");
+        if !cer_path.exists() {
+            return;
         }
-        Err(e) => log_action(&format!("PROXY certutil failed: {}", e)),
-    }
+        let mut cmd = Command::new("certutil");
+        hidden(&mut cmd).args(["-addstore", "-f", "Root"]).arg(&cer_path);
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                log_action("PROXY Root CA trusted in Windows certificate store");
+            }
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log_action(&format!(
+                    "PROXY certutil Root CA warning ({:?}): {} {}",
+                    out.status.code(),
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            }
+            Err(e) => log_action(&format!("PROXY certutil failed: {}", e)),
+        }
 
-    let mut reg = Command::new("reg");
-    hidden(&mut reg).args([
-        "add",
-        r"HKLM\SOFTWARE\Policies\Mozilla\Firefox\Certificates",
-        "/v",
-        "ImportEnterpriseRoots",
-        "/t",
-        "REG_DWORD",
-        "/d",
-        "1",
-        "/f",
-    ]);
-    let _ = reg.output();
+        let mut reg = Command::new("reg");
+        hidden(&mut reg).args([
+            "add",
+            r"HKLM\SOFTWARE\Policies\Mozilla\Firefox\Certificates",
+            "/v",
+            "ImportEnterpriseRoots",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "1",
+            "/f",
+        ]);
+        let _ = reg.output();
+    });
 }
 
 fn wants_full_block_html(req_bytes: &[u8]) -> bool {
@@ -996,8 +998,8 @@ fn serve_blocked_https_with_ca(
         return;
     };
     let mut tls = StreamOwned::new(conn, client);
-    let _ = tls.get_mut().set_read_timeout(Some(Duration::from_millis(350)));
-    let _ = tls.get_mut().set_write_timeout(Some(Duration::from_millis(350)));
+    let _ = tls.get_mut().set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = tls.get_mut().set_write_timeout(Some(Duration::from_millis(600)));
 
     let mut req_buf = [0u8; 8192];
     let mut total = 0usize;
@@ -1071,24 +1073,9 @@ fn respond_blocked(mut stream: TcpStream, method: &str, raw_host: &str, norm_hos
     let _ = stream.flush();
 }
 
-fn connect_upstream(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
-    use std::net::ToSocketAddrs;
-    let addrs = (host, port).to_socket_addrs()?;
-    let mut last_err = None;
-    for addr in addrs.take(3) {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(s) => return Ok(s),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "upstream resolve failed")
-    }))
-}
-
 fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()> {
     let _ = client.set_nodelay(true);
-    let _ = client.set_read_timeout(Some(Duration::from_millis(2500)));
+    let _ = client.set_read_timeout(Some(Duration::from_secs(20)));
     let head = match read_head(&mut client) {
         Some(h) => h,
         None => return Ok(()),
@@ -1130,7 +1117,7 @@ fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()>
         return Ok(());
     }
 
-    let upstream = match connect_upstream(&host, port, Duration::from_secs(4)) {
+    let upstream = match TcpStream::connect((host.as_str(), port)) {
         Ok(s) => s,
         Err(_) => {
             respond(&mut client, "502 Bad Gateway", "upstream unreachable");
@@ -1184,9 +1171,10 @@ fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()>
     if kbps > 0 {
         copy_paced(up_read, client_write, kbps, &host, false);
     } else {
+        // still track uploads even without throttling
         let mut r = up_read;
         let mut w = client_write;
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = vec![0u8; 16 * 1024];
         loop {
             let n = match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1195,6 +1183,7 @@ fn handle(mut client: TcpStream, state: &Arc<ProxyState>) -> std::io::Result<()>
             if w.write_all(&buf[..n]).is_err() {
                 break;
             }
+            track_upload_dir(&host, n as u64, false);
         }
     }
     Ok(())
@@ -1216,9 +1205,7 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
         } else {
             let mut r = c_read;
             let mut w = u_write;
-            let mut buf = vec![0u8; 32 * 1024];
-            let mut pending_up: u64 = 0;
-            let mut last_flush = Instant::now();
+            let mut buf = vec![0u8; 16 * 1024];
             loop {
                 let n = match r.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1227,15 +1214,7 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
                 if w.write_all(&buf[..n]).is_err() {
                     break;
                 }
-                pending_up = pending_up.saturating_add(n as u64);
-                if pending_up >= 65_536 || last_flush.elapsed() >= Duration::from_millis(350) {
-                    track_upload_dir(&host_c, pending_up, true);
-                    pending_up = 0;
-                    last_flush = Instant::now();
-                }
-            }
-            if pending_up > 0 {
-                track_upload_dir(&host_c, pending_up, true);
+                track_upload_dir(&host_c, n as u64, true);
             }
         }
     });
@@ -1244,7 +1223,7 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
     } else {
         let mut r = upstream;
         let mut w = client;
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = vec![0u8; 16 * 1024];
         loop {
             let n = match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1253,6 +1232,7 @@ fn tunnel(client: TcpStream, upstream: TcpStream, kbps: u32, host: &str) {
             if w.write_all(&buf[..n]).is_err() {
                 break;
             }
+            track_upload_dir(&host, n as u64, false);
         }
     }
     let _ = up.join();

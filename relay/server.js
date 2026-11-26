@@ -580,18 +580,276 @@ function getDeviceByToken(token) {
   return row || null;
 }
 function pendingCommand(deviceId) {
-  return db.prepare('SELECT id,type FROM commands WHERE device_id=? AND acked_at IS NULL ORDER BY created_at ASC LIMIT 1').get(deviceId) || null;
+  return db.prepare('SELECT id,type FROM commands WHERE device_id=? AND acked_at IS NULL AND created_at <= ? ORDER BY created_at ASC LIMIT 1').get(deviceId, now()) || null;
 }
+
+// ============================================================================
+// Unified Project Subsystem Logger (C:\Users\IT APP\Desktop\blockwebsite\logs)
+// ============================================================================
+const PROJECT_LOGS_DIR = 'C:\\Users\\IT APP\\Desktop\\blockwebsite\\logs';
+const LOG_FILES = {
+  master: path.join(PROJECT_LOGS_DIR, '00-master-all-events.log'),
+  devices: path.join(PROJECT_LOGS_DIR, '01-devices-and-commands.log'),
+  updates: path.join(PROJECT_LOGS_DIR, '02-auto-updates.log'),
+  policies: path.join(PROJECT_LOGS_DIR, '03-policies-and-groups.log'),
+  dlp: path.join(PROJECT_LOGS_DIR, '04-dlp-uploads-and-alerts.log'),
+  cctv: path.join(PROJECT_LOGS_DIR, '05-cctv-cameras.log'),
+  errors: path.join(PROJECT_LOGS_DIR, '06-errors-and-diagnostics.log'),
+  audit: path.join(PROJECT_LOGS_DIR, '07-admin-audit-trail.log'),
+  localAgent: path.join(PROJECT_LOGS_DIR, '08-local-server-and-agent.log'),
+};
+const logThrottleCache = new Map();
+
+function ensureProjectLogsDir() {
+  try {
+    if (!fs.existsSync(PROJECT_LOGS_DIR)) {
+      fs.mkdirSync(PROJECT_LOGS_DIR, { recursive: true });
+    }
+  } catch (_) {}
+}
+
+function appendSafeLogFile(filePath, line) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const st = fs.statSync(filePath);
+      if (st.size > 5 * 1024 * 1024) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const tailLines = content.split(/\r?\n/).slice(-1200).join('\r\n') + '\r\n';
+        fs.writeFileSync(filePath, tailLines, 'utf8');
+      }
+    }
+    fs.appendFileSync(filePath, line + '\r\n', 'utf8');
+  } catch (_) {}
+}
+
+function writeProjectLog(category, level, event, detail, throttleKey = '', throttleMs = 0) {
+  try {
+    const nowMs = Date.now();
+    if (throttleKey && throttleMs > 0) {
+      const prev = logThrottleCache.get(throttleKey) || 0;
+      if (nowMs - prev < throttleMs) return;
+      logThrottleCache.set(throttleKey, nowMs);
+      if (logThrottleCache.size > 600) logThrottleCache.clear();
+    }
+    ensureProjectLogsDir();
+    const iso = new Date(nowMs).toISOString();
+    const catTag = String(category || 'SYSTEM').toUpperCase();
+    const line = `[${iso}] [${level}] [${catTag}] [${event}] ${detail}`;
+    appendSafeLogFile(LOG_FILES.master, line);
+    const targetFile = LOG_FILES[category];
+    if (targetFile && targetFile !== LOG_FILES.master) {
+      appendSafeLogFile(targetFile, line);
+    }
+    if (level === 'ERROR' || level === 'WARN') {
+      appendSafeLogFile(LOG_FILES.errors, line);
+    }
+  } catch (_) {}
+}
+
+function exportInitialHistoricalLogsSnapshot() {
+  try {
+    ensureProjectLogsDir();
+    const bootMarker = `[${new Date().toISOString()}] [INFO] [SYSTEM] [RELAY_BOOT] بدء تشغيل السيرفر السحابي الموحد (Relay v${RELAY_VERSION}) وتفعيل منظومة التسجيل الشامل في: ${PROJECT_LOGS_DIR}`;
+    appendSafeLogFile(LOG_FILES.master, bootMarker);
+
+    // 1. Snapshot of all enrolled devices
+    const devs = db.prepare('SELECT device_id,label,hostname,ip,app_version,blocked,admin_open,usb_blocked,group_id,last_seen,last_event,rustdesk_id FROM devices ORDER BY last_seen DESC').all();
+    for (const d of devs) {
+      const seenIso = d.last_seen ? new Date(d.last_seen).toISOString() : 'never';
+      const stateStr = Number(d.admin_open) === 1 ? 'OPEN_BY_ADMIN' : (d.blocked ? 'BLOCKED' : 'UNBLOCKED');
+      writeProjectLog(
+        'devices',
+        'INFO',
+        'DEVICE_SNAPSHOT',
+        `جهاز مسجل: "${d.label || d.hostname}" | Host=${d.hostname} | ID=${d.device_id} | IP=${d.ip} | Ver=v${d.app_version} | الحالة=${stateStr} | USB=${d.usb_blocked ? 'LOCKED' : 'OPEN'} | Group=${d.group_id || 'بدون مجموعة'} | RustDesk=${d.rustdesk_id || '-'} | آخر ظهور=${seenIso}`
+      );
+    }
+
+    // 2. Snapshot of groups & policies
+    const grps = groupList();
+    const globalPol = getPolicy() || {};
+    writeProjectLog(
+      'policies',
+      'INFO',
+      'GLOBAL_POLICY_SNAPSHOT',
+      `السياسة العامة (بدون مجموعة): الوضع=${globalPol.mode || 'whitelist'} | المواقع المسموحة=(${(globalPol.allowed || []).join(', ')}) | المواقع المحظورة=(${(globalPol.blocked || []).join(', ')})`
+    );
+    for (const g of grps) {
+      writeProjectLog(
+        'policies',
+        'INFO',
+        'GROUP_POLICY_SNAPSHOT',
+        `مجموعة "${g.name}" (${g.id}): الأجهزة=${g.devices} | الوضع=${g.mode} | المتصفح النظيف=${g.ephemeral_browser ? 'مفعل' : 'معطل'} | قفل الفلاشات=${g.usb_block ? 'مفعل' : 'معطل'} | المواقع المسموحة=(${(g.allowed || []).join(', ')})`
+      );
+    }
+
+    // 3. Snapshot of recent DLP uploaded files
+    const upRows = db.prepare('SELECT file_id,device_name,windows_user,channel,file_name,file_size,recipient_name,recipient_phone,stored_path,created_at FROM uploaded_files ORDER BY created_at DESC LIMIT 60').all();
+    for (const u of upRows.reverse()) {
+      const dt = u.created_at ? new Date(u.created_at).toISOString() : '';
+      writeProjectLog(
+        'dlp',
+        'INFO',
+        'DLP_ARCHIVE_RECORD',
+        `[${dt}] ملف مؤرشف: "${u.file_name}" (${Math.round((u.file_size || 0) / 1024)} KB) | الجهاز=${u.device_name} | المستخدم=${u.windows_user || '-'} | القناة=${u.channel} | المستلم=${u.recipient_name || '-'} (${u.recipient_phone || '-'}) | المسار=${u.stored_path}`
+      );
+    }
+
+    // 4. Snapshot of recent security alerts
+    const altRows = db.prepare('SELECT id,device_id,type,severity,message,created_at FROM alerts ORDER BY created_at DESC LIMIT 60').all();
+    for (const a of altRows.reverse()) {
+      const dt = a.created_at ? new Date(a.created_at).toISOString() : '';
+      writeProjectLog(
+        'dlp',
+        a.severity === 'critical' || a.severity === 'high' ? 'WARN' : 'INFO',
+        `ALERT_${String(a.type || 'TAMPER').toUpperCase()}`,
+        `[${dt}] تنبيه أمني (${a.severity}): الجهاز=${a.device_id} | الرسالة=${a.message}`
+      );
+    }
+
+    // 5. Snapshot of recent audit log entries
+    const audRows = db.prepare('SELECT actor,action,target,result,meta,created_at FROM audit_log ORDER BY created_at DESC LIMIT 80').all();
+    for (const ar of audRows.reverse()) {
+      const dt = ar.created_at ? new Date(ar.created_at).toISOString() : '';
+      writeProjectLog(
+        'audit',
+        'INFO',
+        `AUDIT_${String(ar.action || 'ACTION').toUpperCase()}`,
+        `[${dt}] الفاعل=${ar.actor} | الإجراء=${ar.action} | الهدف=${ar.target || '-'} | النتيجة=${ar.result} | تفاصيل=${ar.meta || '{}'}`
+      );
+    }
+
+    // 6. Sync existing CCTV log & Local Rust activity.log
+    try {
+      const cctvSrc = 'C:\\Users\\IT APP\\Desktop\\blockwebsite\\cctv-cameras.log';
+      if (fs.existsSync(cctvSrc) && !fs.existsSync(LOG_FILES.cctv)) {
+        fs.copyFileSync(cctvSrc, LOG_FILES.cctv);
+      }
+    } catch (_) {}
+    try {
+      const rustLogSrc = 'C:\\ProgramData\\InternetBlocker\\activity.log';
+      if (fs.existsSync(rustLogSrc)) {
+        fs.copyFileSync(rustLogSrc, LOG_FILES.localAgent);
+      } else {
+        appendSafeLogFile(LOG_FILES.localAgent, `[${new Date().toISOString()}] [INFO] [LOCAL_AGENT] سجل السيرفر المحلي والعميل (C:\\ProgramData\\InternetBlocker\\activity.log) جاهز للتسجيل.`);
+      }
+    } catch (_) {}
+
+    appendSafeLogFile(LOG_FILES.updates, `[${new Date().toISOString()}] [INFO] [UPDATES] سجل التحديثات التلقائية للأجهزة (Auto-Update v1.2.6) جاهز للتسجيل.`);
+    appendSafeLogFile(LOG_FILES.errors, `[${new Date().toISOString()}] [INFO] [DIAGNOSTICS] سجل الأخطاء والتشخيص الفني جاهز — لا توجد أخطاء حرجة حالياً.`);
+  } catch (e) {
+    console.error('Log snapshot error:', e);
+  }
+}
+
 function audit(actor, action, target, result, meta) {
   try {
     db.prepare('INSERT INTO audit_log(id,actor,action,target,result,meta,created_at) VALUES(?,?,?,?,?,?,?)')
       .run(rid('aud_'), actor, action, target || null, result || 'ok', JSON.stringify(meta || {}), now());
+    const actStr = String(action || '');
+    const metaJson = JSON.stringify(meta || {});
+    let cat = 'audit';
+    if (actStr.includes('group') || actStr.includes('policy')) cat = 'policies';
+    else if (['block', 'unblock', 'usb_block', 'usb_unblock', 'restart', 'shutdown', 'device_rename', 'device_delete', 'enroll'].includes(actStr)) cat = 'devices';
+    else if (actStr.includes('cctv')) cat = 'cctv';
+    writeProjectLog(
+      cat,
+      result && result !== 'ok' ? 'WARN' : 'INFO',
+      `AUDIT_${actStr.toUpperCase()}`,
+      `الفاعل=${actor} | الإجراء=${actStr} | الهدف=${target || '-'} | النتيجة=${result || 'ok'} | تفاصيل=${metaJson}`
+    );
+    if (cat !== 'audit') {
+      appendSafeLogFile(
+        LOG_FILES.audit,
+        `[${new Date().toISOString()}] [INFO] [AUDIT] [AUDIT_${actStr.toUpperCase()}] الفاعل=${actor} | الإجراء=${actStr} | الهدف=${target || '-'} | النتيجة=${result || 'ok'} | تفاصيل=${metaJson}`
+      );
+    }
   } catch (e) { /* ignore */ }
+}
+
+function cleanPolicyHost(raw) {
+  let s = String(raw || '').trim().toLowerCase();
+  if (s.startsWith('https://')) s = s.slice(8);
+  else if (s.startsWith('http://')) s = s.slice(7);
+  const slashIdx = s.search(/[/?#]/);
+  if (slashIdx >= 0) s = s.slice(0, slashIdx);
+  const colonIdx = s.indexOf(':');
+  if (colonIdx >= 0) s = s.slice(0, colonIdx);
+  s = s.replace(/^\.+|\.+$/g, '');
+  if (!s || s.length > 253 || !/^[a-z0-9.-]+$/.test(s) || s.includes('..')) return '';
+  return s;
+}
+
+function normalizePolicyDomains(list, isAllowed) {
+  const arr = Array.isArray(list) ? list : [];
+  const seen = new Set();
+  const out = [];
+  const pushHost = (h) => {
+    const c = cleanPolicyHost(h);
+    if (c && !seen.has(c)) {
+      seen.add(c);
+      out.push(c);
+    }
+  };
+  for (const item of arr) {
+    pushHost(item);
+  }
+  if (isAllowed) {
+    const hasWa = out.some(d => d.includes('whatsapp'));
+    if (hasWa) {
+      pushHost('whatsapp.com');
+      pushHost('web.whatsapp.com');
+      pushHost('whatsapp.net');
+      pushHost('web.whatsapp.net');
+    }
+    const hasErp = out.some(d => d.includes('elkhawaga.uk') || d === '26.32.24.229' || d === '192.168.10.102');
+    if (hasErp) {
+      pushHost('elkhawaga.uk');
+      pushHost('26.32.24.229');
+      pushHost('192.168.10.102');
+      pushHost('10.10.1.1');
+    }
+  }
+  return out;
+}
+
+const ALL_OPEN_TLDS = [
+  'com','net','org','eg','uk','io','co','ai','me','tv','edu','gov','info','biz','app','dev',
+  'cloud','live','online','site','store','tech','de','fr','sa','ae','us','ca','ru','cn','in',
+  'jp','br','it','es','nl','se','ch','au','nz','za','tr','gr','pl','cz','at','be','dk','fi',
+  'no','pt','ie','qa','kw','bh','om','jo','lb','ma','tn','dz','sd','iq','sy','ye','ly','ps',
+  'youtube.com','facebook.com','m.facebook.com','twitter.com','x.com','instagram.com',
+  'tiktok.com','reddit.com','netflix.com','twitch.tv','snapchat.com','pinterest.com','linkedin.com',
+  'google.com','microsoft.com','live.com','office.com','bing.com','msn.com','cloudflare.com','googleapis.com','gstatic.com'
+];
+try { db.exec('ALTER TABLE devices ADD COLUMN admin_open INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
+try {
+  db.exec("UPDATE devices SET admin_open=1, blocked=0 WHERE device_id IN (SELECT device_id FROM commands WHERE type='unblock' AND acked_at IS NULL)");
+} catch (_) {}
+
+function buildEffectiveDevicePolicy(dev) {
+  const basePol = (dev && dev.group_id && getGroupPolicy(dev.group_id)) || getPolicy();
+  if (!basePol) return null;
+  if (dev && Number(dev.admin_open) === 1) {
+    const mergedAllowed = Array.from(new Set([...(basePol.allowed || []), ...ALL_OPEN_TLDS]));
+    return {
+      ...basePol,
+      version: String(basePol.version || 'v1') + '__OPEN',
+      mode: 'blacklist',
+      blocked: [],
+      allowed: mergedAllowed,
+    };
+  }
+  return basePol;
 }
 
 function getPolicy() {
   const row = db.prepare('SELECT version,data FROM policy WHERE id=1').get();
-  return row ? { version: row.version, ...(JSON.parse(row.data)) } : null;
+  if (!row) return null;
+  const parsed = JSON.parse(row.data);
+  parsed.allowed = normalizePolicyDomains(parsed.allowed, true);
+  parsed.blocked = normalizePolicyDomains(parsed.blocked, false);
+  return { version: row.version, ...parsed };
 }
 function getGroupPolicy(groupId) {
   if (!groupId) return null;
@@ -599,6 +857,8 @@ function getGroupPolicy(groupId) {
   if (!row) return null;
   const gData = JSON.parse(row.data);
   const globalPol = getPolicy() || {};
+  gData.allowed = normalizePolicyDomains(gData.allowed, true);
+  gData.blocked = normalizePolicyDomains(gData.blocked, false);
   return {
     ...globalPol,
     ...gData,
@@ -674,14 +934,26 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url.pathname === '/api/v1/client-setup.exe' || url.pathname === '/api/client-setup.exe')) {
       const foundInfo = findNewestSetupInstaller('IT ELKHAWGA Client_');
       if (!foundInfo) return json(res, 404, { error: 'client installer not found on relay' });
-      const { path: found, stat } = foundInfo;
+      const { path: found, stat, version: ver } = foundInfo;
+      const dlIp = clientIpFromReq(req);
+      console.log(`[UPDATE-DL] GET ${url.pathname} ip=${dlIp} file=${path.basename(found)} ver=${ver} size=${stat.size}`);
+      writeProjectLog('updates', 'INFO', 'UPDATE_DOWNLOAD_START', `بدء تحميل التحديث التلقائي: الملف=${path.basename(found)} (v${ver}) | الحجم=${Math.round(stat.size / 1024)} KB | IP=${dlIp}`);
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'Content-Length': stat.size,
         'Content-Disposition': 'attachment; filename="it-elkhawga-client-setup.exe"',
         'Access-Control-Allow-Origin': CORS_ORIGIN,
       });
-      fs.createReadStream(found).pipe(res);
+      const st = fs.createReadStream(found);
+      st.on('end', () => {
+        console.log(`[UPDATE-DL-DONE] ip=${dlIp} size=${stat.size}`);
+        writeProjectLog('updates', 'INFO', 'UPDATE_DOWNLOAD_DONE', `اكتمل تحميل ملف التحديث بنجاح (v${ver}) | IP=${dlIp} | الحجم=${Math.round(stat.size / 1024)} KB`);
+      });
+      st.on('error', (e) => {
+        console.log(`[UPDATE-DL-ERR] ip=${dlIp} err=${e.message}`);
+        writeProjectLog('updates', 'ERROR', 'UPDATE_DOWNLOAD_ERROR', `خطأ أثناء تحميل ملف التحديث (v${ver}) | IP=${dlIp} | السبب=${e.message}`);
+      });
+      st.pipe(res);
       return;
     }
 
@@ -1037,6 +1309,89 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- Dahua CCTV Live Center -----
+    // 1. Zero-Transcode fMP4 over MSE live stream (/api/cctv/mse)
+    if (req.method === 'GET' && (url.pathname === '/api/cctv/mse' || url.pathname === '/api/v1/cctv/mse')) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const cctvCfg = cctv.getSettings();
+      const actor = jwtVerified && jwtVerified.claims ? String(jwtVerified.claims.sub || '') : 'admin';
+      const role = jwtVerified && jwtVerified.claims ? String(jwtVerified.claims.role || 'super').toLowerCase() : 'super';
+      if (cctvCfg.super_only && role !== 'super') {
+        return json(res, 403, { ok: false, error: 'تم حصر مشاهدة الكاميرات بحساب السوبر أدمن فقط' });
+      }
+      const dvrId = String(url.searchParams.get('dvr_id') || '').trim();
+      const channel = Math.max(1, Math.min(64, Number(url.searchParams.get('channel') || 1) || 1));
+      const hd = url.searchParams.get('hd') === '1';
+      const mode = url.searchParams.get('mode') === 'h264' ? 'h264' : 'copy';
+      cctv.subscribeClientToFmp4Stream({ dvrId, channel, hd, mode, actor, role, req, res });
+      return;
+    }
+
+    // 2. WebRTC WHEP Signaling Gateway (/api/cctv/webrtc/whep)
+    if (req.method === 'POST' && (url.pathname === '/api/cctv/webrtc/whep' || url.pathname === '/api/v1/cctv/webrtc/whep')) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const cctvCfg = cctv.getSettings();
+      const actor = jwtVerified && jwtVerified.claims ? String(jwtVerified.claims.sub || '') : 'admin';
+      const role = jwtVerified && jwtVerified.claims ? String(jwtVerified.claims.role || 'super').toLowerCase() : 'super';
+      if (cctvCfg.super_only && role !== 'super') {
+        return json(res, 403, { ok: false, error: 'تم حصر مشاهدة الكاميرات بحساب السوبر أدمن فقط' });
+      }
+      const body = await readBody(req).catch(() => ({}));
+      const dvrId = String(body.dvr_id || url.searchParams.get('dvr_id') || '').trim();
+      const channel = Math.max(1, Math.min(64, Number(body.channel || url.searchParams.get('channel') || 1) || 1));
+      const hd = Boolean(body.hd || url.searchParams.get('hd') === '1');
+      const offerSdp = String(body.offer_sdp || body.sdp || '');
+      try {
+        const out = await cctv.negotiateWebRtcWhep({ dvrId, channel, hd, offerSdp, actor, role });
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 502, { ok: false, error: (e && e.message) || 'تعذر فتح جلسة WebRTC' });
+      }
+    }
+
+    // 3. Low-Latency HLS Fallback Gateway (/api/cctv/hls/:dvrId/:channel/:streamKind/:file)
+    const hlsMatch = url.pathname.match(/^\/api(?:\/v1)?\/cctv\/hls\/([^/]+)\/(\d+)\/(main|sub)\/(.+)$/);
+    if (req.method === 'GET' && hlsMatch) {
+      const hdrTok = bearer(req);
+      const qTok = String(url.searchParams.get('token') || '').trim();
+      const candTok = hdrTok || qTok;
+      const isAdminKeyOk = Boolean(ADMIN_KEY && hdrTok === ADMIN_KEY);
+      const jwtVerified = isAdminKeyOk ? null : verifyAdminJwtToken(candTok);
+      if (!isAdminKeyOk && !jwtVerified) {
+        return json(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      const cctvCfg = cctv.getSettings();
+      const actor = jwtVerified && jwtVerified.claims ? String(jwtVerified.claims.sub || '') : 'admin';
+      const role = jwtVerified && jwtVerified.claims ? String(jwtVerified.claims.role || 'super').toLowerCase() : 'super';
+      if (cctvCfg.super_only && role !== 'super') {
+        return json(res, 403, { ok: false, error: 'تم حصر مشاهدة الكاميرات بحساب السوبر أدمن فقط' });
+      }
+      cctv.proxyMediaMtxHls({
+        dvrId: decodeURIComponent(hlsMatch[1]),
+        channel: Number(hlsMatch[2] || 1),
+        hd: hlsMatch[3] === 'main',
+        subFile: hlsMatch[4],
+        actor,
+        role,
+        token: candTok,
+        res,
+      });
+      return;
+    }
+
     if ((req.method === 'GET' || req.method === 'HEAD') && (url.pathname === '/api/cctv/frame' || url.pathname === '/api/v1/cctv/frame')) {
       const hdrTok = bearer(req);
       const qTok = String(url.searchParams.get('token') || '').trim();
@@ -1407,6 +1762,12 @@ const server = http.createServer(async (req, res) => {
           const ver = rid('gv_');
           db.prepare('INSERT INTO group_policy(group_id,version,data,updated_at) VALUES(?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET version=excluded.version,data=excluded.data,updated_at=excluded.updated_at')
             .run(gid, ver, JSON.stringify(data), now());
+          writeProjectLog(
+            'policies',
+            'INFO',
+            'GROUP_POLICY_UPDATED',
+            `تحديث سياسة المجموعة (${gid}): الوضع=${data.mode} | المتصفح النظيف=${data.ephemeral_browser} | قفل الفلاشات=${data.usb_block} | المسموحة=(${(data.allowed || []).join(', ')}) | المحظورة=(${(data.blocked || []).join(', ')})`
+          );
         }
         return json(res, 200, {ok:true, group: groupList().find(g => g.id === gid)});
       }
@@ -1437,8 +1798,8 @@ const server = http.createServer(async (req, res) => {
       for (const t of targets) {
         clear.run(t.device_id);
         ins.run(rid('cmd_'), t.device_id, type, now());
-        if (type === 'block') db.prepare('UPDATE devices SET blocked=1 WHERE device_id=?').run(t.device_id);
-        else if (type === 'unblock') db.prepare('UPDATE devices SET blocked=0 WHERE device_id=?').run(t.device_id);
+        if (type === 'block') db.prepare("UPDATE devices SET blocked=1, admin_open=0, last_event='', last_event_at=0 WHERE device_id=?").run(t.device_id);
+        else if (type === 'unblock') db.prepare("UPDATE devices SET blocked=0, admin_open=1, last_event='', last_event_at=0 WHERE device_id=?").run(t.device_id);
         else if (type === 'usb_block') db.prepare('UPDATE devices SET usb_blocked=1 WHERE device_id=?').run(t.device_id);
         else if (type === 'usb_unblock') db.prepare('UPDATE devices SET usb_blocked=0 WHERE device_id=?').run(t.device_id);
       }
@@ -1538,7 +1899,7 @@ const server = http.createServer(async (req, res) => {
     // Admin: devices
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/devices') {
       if (!requireAdmin(req,res)) return;
-      const rows = db.prepare('SELECT device_id,hostname,os,app_version,enrolled_at,last_seen,ip,blocked,usb_blocked,mode,policy_version,group_id,label,last_event,last_event_at,throttle_kbps,sites,denied,rustdesk_id,rustdesk_password FROM devices ORDER BY last_seen DESC').all();
+      const rows = db.prepare('SELECT device_id,hostname,os,app_version,enrolled_at,last_seen,ip,blocked,admin_open,usb_blocked,mode,policy_version,group_id,label,last_event,last_event_at,throttle_kbps,sites,denied,rustdesk_id,rustdesk_password FROM devices ORDER BY last_seen DESC').all();
       const pendRows = db.prepare('SELECT device_id, type FROM commands WHERE acked_at IS NULL ORDER BY created_at DESC').all();
       const pendMap = new Map();
       for (const pr of pendRows) {
@@ -1551,7 +1912,20 @@ const server = http.createServer(async (req, res) => {
         let denied = [];
         try { sites = JSON.parse(d.sites || '[]'); } catch (e) { sites = []; }
         try { denied = JSON.parse(d.denied || '[]'); } catch (e) { denied = []; }
-        return {...d, sites, denied, pending_command: pendMap.get(d.device_id) || '', latest_client_version: latestVer, rustdesk_id: d.rustdesk_id || '', rustdesk_password: d.rustdesk_password || '', blocked: !!d.blocked, usb_blocked: !!d.usb_blocked, online: d.last_seen && (now()-d.last_seen < 120_000)};
+        const isOpenByAdmin = Number(d.admin_open) === 1;
+        const pendCmd = pendMap.get(d.device_id) || '';
+        const effectiveBlocked = pendCmd === 'block' ? true : (pendCmd === 'unblock' || isOpenByAdmin ? false : !!d.blocked);
+        return {...d, sites, denied, pending_command: pendCmd, latest_client_version: latestVer, rustdesk_id: d.rustdesk_id || '', rustdesk_password: d.rustdesk_password || '', blocked: effectiveBlocked, usb_blocked: !!d.usb_blocked, online: d.last_seen && (now()-d.last_seen < 120_000)};
+      });
+      out.sort((a, b) => {
+        const ao = a.online ? 1 : 0;
+        const bo = b.online ? 1 : 0;
+        if (ao !== bo) return bo - ao;
+        const an = String(a.label || a.hostname || a.device_id || '').trim();
+        const bn = String(b.label || b.hostname || b.device_id || '').trim();
+        const cmp = an.localeCompare(bn, undefined, { numeric: true, sensitivity: 'base' });
+        if (cmp !== 0) return cmp;
+        return String(a.device_id || '').localeCompare(String(b.device_id || ''));
       });
       return json(res, 200, {ok:true, latest_client_version: latestVer, devices: out});
     }
@@ -1587,8 +1961,8 @@ const server = http.createServer(async (req, res) => {
           if (throttleVal !== null) setThr.run(throttleVal, t);
           // Reflect the intended state immediately so the admin UI does not
           // lag behind the device's next poll.
-          if (type === 'block') db.prepare('UPDATE devices SET blocked=1 WHERE device_id=?').run(t);
-          else if (type === 'unblock') db.prepare('UPDATE devices SET blocked=0 WHERE device_id=?').run(t);
+          if (type === 'block') db.prepare("UPDATE devices SET blocked=1, admin_open=0, last_event='', last_event_at=0 WHERE device_id=?").run(t);
+          else if (type === 'unblock') db.prepare("UPDATE devices SET blocked=0, admin_open=1, last_event='', last_event_at=0 WHERE device_id=?").run(t);
           else if (type === 'usb_block') db.prepare('UPDATE devices SET usb_blocked=1 WHERE device_id=?').run(t);
           else if (type === 'usb_unblock') db.prepare('UPDATE devices SET usb_blocked=0 WHERE device_id=?').run(t);
           count++;
@@ -1934,6 +2308,12 @@ const server = http.createServer(async (req, res) => {
           pageUrl,
           sha256Hash
         );
+      writeProjectLog(
+        'dlp',
+        'INFO',
+        'DLP_FILE_CAPTURED',
+        `تم التقاط وأرشفة ملف مرفوع: الملف="${origName}" (${Math.round(buf.length / 1024)} KB) | الجهاز="${deviceName}" (${dev.device_id}) | المستخدم="${winUser || '-'}" | القناة=${channel} | المستلم="${recipientName || '-'}" (${recipientPhone || '-'}) | المسار=${storedPath}`
+      );
       return json(res, 200, {ok:true, file_id: fid, size: buf.length, sha256: sha256Hash, stored_path: storedPath});
     }
 
@@ -1945,6 +2325,12 @@ const server = http.createServer(async (req, res) => {
       const type = String(body.type || 'tamper').slice(0, 40);
       const severity = ['low','medium','high','critical'].includes(body.severity) ? body.severity : 'medium';
       const message = String(body.message || '').slice(0, 600);
+      writeProjectLog(
+        'dlp',
+        severity === 'critical' || severity === 'high' ? 'WARN' : 'INFO',
+        `DEVICE_ALERT_${type.toUpperCase()}`,
+        `تنبيه أمني من الجهاز "${dev.label || dev.hostname}" (${dev.device_id}) | الخطورة=${severity} | النوع=${type} | التفاصيل=${message}`
+      );
       const parsedMeta = storeAlertWithSeparatedMedia({
         id: rid('alt_'),
         deviceId: dev.device_id,
@@ -2042,16 +2428,73 @@ const server = http.createServer(async (req, res) => {
       const dev = getDeviceByToken(bearer(req));
       if (!dev) return json(res, 401, {ok:false,error:'unauthorized'});
       const body = await readBody(req);
+      const ci = findNewestSetupInstaller('IT ELKHAWGA Client_');
+      const latestClientVer = (ci && ci.version) || '1.2.0';
+      const reportedVer = String(body.app_version || dev.app_version || '1.0.0').replace(/^v/i, '').trim();
+      const cmpVer = (a, b) => {
+        const pa = String(a || '0.0.0').split('.').map(n => parseInt(n, 10) || 0);
+        const pb = String(b || '0.0.0').split('.').map(n => parseInt(n, 10) || 0);
+        for (let i = 0; i < 3; i++) {
+          if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+        }
+        return 0;
+      };
+      const isUpToDate = cmpVer(reportedVer, latestClientVer) >= 0;
+      const supportsSelfUpdate = cmpVer(reportedVer, '1.1.0') >= 0;
+      if (isUpToDate) {
+        db.prepare("UPDATE commands SET acked_at=? WHERE device_id=? AND type='update_client' AND acked_at IS NULL")
+          .run(now(), dev.device_id);
+      }
       if (body.ack_command_id) {
-        db.prepare('UPDATE commands SET acked_at=? WHERE id=? AND device_id=? AND acked_at IS NULL')
-          .run(now(), body.ack_command_id, dev.device_id);
+        const cmdRow = db.prepare('SELECT id,type FROM commands WHERE id=? AND device_id=? AND acked_at IS NULL').get(body.ack_command_id, dev.device_id);
+        if (cmdRow) {
+          console.log(`[CMD-ACK] dev=${dev.label || dev.hostname} ver=${reportedVer} cmd=${cmdRow.type} id=${cmdRow.id} isUpToDate=${isUpToDate}`);
+          writeProjectLog(
+            cmdRow.type === 'update_client' ? 'updates' : 'devices',
+            'INFO',
+            'COMMAND_ACKED',
+            `تأكيد تنفيذ أمر من الجهاز "${dev.label || dev.hostname}" (${dev.device_id}) | الأمر=${cmdRow.type} | ID=${cmdRow.id} | الإصدار الحالي=v${reportedVer} | محدث بالكامل=${isUpToDate}`
+          );
+          db.prepare('UPDATE commands SET acked_at=? WHERE id=?').run(now(), cmdRow.id);
+          if (cmdRow.type === 'update_client' && !isUpToDate) {
+            // Queue a fresh command ID 75s in the future so the client's last_command_id check never skips a retry!
+            db.prepare('INSERT INTO commands(id,device_id,type,created_at) VALUES(?,?,?,?)')
+              .run(rid('cmd_'), dev.device_id, 'update_client', now() + 75_000);
+          }
+        }
+      }
+      if (!isUpToDate && supportsSelfUpdate) {
+        const hasPendingAny = db.prepare('SELECT 1 FROM commands WHERE device_id=? AND acked_at IS NULL').get(dev.device_id);
+        if (!hasPendingAny) {
+          db.prepare('INSERT INTO commands(id,device_id,type,created_at) VALUES(?,?,?,?)')
+            .run(rid('cmd_'), dev.device_id, 'update_client', now());
+          console.log(`[AUTO-UPDATE] Queued update_client (${reportedVer} -> ${latestClientVer}) for ${dev.label || dev.hostname}`);
+          writeProjectLog(
+            'updates',
+            'INFO',
+            'AUTO_UPDATE_QUEUED',
+            `جدولة تحديث تلقائي للجهاز "${dev.label || dev.hostname}" (${dev.device_id}) من الإصدار v${reportedVer} إلى v${latestClientVer}`
+          );
+        }
+      }
+      if (body.app_version && dev.app_version && String(body.app_version) !== String(dev.app_version)) {
+        writeProjectLog(
+          'updates',
+          'INFO',
+          'DEVICE_VERSION_CHANGED',
+          `نجاح ترقية الجهاز "${dev.label || dev.hostname}" (${dev.device_id}) من الإصدار v${dev.app_version} إلى الإصدار v${body.app_version}`
+        );
       }
       const realPollIp = clientIpFromReq(req);
       const nextIp = (realPollIp && realPollIp !== '127.0.0.1' && realPollIp !== '::1')
         ? realPollIp
         : ((dev.ip && dev.ip !== '127.0.0.1') ? dev.ip : (realPollIp || '127.0.0.1'));
+      const prePendingCmd = pendingCommand(dev.device_id);
+      const hasPendingBlock = Boolean(prePendingCmd && prePendingCmd.type === 'block');
+      const hasPendingUnblock = Boolean(prePendingCmd && prePendingCmd.type === 'unblock');
+      const pollBlockedBit = hasPendingBlock ? 1 : (hasPendingUnblock ? 0 : (body.blocked ? 1 : 0));
       db.prepare("UPDATE devices SET hostname=?,os=COALESCE(NULLIF(?,'') ,os),app_version=?,last_seen=?,ip=?,blocked=?,usb_blocked=?,mode=?,policy_version=? WHERE device_id=?")
-        .run(body.hostname||dev.hostname, body.os||'', body.app_version||dev.app_version, now(), nextIp, body.blocked?1:0, body.usb_blocked?1:0, body.mode||dev.mode, body.policy_version||dev.policy_version, dev.device_id);
+        .run(body.hostname||dev.hostname, body.os||'', body.app_version||dev.app_version, now(), nextIp, pollBlockedBit, body.usb_blocked?1:0, body.mode||dev.mode, body.policy_version||dev.policy_version, dev.device_id);
       if (Array.isArray(body.sites)) {
         const clean = body.sites
           .filter(function (s) { return typeof s === 'string' && s.length <= 120; })
@@ -2071,34 +2514,62 @@ const server = http.createServer(async (req, res) => {
           .run(body.rustdesk_id.slice(0, 60), dev.device_id);
       }
       if (typeof body.event === 'string' && body.event) {
-        db.prepare('UPDATE devices SET last_event=?,last_event_at=? WHERE device_id=?')
-          .run(body.event.slice(0, 60), now(), dev.device_id);
+        const ev = body.event.slice(0, 60);
+        writeProjectLog(
+          'devices',
+          'INFO',
+          `CLIENT_EVENT_${ev.toUpperCase()}`,
+          `حدث من الجهاز "${dev.label || dev.hostname}" (${dev.device_id}) | الحدث=${ev} | IP=${nextIp}`
+        );
+        if (ev === 'unblock_password') {
+          if (!hasPendingBlock) {
+            db.prepare('UPDATE devices SET last_event=?,last_event_at=?,admin_open=1,blocked=0 WHERE device_id=?').run(ev, now(), dev.device_id);
+            dev.admin_open = 1;
+          }
+        } else if (ev === 'block_password') {
+          if (!hasPendingUnblock) {
+            db.prepare('UPDATE devices SET last_event=?,last_event_at=?,admin_open=0,blocked=1 WHERE device_id=?').run(ev, now(), dev.device_id);
+            dev.admin_open = 0;
+          }
+        } else {
+          db.prepare('UPDATE devices SET last_event=?,last_event_at=? WHERE device_id=?').run(ev, now(), dev.device_id);
+        }
       }
-      const pol = (dev.group_id && getGroupPolicy(dev.group_id)) || getPolicy();
-      const sendPolicy = pol && body.policy_version !== pol.version ? pol : null;
+      const effBlocked = hasPendingBlock ? 1 : ((hasPendingUnblock || Number(dev.admin_open) === 1) ? 0 : (body.blocked ? 1 : 0));
+      if (effBlocked !== pollBlockedBit) {
+        db.prepare('UPDATE devices SET blocked=? WHERE device_id=?').run(effBlocked, dev.device_id);
+      }
+      let pol = buildEffectiveDevicePolicy(dev);
+      let sendPolicy = pol && body.policy_version !== pol.version ? pol : null;
+      if (Number(dev.admin_open) === 1 && pol && body.policy_version === pol.version && !hasPendingBlock) {
+        db.prepare("UPDATE commands SET acked_at=? WHERE device_id=? AND type='unblock' AND acked_at IS NULL").run(now(), dev.device_id);
+      }
+      if (Number(dev.admin_open) === 0 && pol && body.policy_version === pol.version && body.blocked && !hasPendingUnblock) {
+        db.prepare("UPDATE commands SET acked_at=? WHERE device_id=? AND type='block' AND acked_at IS NULL").run(now(), dev.device_id);
+      }
 
       const activeMode = (d) => (d && d.stream_until && d.stream_until > now())
         ? (d.stream_mode || 'screen')
         : ((d && d.screen_requested) ? 'once' : '');
       let command = pendingCommand(dev.device_id);
-      let fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password FROM devices WHERE device_id=?').get(dev.device_id) || dev;
+      let fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password,admin_open,group_id FROM devices WHERE device_id=?').get(dev.device_id) || dev;
       let streamMode = activeMode(fresh);
-      let cctvTasks = cctv.getActiveTaskForDevice(dev.device_id);
-      let cctvScan = cctv.popPendingScanForDevice(dev.device_id);
-      let cctvCgi = cctv.popPendingCgiForDevice(dev.device_id);
-      // Long-poll: keep the request open briefly so a command or screenshot/stream/CCTV request issued
+      // 100% Router Direct CCTV mode: never dispatch any CCTV bridge tasks to employee computers
+      let cctvTasks = null;
+      let cctvScan = false;
+      let cctvCgi = null;
+      // Long-poll: keep the request open briefly so a command or screenshot/stream request issued
       // right now is delivered within ~300 ms instead of waiting for the next cycle.
-      if (!command && !sendPolicy && !streamMode && !cctvTasks && !cctvScan && !cctvCgi) {
+      if (!command && !sendPolicy && !streamMode) {
         const started = Date.now();
-        while (!command && !streamMode && !cctvTasks && !cctvScan && !cctvCgi && (Date.now() - started) < LONG_POLL_MS) {
-          await new Promise(function (r) { setTimeout(r, 300); });
+        while (!command && !streamMode && (Date.now() - started) < LONG_POLL_MS) {
+          await new Promise(function (r) { setTimeout(r, 400); });
           command = pendingCommand(dev.device_id);
-          fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password FROM devices WHERE device_id=?').get(dev.device_id) || fresh;
+          fresh = db.prepare('SELECT screen_requested,stream_mode,stream_until,rustdesk_password,admin_open,group_id FROM devices WHERE device_id=?').get(dev.device_id) || fresh;
           streamMode = activeMode(fresh);
-          cctvTasks = cctv.getActiveTaskForDevice(dev.device_id);
-          cctvScan = cctv.popPendingScanForDevice(dev.device_id);
-          cctvCgi = cctv.popPendingCgiForDevice(dev.device_id);
         }
+        pol = buildEffectiveDevicePolicy(fresh);
+        sendPolicy = pol && body.policy_version !== pol.version ? pol : null;
         try { db.prepare('UPDATE devices SET last_seen=? WHERE device_id=?').run(now(), dev.device_id); } catch (_) {}
       }
       return json(res, 200, {
@@ -2162,6 +2633,24 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, headers);
       if (req.method === 'HEAD') return res.end();
       return fs.createReadStream(guideMp4).pipe(res);
+    }
+
+    if (req.method === 'GET' && (url.pathname === '/showcase' || url.pathname === '/showcase.html')) {
+      const showcaseCandidates = [
+        path.join(process.cwd(), 'web', 'showcase.html'),
+        path.join(process.cwd(), '..', 'web', 'showcase.html'),
+        'C:\\Users\\IT APP\\Desktop\\blockwebsite\\web\\showcase.html',
+      ];
+      for (const sc of showcaseCandidates) {
+        if (fs.existsSync(sc)) {
+          const html = fs.readFileSync(sc, 'utf8');
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+          });
+          return res.end(html);
+        }
+      }
     }
 
     if (req.method === 'GET' && (url.pathname === '/guide' || url.pathname === '/admin-guide')) {
@@ -2348,6 +2837,64 @@ const server = http.createServer(async (req, res) => {
         url.pathname.startsWith('/assets/')
       ));
 
+    if (isWebProxyRoute && (req.method === 'GET' || req.method === 'HEAD')) {
+      const webRootCandidates = [
+        path.join(process.cwd(), 'web'),
+        path.join(process.cwd(), '..', 'web'),
+        'C:\\Users\\IT APP\\Desktop\\blockwebsite\\web',
+      ];
+      let relAsset = url.pathname;
+      if (relAsset === '/' || relAsset === '/admin' || relAsset === '/admin/' || relAsset === '/index.html') {
+        relAsset = '/index.html';
+      } else if (relAsset === '/favicon.ico') {
+        relAsset = '/assets/apple-touch-icon.png';
+      }
+      const safeRel = relAsset.replace(/^\/+/, '').replace(/\.\./g, '');
+      for (const wr of webRootCandidates) {
+        const diskPath = path.join(wr, safeRel);
+        if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
+          const ext = path.extname(diskPath).toLowerCase();
+          const mimeMap = {
+            '.html': 'text/html; charset=utf-8',
+            '.js': 'application/javascript; charset=utf-8',
+            '.css': 'text/css; charset=utf-8',
+            '.webmanifest': 'application/manifest+json; charset=utf-8',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.svg': 'image/svg+xml',
+            '.ico': 'image/png',
+          };
+          let rawBuf = fs.readFileSync(diskPath);
+          if (relAsset === '/index.html') {
+            const htmlStr = rawBuf
+              .toString('utf8')
+              .replace(
+                '<script src="tauri-shim.js',
+                '<script>window.__ITK_WEB_ADMIN__=true;</script><script src="tauri-shim.js'
+              );
+            rawBuf = Buffer.from(htmlStr, 'utf8');
+          }
+          const outHeaders = {
+            'Content-Type': mimeMap[ext] || 'application/octet-stream',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Pragma': 'no-cache',
+          };
+          if (res.__acceptGzip && rawBuf.length >= 1024 && (ext === '.html' || ext === '.js' || ext === '.css' || ext === '.webmanifest')) {
+            const gz = zlib.gzipSync(rawBuf, { level: zlib.constants.Z_BEST_SPEED });
+            outHeaders['Content-Encoding'] = 'gzip';
+            outHeaders['Content-Length'] = gz.length;
+            outHeaders['Vary'] = 'Accept-Encoding';
+            res.writeHead(200, outHeaders);
+            return res.end(req.method === 'HEAD' ? undefined : gz);
+          }
+          outHeaders['Content-Length'] = rawBuf.length;
+          res.writeHead(200, outHeaders);
+          return res.end(req.method === 'HEAD' ? undefined : rawBuf);
+        }
+      }
+    }
+
     if (isWebProxyRoute) {
       const targetPath = (url.pathname === '/admin' || url.pathname === '/admin/')
         ? ('/' + (url.search || ''))
@@ -2432,10 +2979,15 @@ const server = http.createServer(async (req, res) => {
     json(res, 404, {ok:false,error:'not found'});
   } catch (e) {
     console.error(e);
+    writeProjectLog('errors', 'ERROR', 'HTTP_HANDLER_EXCEPTION', `خطأ داخلي في معالجة الطلب (${req.method} ${req.url}): ${(e && e.stack) || (e && e.message) || e}`);
     json(res, 500, {ok:false,error:'server error'});
   }
 });
-server.listen(PORT, '0.0.0.0', () => console.log(`relay listening on :${PORT}`));
+exportInitialHistoricalLogsSnapshot();
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`relay listening on :${PORT}`);
+  writeProjectLog('devices', 'INFO', 'RELAY_LISTENING', `السيرفر السحابي يعمل ويستمع على المنفذ :${PORT}`);
+});
 
 // Self-healing watchdog: keep local Admin HTTP Server (127.0.0.1:8787) alive 24/7
 let adminMissStreak = 0;

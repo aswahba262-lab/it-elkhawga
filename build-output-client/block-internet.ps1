@@ -53,11 +53,14 @@ try {
 $userInetKeys = $userInetKeys | Select-Object -Unique
 
 # Always route traffic through our local proxy on 127.0.0.1:8080 when blocking is active
-# (in both whitelist and blacklist modes) so blocked sites are enforced, logged, and trigger notifications.
-$overrideList = "<local>;localhost;127.0.0.1"
+# (in both whitelist and blacklist modes) while bypassing local LAN & company ERP (elkhawaga.uk)
+# so company ERP requests run at 100% direct wire speed with zero proxy latency.
+$overrideList = "<local>;localhost;127.0.0.1;10.*;192.168.*;26.32.24.229;elkhawaga.uk;*.elkhawaga.uk;*.ts.net"
 
-if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
-try { Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord } catch { }
+try {
+    if (-not (Test-Path $inetPolicyKey)) { New-Item -Path $inetPolicyKey -Force | Out-Null }
+    Set-ItemProperty -Path $inetPolicyKey -Name "ProxySettingsPerUser" -Value 0 -Type DWord
+} catch { }
 
 foreach ($k in (@($inetKey) + $userInetKeys)) {
     if (Test-Path $k) {
@@ -76,7 +79,7 @@ foreach ($key in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\Poli
         Set-ItemProperty -Path $key -Name "DnsOverHttpsMode" -Value "off" -Type String
         Set-ItemProperty -Path $key -Name "QuicAllowed" -Value 0 -Type DWord
 
-        $bypass = (($overrideList -split ";") | Where-Object { $_ }) -join ","
+        $bypass = "<local>;localhost;127.0.0.1;10.*;192.168.*;26.32.24.229;elkhawaga.uk;*.elkhawaga.uk;*.ts.net"
         Set-ItemProperty -Path $key -Name "ProxyMode" -Value "fixed_servers" -Type String
         Set-ItemProperty -Path $key -Name "ProxyServer" -Value "127.0.0.1:8080" -Type String
         Set-ItemProperty -Path $key -Name "ProxyBypassList" -Value $bypass -Type String
@@ -105,7 +108,13 @@ if ($hadBlock) {
     } catch { Write-Host "WARN: hosts file not writable (need admin)" -ForegroundColor Yellow }
 }
 
-# 4. Flush DNS and tell WinINET to reload
+# 4. Ensure local LAN Direct RustDesk port (21118 TCP) is allowed on Private/Domain profiles for fast IT support
+try {
+    netsh advfirewall firewall delete rule name="IT ELKHAWGA RustDesk Direct" 2>&1 | Out-Null
+    netsh advfirewall firewall add rule name="IT ELKHAWGA RustDesk Direct" dir=in action=allow protocol=TCP localport=21118 profile=private,domain 2>&1 | Out-Null
+} catch { }
+
+# 5. Flush DNS and tell WinINET to reload
 ipconfig /flushdns | Out-Null
 
 Add-Type -TypeDefinition @"
